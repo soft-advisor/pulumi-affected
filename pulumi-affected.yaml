@@ -1,0 +1,7 @@
+# yaml-language-server: $schema=./schema.json
+# This repo's own Pulumi fixtures, which CI runs the action against
+projects:
+  include: ['e2e/fixtures/**']
+dependsOn:
+  # prod reads dev's resources in the cloud, which analysis can't see
+  fixture-site/prod: [fixture-site/dev]

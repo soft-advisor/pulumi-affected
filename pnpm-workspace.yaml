@@ -1,0 +1,3 @@
+# Only install releases that have been public for a week
+minimumReleaseAge: 10080
+onlyBuiltDependencies: []

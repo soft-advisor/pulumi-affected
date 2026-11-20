@@ -1,0 +1,56 @@
+name: pulumi-affected select
+description: Work out which Pulumi stacks a change affects, so only those are previewed and deployed
+author: soft-advisor
+branding:
+  icon: filter
+  color: purple
+
+inputs:
+  base:
+    description: >-
+      Revision to compare against. Default: the merge base with the pull request's base branch,
+      or the previous commit of a push.
+    required: false
+  head:
+    description: 'Revision to analyse. Default: the checked-out working tree.'
+    required: false
+  bases:
+    description: >-
+      JSON object mapping stack ids to the revision each was last deployed from (null: never
+      deployed); those stacks compare against it instead of base.
+    required: false
+  run:
+    description: Stack patterns to select regardless of changes, separated by commas or newlines.
+    required: false
+  skip:
+    description: Stack patterns to leave out unless also requested, separated by commas or newlines.
+    required: false
+  all:
+    description: Select every stack.
+    required: false
+    default: 'false'
+  working-directory:
+    description: 'A folder inside the repository. Default: the workspace.'
+    required: false
+  github-token:
+    description: >-
+      Token for reading /pulumi-affected commands on pull requests and replying to ignored ones.
+      Needs pull-requests: write. Leave empty to skip commands.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  stacks:
+    description: JSON array of the selected stacks (id, project, dir, stack, configFile, wave, reasons), ordered by wave.
+  ids:
+    description: JSON array of the selected stack ids, ordered by wave.
+  waves:
+    description: JSON array of waves, each a JSON array of stack ids that can run in parallel.
+  any:
+    description: "'true' when at least one stack is selected."
+  result:
+    description: The full selection as JSON, including unaffected stacks and warnings.
+
+runs:
+  using: node24
+  main: dist/index.cjs

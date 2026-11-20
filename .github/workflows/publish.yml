@@ -1,0 +1,65 @@
+name: Publish
+
+# Publishes the package when its package.json version isn't on npm yet, and tags the commit so
+# the action can be pinned to it. Bump the version in a PR; merging it publishes.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never publish twice at once
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # release tags
+      id-token: write # npm provenance and trusted publishing
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - name: Activate the pinned package manager
+        run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - id: version
+        name: Check whether this version is new
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already published"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+      # Signs in to npm with this workflow's GitHub OIDC token (npm trusted publishing), so no
+      # npm token is stored
+      - name: Publish
+        if: steps.version.outputs.new == 'true'
+        run: npm publish --provenance --access public
+      - name: Tag the release and move the major version tag
+        if: steps.version.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/v$VERSION" -f sha="$GITHUB_SHA"
+          major="v${VERSION%%.*}"
+          if gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" -f sha="$GITHUB_SHA" -F force=true
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$major" -f sha="$GITHUB_SHA"
+          fi

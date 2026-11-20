@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Activate the pinned package manager
+        run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      # The action runs the committed bundle, so it must match the source
+      - name: Check the action bundle and schema.json are up to date
+        run: git diff --exit-code -- select/dist schema.json
+      - name: Show what would be published
+        run: npm pack --dry-run
+
+  # Runs the action from this commit on this repo's own pull requests and pushes, against the
+  # projects in e2e/fixtures, so real event payloads and API calls are exercised
+  dogfood:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write # replies to /pulumi-affected commands from people without write access
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: select
+        uses: ./select
+      - name: Show the selection
+        env:
+          WAVES: ${{ steps.select.outputs.waves }}
+        run: echo "Waves = $WAVES"
