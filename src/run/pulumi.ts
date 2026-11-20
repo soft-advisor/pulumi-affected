@@ -1,0 +1,274 @@
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { parse as parseYaml } from 'yaml';
+import { type Classification, type IgnoreRule, classify, parseFirstJson } from '../classify.ts';
+import type { Stack } from '../projects.ts';
+
+/*
+ * Runs Pulumi for one stack through the repo's command template, so wrapper scripts that pick a
+ * backend or credentials per stack keep working. Sign-in to Pulumi and the cloud happens before,
+ * in the caller's own workflow steps.
+ */
+
+export interface CommandResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface PulumiRunner {
+  /** Runs `<command template for stack> <args>` */
+  run(stack: Stack, args: string[], env?: NodeJS.ProcessEnv): Promise<CommandResult>;
+  /** Runs `pulumi <args>` directly, for previews in a temporary backend */
+  runPulumi(args: string[], env: NodeJS.ProcessEnv): Promise<CommandResult>;
+}
+
+const MISSING_STACK = /no stack named '[^']*' found/i;
+
+export function commandRunner(template: string, repoRoot: string): PulumiRunner {
+  const exec = (command: string, env: NodeJS.ProcessEnv) =>
+    new Promise<CommandResult>((resolve) => {
+      const child = spawn('/bin/sh', ['-c', command], { cwd: repoRoot, env });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+      });
+      child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }));
+      child.on('error', (error) =>
+        resolve({ code: 1, stdout, stderr: `${stderr}${error.message}` }),
+      );
+    });
+  return {
+    run: (stack, args, env = {}) =>
+      exec(`${expandTemplate(template, stack)} ${args.map(quote).join(' ')}`, {
+        ...process.env,
+        ...env,
+      }),
+    runPulumi: (args, env) =>
+      exec(`pulumi ${args.map(quote).join(' ')}`, { ...process.env, ...env }),
+  };
+}
+
+export function expandTemplate(template: string, stack: Stack) {
+  const values: Record<string, string> = {
+    dir: stack.dir === '' ? '.' : stack.dir,
+    stack: stack.stack,
+    project: stack.project,
+    id: stack.id,
+  };
+  return template.replace(/\{(dir|stack|project|id)\}/g, (_, key: string) => quote(values[key]));
+}
+
+export function quote(value: string) {
+  return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export function isMissingStack(result: CommandResult) {
+  return result.code !== 0 && MISSING_STACK.test(result.stderr + result.stdout);
+}
+
+export type PreviewOutcome =
+  | { kind: 'previewed'; classification: Classification; newStack: boolean }
+  | { kind: 'failed'; error: string };
+
+export async function previewStack(
+  runner: PulumiRunner,
+  stack: Stack,
+  repoRoot: string,
+  ignore: readonly IgnoreRule[],
+): Promise<PreviewOutcome> {
+  const result = await runner.run(stack, ['preview', '--json', '--non-interactive']);
+  if (isMissingStack(result)) return previewNewStack(runner, stack, repoRoot, ignore);
+  return toOutcome(result, ignore, false);
+}
+
+/**
+ * A stack that doesn't exist yet is previewed in a temporary local backend, so nothing is
+ * written to the real one before the change is merged. Pulumi writes an encryption salt into the
+ * stack's config file when it creates the stack; the file is restored afterwards.
+ */
+async function previewNewStack(
+  runner: PulumiRunner,
+  stack: Stack,
+  repoRoot: string,
+  ignore: readonly IgnoreRule[],
+): Promise<PreviewOutcome> {
+  const backend = mkdtempSync(join(tmpdir(), 'pulumi-affected-backend-'));
+  const configPath = join(repoRoot, stack.configFile);
+  const originalConfig = existsSync(configPath) ? readFileSync(configPath, 'utf8') : undefined;
+  const env: NodeJS.ProcessEnv = {
+    PULUMI_BACKEND_URL: `file://${backend}`,
+    PULUMI_CONFIG_PASSPHRASE: process.env.PULUMI_CONFIG_PASSPHRASE ?? '',
+  };
+  const cwd = stack.dir === '' ? '.' : stack.dir;
+  try {
+    const secretsProvider = readSecretsProvider(originalConfig);
+    const init = await runner.runPulumi(
+      [
+        '--cwd',
+        cwd,
+        'stack',
+        'init',
+        stack.stack,
+        '--non-interactive',
+        ...(secretsProvider ? ['--secrets-provider', secretsProvider] : []),
+      ],
+      env,
+    );
+    if (init.code !== 0) return { kind: 'failed', error: errorText(init) };
+    const result = await runner.runPulumi(
+      ['--cwd', cwd, '--stack', stack.stack, 'preview', '--json', '--non-interactive'],
+      env,
+    );
+    return toOutcome(result, ignore, true);
+  } finally {
+    if (originalConfig === undefined) rmSync(configPath, { force: true });
+    else writeFileSync(configPath, originalConfig);
+    rmSync(backend, { recursive: true, force: true });
+  }
+}
+
+function readSecretsProvider(config: string | undefined) {
+  if (!config) return undefined;
+  try {
+    const value = (parseYaml(config) as { secretsprovider?: unknown } | null)?.secretsprovider;
+    return typeof value === 'string' && value !== 'passphrase' ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function toOutcome(
+  result: CommandResult,
+  ignore: readonly IgnoreRule[],
+  newStack: boolean,
+): PreviewOutcome {
+  if (result.code !== 0) return { kind: 'failed', error: errorText(result) };
+  try {
+    return { kind: 'previewed', classification: classify(result.stdout, ignore), newStack };
+  } catch (error) {
+    return { kind: 'failed', error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export type UpOutcome =
+  | {
+      kind: 'applied';
+      classification: Classification;
+      /** Output names whose values changed; values are never kept */
+      changedOutputs: string[];
+      newStack: boolean;
+      /** Things the user should act on, e.g. a config file Pulumi changed that must be committed */
+      notes: string[];
+    }
+  | { kind: 'failed'; error: string };
+
+export async function upStack(
+  runner: PulumiRunner,
+  stack: Stack,
+  repoRoot: string,
+  ignore: readonly IgnoreRule[],
+): Promise<UpOutcome> {
+  let newStack = false;
+  const notes: string[] = [];
+  let before = await readOutputs(runner, stack);
+  if (before === 'missing') {
+    const configPath = join(repoRoot, stack.configFile);
+    const configBefore = existsSync(configPath) ? readFileSync(configPath, 'utf8') : undefined;
+    const init = await runner.run(stack, ['stack', 'init', '--non-interactive']);
+    if (init.code !== 0) return { kind: 'failed', error: errorText(init) };
+    const configAfter = existsSync(configPath) ? readFileSync(configPath, 'utf8') : undefined;
+    if (configAfter !== configBefore) {
+      notes.push(
+        `Pulumi wrote to ${stack.configFile} when creating the stack (usually an encryption salt); commit that change, or later runs can't read the stack's secrets`,
+      );
+    }
+    newStack = true;
+    before = {};
+  }
+  if (before === 'failed') return { kind: 'failed', error: 'could not read the stack outputs' };
+
+  const result = await runner.run(stack, ['up', '--yes', '--json', '--non-interactive']);
+  if (result.code !== 0) return { kind: 'failed', error: errorText(result) };
+  let classification: Classification;
+  try {
+    classification = classify(result.stdout, ignore);
+  } catch (error) {
+    return { kind: 'failed', error: error instanceof Error ? error.message : String(error) };
+  }
+
+  const after = await readOutputs(runner, stack);
+  const afterValues = typeof after === 'object' ? after : {};
+  const keys = new Set([...Object.keys(before), ...Object.keys(afterValues)]);
+  const changedOutputs = [...keys]
+    .filter((key) => !isDeepStrictEqual(before[key], afterValues[key]))
+    .sort();
+  return { kind: 'applied', classification, changedOutputs, newStack, notes };
+}
+
+/** Stack outputs including secrets, compared in memory only and never printed */
+async function readOutputs(runner: PulumiRunner, stack: Stack) {
+  const result = await runner.run(stack, ['stack', 'output', '--json', '--show-secrets']);
+  if (isMissingStack(result)) return 'missing' as const;
+  if (result.code !== 0) return 'failed' as const;
+  try {
+    return (JSON.parse(result.stdout || '{}') ?? {}) as Record<string, unknown>;
+  } catch {
+    return 'failed' as const;
+  }
+}
+
+/**
+ * The commit a stack was last deployed from: Pulumi records `git.head` in each update's
+ * environment. Null when the stack doesn't exist or has never been deployed successfully.
+ */
+export async function lastDeployedCommit(runner: PulumiRunner, stack: Stack) {
+  const result = await runner.run(stack, ['stack', 'history', '--json', '--page-size', '50']);
+  if (isMissingStack(result)) return null;
+  if (result.code !== 0)
+    throw new Error(`${stack.id}: can't read the stack history: ${errorText(result)}`);
+  const history = parseFirstJsonArray(result.stdout);
+  for (const update of history) {
+    if (update.kind !== 'update' || update.result !== 'succeeded') continue;
+    const head = update.environment?.['git.head'];
+    return typeof head === 'string' && head ? head : undefined;
+  }
+  return null;
+}
+
+interface HistoryEntry {
+  kind?: string;
+  result?: string;
+  environment?: Record<string, string>;
+}
+
+function parseFirstJsonArray(text: string): HistoryEntry[] {
+  const start = text.indexOf('[');
+  if (start === -1) return [];
+  try {
+    return JSON.parse(text.slice(start)) as HistoryEntry[];
+  } catch {
+    return [];
+  }
+}
+
+/** The useful part of a failed command's output: Pulumi's error lines, or its last lines */
+export function errorText(result: CommandResult) {
+  const json = parseFirstJson(result.stdout) as
+    | { diagnostics?: { message?: string }[] }
+    | undefined;
+  const diagnostics = json?.diagnostics
+    ?.map((diagnostic) => diagnostic.message?.trim())
+    .filter(Boolean);
+  if (diagnostics?.length) return diagnostics.join('\n');
+  const lines = `${result.stderr}\n${result.stdout}`.trim().split('\n');
+  const errors = lines.filter((line) => /^\s*error:/i.test(line));
+  return (errors.length > 0 ? errors : lines.slice(-20)).join('\n');
+}

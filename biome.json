@@ -45,6 +45,6 @@
     }
   ],
   "files": {
-    "includes": ["**", "!select/dist", "!schema.json"]
+    "includes": ["**", "!select/dist", "!run/dist", "!schema.json"]
   }
 }

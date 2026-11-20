@@ -236815,6 +236815,51 @@ var configSchema = {
       description: "Files whose content change selects every stack. Default: .nvmrc and .node-version.",
       $ref: "#/definitions/globs"
     },
+    classify: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ignore: {
+          description: "Preview differences that aren't real changes, e.g. a provider's assumeRole when previews run with a read-only role. Only updates are ever ignored.",
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["type"],
+            properties: {
+              type: {
+                description: "Resource type glob, e.g. pulumi:providers:aws",
+                type: "string"
+              },
+              properties: {
+                description: "Top-level properties whose differences don't count; omit for all",
+                type: "array",
+                items: { type: "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    run: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        command: {
+          description: "How to run Pulumi for a stack; the run action appends preview or up arguments. Placeholders: {dir}, {stack}, {project}, {id}. Default: pulumi --cwd {dir} --stack {stack}",
+          type: "string"
+        },
+        concurrency: {
+          description: "How many stacks run at once. Default: 4",
+          type: "integer",
+          minimum: 1
+        },
+        failFast: {
+          description: "Stop starting stacks after the first failure. Default: false, which keeps going and fails at the end",
+          type: "boolean"
+        }
+      }
+    },
     packages: {
       type: "object",
       additionalProperties: false,
@@ -236830,6 +236875,7 @@ var configSchema = {
 
 // src/config.ts
 var CONFIG_FILE = "pulumi-affected.yaml";
+var DEFAULT_COMMAND = "pulumi --cwd {dir} --stack {stack}";
 var DEFAULT_GLOBAL_INPUTS = [".nvmrc", ".node-version"];
 function defaultConfig() {
   return {
@@ -236840,7 +236886,9 @@ function defaultConfig() {
     always: [],
     inputs: {},
     globalInputs: [...DEFAULT_GLOBAL_INPUTS],
-    packages: { ignore: [] }
+    packages: { ignore: [] },
+    classify: { ignore: [] },
+    run: { command: DEFAULT_COMMAND, concurrency: 4, failFast: false }
   };
 }
 var validate = new import_ajv.Ajv({ allErrors: true }).compile(configSchema);
@@ -236870,7 +236918,13 @@ function parseConfig(text, path = CONFIG_FILE) {
     always: parsed.always ?? [],
     inputs: parsed.inputs ?? {},
     globalInputs: parsed.globalInputs ?? defaults.globalInputs,
-    packages: { ignore: parsed.packages?.ignore ?? [] }
+    packages: { ignore: parsed.packages?.ignore ?? [] },
+    classify: { ignore: parsed.classify?.ignore ?? [] },
+    run: {
+      command: parsed.run?.command ?? defaults.run.command,
+      concurrency: parsed.run?.concurrency ?? defaults.run.concurrency,
+      failFast: parsed.run?.failFast ?? defaults.run.failFast
+    }
   };
 }
 
@@ -237311,6 +237365,9 @@ function select(options) {
     stacks: selected,
     waves,
     unaffected: stacks.filter((stack) => !reasons.has(stack.id)).map((stack) => stack.id),
+    dependencies: Object.fromEntries(
+      [...graph].map(([id, dependencies]) => [id, [...dependencies].sort()])
+    ),
     warnings: [...new Set(warnings)]
   };
 }
@@ -237486,7 +237543,9 @@ var Session = class {
     const before = parseYamlFile(baseSnapshot, stack.configFile);
     const after = parseYamlFile(this.head, stack.configFile);
     if (before === void 0 && after !== void 0) reasons.push(`${stack.configFile} added`);
-    else if (!(0, import_node_util.isDeepStrictEqual)(before, after)) reasons.push(`${stack.configFile} changed`);
+    else if (!(0, import_node_util.isDeepStrictEqual)(before, withoutNewSalt(before, after))) {
+      reasons.push(`${stack.configFile} changed`);
+    }
     for (const name of [`Pulumi.${stack.stack}.force`, "Pulumi.force"]) {
       const path = joinPath(project.stackConfigDir, name);
       if (changed.has(path) && this.head.has(path)) reasons.push(`${path} touched`);
@@ -237555,6 +237614,16 @@ function projectSettings(snapshot, path) {
     return rest;
   }
   return settings;
+}
+function withoutNewSalt(before, after) {
+  const isObject = (value) => typeof value === "object" && value !== null;
+  if (!isObject(before) || !isObject(after)) return after;
+  if ("encryptionsalt" in before || !("encryptionsalt" in after)) return after;
+  const { encryptionsalt: _salt, ...rest } = after;
+  if (!("config" in rest) && isObject(before.config) && Object.keys(before.config).length === 0) {
+    rest.config = before.config;
+  }
+  return rest;
 }
 function parseYamlFile(snapshot, path) {
   const text = snapshot.read(path);
@@ -237629,131 +237698,10 @@ function readRequests(repoRoot, base, options) {
   return { run, skip };
 }
 
-// src/action/github.ts
-var import_node_crypto3 = require("node:crypto");
-var import_node_fs2 = require("node:fs");
-function input(name) {
-  const value = process.env[`INPUT_${name.replace(/ /g, "_").toUpperCase()}`] ?? "";
-  return value.trim();
-}
-function booleanInput(name) {
-  return /^(true|yes|1)$/i.test(input(name));
-}
-function setOutput(name, value) {
-  const file = process.env.GITHUB_OUTPUT;
-  if (!file) {
-    console.log(`${name}=${value}`);
-    return;
-  }
-  const delimiter = `pulumi-affected-${(0, import_node_crypto3.randomUUID)()}`;
-  (0, import_node_fs2.appendFileSync)(file, `${name}<<${delimiter}
-${value}
-${delimiter}
-`);
-}
-function appendSummary(markdown) {
-  const file = process.env.GITHUB_STEP_SUMMARY;
-  if (file) (0, import_node_fs2.appendFileSync)(file, `${markdown}
-`);
-}
-function warning(message) {
-  console.log(`::warning::${escapeCommand(message)}`);
-}
-function notice(message) {
-  console.log(`::notice::${escapeCommand(message)}`);
-}
-function escapeCommand(message) {
-  return message.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
-}
-function readEvent() {
-  const path = process.env.GITHUB_EVENT_PATH;
-  return {
-    name: process.env.GITHUB_EVENT_NAME ?? "",
-    payload: path ? JSON.parse((0, import_node_fs2.readFileSync)(path, "utf8")) : {}
-  };
-}
-var GitHubApi = class {
-  token;
-  baseUrl;
-  repository;
-  constructor(token, repository = process.env.GITHUB_REPOSITORY ?? "") {
-    this.token = token;
-    this.baseUrl = process.env.GITHUB_API_URL ?? "https://api.github.com";
-    this.repository = repository;
-  }
-  async request(method, path, body) {
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        accept: "application/vnd.github+json",
-        "x-github-api-version": "2022-11-28",
-        ...body === void 0 ? {} : { "content-type": "application/json" }
-      },
-      body: body === void 0 ? void 0 : JSON.stringify(body)
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`GitHub API ${method} ${path} failed with ${response.status}: ${text}`);
-    }
-    return await response.json();
-  }
-  /** Every page of a list endpoint */
-  async list(path) {
-    const items = [];
-    const separator = path.includes("?") ? "&" : "?";
-    for (let page = 1; ; page++) {
-      const batch = await this.request("GET", `${path}${separator}per_page=100&page=${page}`);
-      items.push(...batch);
-      if (batch.length < 100) return items;
-    }
-  }
-  repo(path) {
-    return `/repos/${this.repository}${path}`;
-  }
-};
-
-// src/action/select.ts
+// src/action/context.ts
 var COMMAND = /^\/pulumi-affected\s+preview\b(.*)$/gim;
 var WRITE_ROLES = /* @__PURE__ */ new Set(["admin", "maintain", "write"]);
 var ZERO_SHA = /^0+$/;
-async function main() {
-  const cwd = input("working-directory") || process.cwd();
-  const repoRoot = repoRootOf(cwd);
-  const event = readEvent();
-  const token = input("github-token");
-  const api = token ? new GitHubApi(token) : void 0;
-  const context = await eventContext(event, repoRoot, api);
-  if (context === void 0) {
-    notice("Not a /pulumi-affected command; nothing to select");
-    writeOutputs([], [], "{}");
-    return;
-  }
-  const result = select({
-    cwd,
-    base: input("base") || context.base || "HEAD",
-    head: input("head") || void 0,
-    bases: input("bases") ? JSON.parse(input("bases")) : void 0,
-    run: splitPatterns(input("run")),
-    requests: context.requests,
-    skip: splitPatterns(input("skip")),
-    all: booleanInput("all") || context.all,
-    messages: context.messages
-  });
-  for (const message of result.warnings) warning(message);
-  appendSummary(renderMarkdown(result));
-  writeOutputs(result.stacks, result.waves, JSON.stringify(result));
-  console.log(
-    result.stacks.length === 0 ? "No stacks affected" : `Selected ${result.stacks.map((stack) => stack.id).join(", ")}`
-  );
-}
-function writeOutputs(stacks, waves, result) {
-  setOutput("stacks", JSON.stringify(stacks));
-  setOutput("ids", JSON.stringify(waves.flat()));
-  setOutput("waves", JSON.stringify(waves));
-  setOutput("any", stacks.length > 0 ? "true" : "false");
-  setOutput("result", result);
-}
 async function eventContext(event, repoRoot, api) {
   const payload = event.payload;
   if (event.name === "pull_request" || event.name === "pull_request_target") {
@@ -237763,7 +237711,8 @@ async function eventContext(event, repoRoot, api) {
       messages: [pullRequest.body ?? ""],
       requests: api ? await commandRequests(api, pullRequest.number) : [],
       all: false,
-      pullRequest
+      pullRequest,
+      mergedPullRequests: []
     };
   }
   if (event.name === "issue_comment") {
@@ -237783,25 +237732,48 @@ async function eventContext(event, repoRoot, api) {
       messages: [pullRequest.body ?? ""],
       requests: await commandRequests(api, pullRequest.number),
       all: false,
-      pullRequest
+      pullRequest,
+      mergedPullRequests: []
     };
   }
   if (event.name === "push") {
     const before = String(payload.before ?? "");
     if (!before || ZERO_SHA.test(before)) {
-      return { base: void 0, messages: [], requests: [], all: true, pullRequest: void 0 };
+      return {
+        base: void 0,
+        messages: [],
+        requests: [],
+        all: true,
+        pullRequest: void 0,
+        mergedPullRequests: []
+      };
     }
     const messages = [];
     const requests = [];
-    if (api) {
-      for (const pullRequest of await mergedPullRequests(api, repoRoot, before)) {
+    const merged = api ? await mergedPullRequests(api, repoRoot, before) : [];
+    for (const pullRequest of merged) {
+      if (api) {
         messages.push(pullRequest.body ?? "");
         requests.push(...await commandRequests(api, pullRequest.number));
       }
     }
-    return { base: before, messages, requests, all: false, pullRequest: void 0 };
+    return {
+      base: before,
+      messages,
+      requests,
+      all: false,
+      pullRequest: void 0,
+      mergedPullRequests: merged
+    };
   }
-  return { base: void 0, messages: [], requests: [], all: false, pullRequest: void 0 };
+  return {
+    base: void 0,
+    messages: [],
+    requests: [],
+    all: false,
+    pullRequest: void 0,
+    mergedPullRequests: []
+  };
 }
 function mergeBase(repoRoot, baseSha) {
   try {
@@ -237868,6 +237840,130 @@ async function mergedPullRequests(api, repoRoot, before) {
     for (const pullRequest of found) pullRequests.set(pullRequest.number, pullRequest);
   }
   return [...pullRequests.values()];
+}
+
+// src/action/github.ts
+var import_node_crypto3 = require("node:crypto");
+var import_node_fs2 = require("node:fs");
+function input(name) {
+  const value = process.env[`INPUT_${name.replace(/ /g, "_").toUpperCase()}`] ?? "";
+  return value.trim();
+}
+function booleanInput(name) {
+  return /^(true|yes|1)$/i.test(input(name));
+}
+function setOutput(name, value) {
+  const file = process.env.GITHUB_OUTPUT;
+  if (!file) {
+    console.log(`${name}=${value}`);
+    return;
+  }
+  const delimiter = `pulumi-affected-${(0, import_node_crypto3.randomUUID)()}`;
+  (0, import_node_fs2.appendFileSync)(file, `${name}<<${delimiter}
+${value}
+${delimiter}
+`);
+}
+function appendSummary(markdown) {
+  const file = process.env.GITHUB_STEP_SUMMARY;
+  if (file) (0, import_node_fs2.appendFileSync)(file, `${markdown}
+`);
+}
+function warning(message) {
+  console.log(`::warning::${escapeCommand(message)}`);
+}
+function notice(message) {
+  console.log(`::notice::${escapeCommand(message)}`);
+}
+function escapeCommand(message) {
+  return message.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+}
+function readEvent() {
+  const path = process.env.GITHUB_EVENT_PATH;
+  return {
+    name: process.env.GITHUB_EVENT_NAME ?? "",
+    payload: path ? JSON.parse((0, import_node_fs2.readFileSync)(path, "utf8")) : {}
+  };
+}
+var GitHubApi = class {
+  token;
+  baseUrl;
+  repository;
+  constructor(token, repository = process.env.GITHUB_REPOSITORY ?? "") {
+    this.token = token;
+    this.baseUrl = process.env.GITHUB_API_URL ?? "https://api.github.com";
+    this.repository = repository;
+  }
+  async request(method, path, body) {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${this.token}`,
+        accept: "application/vnd.github+json",
+        "x-github-api-version": "2022-11-28",
+        ...body === void 0 ? {} : { "content-type": "application/json" }
+      },
+      body: body === void 0 ? void 0 : JSON.stringify(body)
+    });
+    if (!response.ok) {
+      const text2 = await response.text();
+      throw new Error(`GitHub API ${method} ${path} failed with ${response.status}: ${text2}`);
+    }
+    const text = await response.text();
+    return text ? JSON.parse(text) : void 0;
+  }
+  /** Every page of a list endpoint */
+  async list(path) {
+    const items = [];
+    const separator = path.includes("?") ? "&" : "?";
+    for (let page = 1; ; page++) {
+      const batch = await this.request("GET", `${path}${separator}per_page=100&page=${page}`);
+      items.push(...batch);
+      if (batch.length < 100) return items;
+    }
+  }
+  repo(path) {
+    return `/repos/${this.repository}${path}`;
+  }
+};
+
+// src/action/select.ts
+async function main() {
+  const cwd = input("working-directory") || process.cwd();
+  const repoRoot = repoRootOf(cwd);
+  const event = readEvent();
+  const token = input("github-token");
+  const api = token ? new GitHubApi(token) : void 0;
+  const context = await eventContext(event, repoRoot, api);
+  if (context === void 0) {
+    notice("Not a /pulumi-affected command; nothing to select");
+    writeOutputs([], [], "{}");
+    return;
+  }
+  const result = select({
+    cwd,
+    base: input("base") || context.base || "HEAD",
+    head: input("head") || void 0,
+    bases: input("bases") ? JSON.parse(input("bases")) : void 0,
+    run: splitPatterns(input("run")),
+    requests: context.requests,
+    skip: splitPatterns(input("skip")),
+    all: booleanInput("all") || context.all,
+    messages: context.messages
+  });
+  for (const message of result.warnings) warning(message);
+  appendSummary(renderMarkdown(result));
+  writeOutputs(result.stacks, result.waves, JSON.stringify(result));
+  console.log(
+    result.stacks.length === 0 ? "No stacks affected" : `Selected ${result.stacks.map((stack) => stack.id).join(", ")}`
+  );
+}
+function writeOutputs(stacks, waves, result) {
+  setOutput("stacks", JSON.stringify(stacks));
+  setOutput("ids", JSON.stringify(waves.flat()));
+  setOutput("waves", JSON.stringify(waves));
+  setOutput("any", stacks.length > 0 ? "true" : "false");
+  setOutput("result", result);
 }
 main().catch((error) => {
   console.log(`::error::${error instanceof Error ? error.message : String(error)}`);

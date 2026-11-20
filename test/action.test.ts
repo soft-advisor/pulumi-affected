@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { createServer, type IncomingMessage } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
+import { fakeApi } from './fake-api.ts';
 import { commit, createRepo, project } from './helpers.ts';
 
 const ACTION = join(import.meta.dirname, '../src/action/select.ts');
@@ -14,35 +14,6 @@ const PROJECTS = {
   ...project('alpha', 'alpha', ['dev'], { 'index.ts': 'export const a = 1;\n' }),
   ...project('beta', 'beta', ['dev'], { 'index.ts': 'export const b = 1;\n' }),
 };
-
-interface ApiCall {
-  method: string;
-  path: string;
-  body: unknown;
-}
-
-/** A fake GitHub API answering from `routes` ("GET /path" → response) and recording calls */
-async function fakeApi(routes: Record<string, unknown>) {
-  const calls: ApiCall[] = [];
-  const server = createServer(async (request: IncomingMessage, response) => {
-    let text = '';
-    for await (const chunk of request) text += chunk;
-    const path = (request.url ?? '').replace(/[?&]per_page=100&page=\d+/, '');
-    calls.push({ method: request.method ?? '', path, body: text ? JSON.parse(text) : undefined });
-    const page = Number(/[?&]page=(\d+)/.exec(request.url ?? '')?.[1] ?? '1');
-    const key = `${request.method} ${path}`;
-    if (!(key in routes)) {
-      response.writeHead(404).end('{}');
-      return;
-    }
-    response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify(page > 1 ? [] : routes[key]));
-  });
-  await new Promise<void>((resolve) => server.listen(0, resolve));
-  const address = server.address();
-  const port = typeof address === 'object' && address ? address.port : 0;
-  return { url: `http://127.0.0.1:${port}`, calls, close: () => server.close() };
-}
 
 async function runAction(
   dir: string,

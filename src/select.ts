@@ -63,6 +63,8 @@ export interface SelectResult {
   waves: string[][];
   /** Ids of stacks that weren't selected */
   unaffected: string[];
+  /** Every stack id to the ids of the stacks it depends on */
+  dependencies: Record<string, string[]>;
   warnings: string[];
 }
 
@@ -158,6 +160,9 @@ export function select(options: SelectOptions): SelectResult {
     stacks: selected,
     waves,
     unaffected: stacks.filter((stack) => !reasons.has(stack.id)).map((stack) => stack.id),
+    dependencies: Object.fromEntries(
+      [...graph].map(([id, dependencies]) => [id, [...dependencies].sort()]),
+    ),
     warnings: [...new Set(warnings)],
   };
 }
@@ -367,7 +372,9 @@ export class Session {
     const before = parseYamlFile(baseSnapshot, stack.configFile);
     const after = parseYamlFile(this.head, stack.configFile);
     if (before === undefined && after !== undefined) reasons.push(`${stack.configFile} added`);
-    else if (!isDeepStrictEqual(before, after)) reasons.push(`${stack.configFile} changed`);
+    else if (!isDeepStrictEqual(before, withoutNewSalt(before, after))) {
+      reasons.push(`${stack.configFile} changed`);
+    }
 
     // Force files: any edit at all, even whitespace, selects the stack
     for (const name of [`Pulumi.${stack.stack}.force`, 'Pulumi.force']) {
@@ -450,6 +457,24 @@ function projectSettings(snapshot: Snapshot, path: string) {
     return rest;
   }
   return settings;
+}
+
+/**
+ * Pulumi writes an encryption salt into a stack's config file when it creates the stack. A salt
+ * that wasn't there before can't change what the program does, so it doesn't count; a changed
+ * salt does.
+ */
+function withoutNewSalt(before: unknown, after: unknown) {
+  const isObject = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null;
+  if (!isObject(before) || !isObject(after)) return after;
+  if ('encryptionsalt' in before || !('encryptionsalt' in after)) return after;
+  const { encryptionsalt: _salt, ...rest } = after;
+  // Pulumi drops an empty `config: {}` when it rewrites the file
+  if (!('config' in rest) && isObject(before.config) && Object.keys(before.config).length === 0) {
+    rest.config = before.config;
+  }
+  return rest;
 }
 
 function parseYamlFile(snapshot: Snapshot, path: string): unknown {

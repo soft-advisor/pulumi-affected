@@ -90,6 +90,55 @@
       "description": "Files whose content change selects every stack. Default: .nvmrc and .node-version.",
       "$ref": "#/definitions/globs"
     },
+    "classify": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ignore": {
+          "description": "Preview differences that aren't real changes, e.g. a provider's assumeRole when previews run with a read-only role. Only updates are ever ignored.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "description": "Resource type glob, e.g. pulumi:providers:aws",
+                "type": "string"
+              },
+              "properties": {
+                "description": "Top-level properties whose differences don't count; omit for all",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "description": "How to run Pulumi for a stack; the run action appends preview or up arguments. Placeholders: {dir}, {stack}, {project}, {id}. Default: pulumi --cwd {dir} --stack {stack}",
+          "type": "string"
+        },
+        "concurrency": {
+          "description": "How many stacks run at once. Default: 4",
+          "type": "integer",
+          "minimum": 1
+        },
+        "failFast": {
+          "description": "Stop starting stacks after the first failure. Default: false, which keeps going and fails at the end",
+          "type": "boolean"
+        }
+      }
+    },
     "packages": {
       "type": "object",
       "additionalProperties": false,

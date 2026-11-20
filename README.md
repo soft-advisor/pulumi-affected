@@ -63,9 +63,35 @@ inputs:
 globalInputs: ['.nvmrc', '.node-version'] # the default
 packages:
   ignore: ['@types/*']
+classify:
+  ignore: # preview differences that aren't real changes
+    - type: pulumi:providers:aws
+      properties: [assumeRole, assumeRoles] # previews run with a read-only role
+run:
+  command: scripts/pulumi.sh {stack} # default: pulumi --cwd {dir} --stack {stack}
+  concurrency: 4
+  failFast: false
 ```
 
-## GitHub Action
+## GitHub Actions
+
+Two actions share the same selection:
+
+- **`run`** previews or deploys the selected stacks in one job, in dependency order, and comments on pull requests. Use it when one set of credentials can reach every stack.
+- **`select`** only outputs the selection, for a matrix of your own jobs, for example when stacks need different roles.
+
+Both take the comparison base from the event:
+
+| Event                                             | Compared with                                                       |
+| ------------------------------------------------- | ------------------------------------------------------------------- |
+| `pull_request`                                    | the merge base with the target branch                               |
+| `push`                                            | the push's previous commit; a new branch selects everything         |
+| `issue_comment` with `/pulumi-affected preview …` | the pull request's merge base; check out `refs/pull/<n>/head` first |
+| anything else                                     | the `base` input                                                    |
+
+Pin the actions to a commit SHA: jobs that preview and deploy usually hold credentials for your cloud accounts.
+
+### `run`
 
 ```yaml
 on:
@@ -73,6 +99,35 @@ on:
   push:
     branches: [main]
 
+jobs:
+  pulumi:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # your cloud sign-in
+      pull-requests: write # comments
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # history for the merge base and each stack's last deploy
+      # your own Pulumi and cloud sign-in
+      - uses: soft-advisor/pulumi-affected/run@<commit sha>
+        with:
+          mode: ${{ github.event_name == 'push' && 'up' || 'preview' }}
+```
+
+**Preview** runs every selected stack in parallel. A stack that doesn't exist yet is previewed in a temporary local backend with its config, so nothing is written to the real backend before merge. Secrets encrypted by a backend the temporary one can't use (such as Pulumi Cloud) make that preview fail with a clear error.
+
+**Up** compares each stack with the commit it was last deployed from (Pulumi records it as `git.head` in the stack's history), so a stack whose deploy failed, or that was never deployed, runs again on the next push. Stacks run after the ones they depend on. When a deploy changes a stack's outputs, the stacks that depend on it are deployed too, with the reason. A failure skips the stacks that depend on the failed one, lets the others finish, and fails the job at the end (`fail-fast` stops early instead).
+
+**Comments.** A preview posts one comment on the pull request and edits it on every push: a table of stacks with their result and why they ran, then each stack's resource changes. A push that selects nothing rewrites an earlier comment rather than adding one. A deploy comments its results on the pull requests the push merged. GitHub limits a comment to 65,536 characters, so a long report continues in further comments, split between stacks. Resource changes show types, names and changed property names, never values; a failed stack shows the error Pulumi printed. Pull requests from forks can't be commented on with the default token; the job summary has everything.
+
+**Inputs:** `mode` (`preview` or `up`), `command`, `concurrency`, `fail-fast`, `comment`, `base`, `head`, `run`, `skip`, `all`, `working-directory`, `github-token`.
+**Outputs:** `results` (JSON array of `{ id, status, reasons, counts, changedOutputs, newStack, error }`, status being `changes`, `no-changes`, `failed` or `skipped`), `changed`, `failed`, `any-changes`.
+
+### `select`
+
+```yaml
 jobs:
   select:
     runs-on: ubuntu-24.04
@@ -85,7 +140,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # history for the merge base
+          fetch-depth: 0
       - id: select
         uses: soft-advisor/pulumi-affected/select@<commit sha>
 
@@ -103,18 +158,7 @@ jobs:
       - run: pulumi preview --cwd "${{ matrix.stack.dir }}" --stack "${{ matrix.stack.stack }}"
 ```
 
-Pin the action to a commit SHA: jobs that preview and deploy usually hold credentials for your cloud accounts.
-
-The comparison base comes from the event:
-
-| Event                                             | Compared with                                                       |
-| ------------------------------------------------- | ------------------------------------------------------------------- |
-| `pull_request`                                    | the merge base with the target branch                               |
-| `push`                                            | the push's previous commit; a new branch selects everything         |
-| `issue_comment` with `/pulumi-affected preview …` | the pull request's merge base; check out `refs/pull/<n>/head` first |
-| anything else                                     | the `base` input                                                    |
-
-To deploy only stacks whose last deploy is older than the change, pass `bases`: a JSON object from stack id to the commit each was last deployed from (Pulumi records it as `git.head` in `pulumi stack history --json`), or `null` for a stack never deployed. A stack whose deploy failed is then picked up again by the next run.
+To deploy only stacks whose last deploy is older than the change, pass `bases`: a JSON object from stack id to the commit each was last deployed from, or `null` for a stack never deployed.
 
 **Inputs:** `base`, `head`, `bases`, `run`, `skip`, `all`, `working-directory`, `github-token`.
 **Outputs:** `stacks` (JSON array of `{ id, project, dir, stack, configFile, wave, reasons }`), `ids`, `waves`, `any`, `result`.
@@ -124,9 +168,11 @@ To deploy only stacks whose last deploy is older than the change, pass `bases`: 
 ```sh
 npx @soft-advisor/pulumi-affected select --base origin/main [--format markdown]
 npx @soft-advisor/pulumi-affected dependents accounts/business [--transitive]
+npx @soft-advisor/pulumi-affected run --mode preview --base origin/main [--format markdown]
+pulumi preview --json | npx @soft-advisor/pulumi-affected classify
 ```
 
-`select` analyses the working tree unless `--head` is given. See `--help` for every option.
+`select` analyses the working tree unless `--head` is given; `run` analyses `HEAD`. `classify` exits 0 when the preview changes something and 3 when it doesn't. See `--help` for every option.
 
 ## Development
 
@@ -137,10 +183,10 @@ pnpm install
 pnpm lint        # Biome lint + format check
 pnpm typecheck
 pnpm test
-pnpm build       # also rebuilds select/dist and schema.json, which are committed
+pnpm build       # also rebuilds select/dist, run/dist and schema.json, which are committed
 ```
 
-Tests build real git repositories in a temporary folder. `e2e/fixtures` holds Pulumi projects with realistic layouts, and `e2e/scenarios.json` the changes and the stacks each should select. The CI `dogfood` job runs the action from each commit against those fixtures.
+Tests build real git repositories in a temporary folder. `test/run.test.ts` drives the real `pulumi` CLI against a local file backend, and is skipped when the CLI isn't installed. `e2e/fixtures` holds Pulumi projects with realistic layouts, and `e2e/scenarios.json` the changes and the stacks each should select. The CI `dogfood` job runs the action from each commit against those fixtures.
 
 ## Releasing
 
