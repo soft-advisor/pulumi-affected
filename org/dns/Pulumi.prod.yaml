@@ -1,2 +1,3 @@
 config:
   fixture-dns:domain: Example.com
+encryptionsalt: v1:TR85GxiDs70=:v1:EfVSrW+ui5DZkMMw:XuQcNN15wFtn3YXrQ1irHARy09f4IQ==
