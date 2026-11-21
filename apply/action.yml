@@ -12,11 +12,36 @@ inputs:
   directory:
     description: >-
       A directory that already holds the plans (manifest.json). Without one, the artifact
-      pulumi-plans-<tree SHA of the checkout> is downloaded, here if set.
+      pulumi-plans-<tree SHA of the checkout> is downloaded to the runner's temporary folder.
     required: false
   run-id:
-    description: 'The workflow run whose artifact to download. Default: the newest run that planned this tree.'
+    description: >-
+      The workflow run whose artifact to download. Default: the newest run that planned this tree
+      on the pull request's head commit (or on this commit).
     required: false
+  plan-sha:
+    description: >-
+      The commit the plan run ran on. Default: the head of the pull request this commit came
+      from, or this commit. Runs on any other commit are refused, even with the same tree.
+    required: false
+  base:
+    description: >-
+      Revision the change is compared against, to check which stacks it selects. Default: the
+      event's (a push's previous commit, a pull request's merge base).
+    required: false
+  bases:
+    description: As for plan, when plan used it.
+    required: false
+  run:
+    description: As for plan, when plan used it.
+    required: false
+  skip:
+    description: As for plan, when plan used it.
+    required: false
+  all:
+    description: As for plan, when plan used it.
+    required: false
+    default: 'false'
   stacks:
     description: >-
       Stack patterns that may be applied, separated by commas or newlines. A plan for any other
@@ -35,6 +60,10 @@ inputs:
     description: How many stacks of a wave to apply at once.
     required: false
     default: '4'
+  fail-fast:
+    description: Stop at the first stack that isn't applied, instead of applying every other one.
+    required: false
+    default: 'false'
   comment:
     description: >-
       Comment the result on the pull request: the triggering one, the pull-request input, or the
@@ -72,6 +101,8 @@ runs:
       env:
         INPUT_DIRECTORY: ${{ inputs.directory }}
         INPUT_RUN_ID: ${{ inputs.run-id }}
+        INPUT_PLAN_SHA: ${{ inputs.plan-sha }}
+        INPUT_PULL_REQUEST: ${{ inputs.pull-request }}
         INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
     - if: steps.locate.outputs.download == 'true'
@@ -88,6 +119,12 @@ runs:
       env:
         INPUT_PLANS: ${{ steps.locate.outputs.directory }}
         INPUT_STACKS: ${{ inputs.stacks }}
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_BASES: ${{ inputs.bases }}
+        INPUT_RUN: ${{ inputs.run }}
+        INPUT_SKIP: ${{ inputs.skip }}
+        INPUT_ALL: ${{ inputs.all }}
+        INPUT_FAIL_FAST: ${{ inputs.fail-fast }}
         INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
         INPUT_COMMAND: ${{ inputs.command }}
         INPUT_CONCURRENCY: ${{ inputs.concurrency }}

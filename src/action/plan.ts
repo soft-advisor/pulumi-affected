@@ -39,6 +39,7 @@ async function main() {
     directory,
     runner,
     concurrency: positiveInteger('concurrency', 4),
+    failFast: booleanInput('fail-fast'),
     onFinish: (outcome) => {
       if (outcome.kind === 'failed') printUntrusted(`${outcome.id}: failed\n${outcome.error}`);
       else

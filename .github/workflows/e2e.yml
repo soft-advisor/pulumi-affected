@@ -137,12 +137,17 @@ jobs:
           working-directory: ${{ env.FIXTURE }}
           command: sh ${{ github.workspace }}/tool/e2e/wrapper.sh --cwd {dir} --stack {stack}
           pull-request: ${{ steps.prepare.outputs.pull-request }}
+          base: ${{ steps.prepare.outputs.base-sha }}
+          # The plans were uploaded by this run, which runs on the tool's own commit
+          plan-sha: ${{ github.event.pull_request.head.sha || github.sha }}
       - id: reapply
         if: steps.apply.outcome == 'success'
         uses: ./tool/apply
         with:
           directory: ${{ steps.apply.outputs.directory }}
           working-directory: ${{ env.FIXTURE }}
+          base: ${{ steps.prepare.outputs.base-sha }}
+          pull-request: ${{ steps.prepare.outputs.pull-request }}
           comment: false
       - name: Check what was applied
         env:

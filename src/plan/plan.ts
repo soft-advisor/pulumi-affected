@@ -9,7 +9,7 @@ import { type SelectedStack, type SelectOptions, select } from '../select.ts';
 import { git, repoRootOf, WorktreeSnapshot } from '../snapshot.ts';
 import { mapConcurrently } from './concurrency.ts';
 import { describeRead, type StaleRead, staleReads } from './outputs.ts';
-import { stackOutputChanges } from './planfile.ts';
+import { stackOutputChanges, unknownOutputChanges } from './planfile.ts';
 import {
   hashFile,
   type Manifest,
@@ -31,6 +31,8 @@ export interface PlanOptions {
   directory: string;
   runner: PulumiRunner;
   concurrency: number;
+  /** Stop planning at the first stack that fails, instead of planning every other one */
+  failFast?: boolean;
   onFinish?: (outcome: StackOutcome) => void;
 }
 
@@ -46,16 +48,33 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
   const config = options.select.config ?? loadConfig(new WorktreeSnapshot(repoRoot));
   const selection = select({ ...options.select, config });
 
-  const outcomes = await mapConcurrently(selection.stacks, options.concurrency, async (stack) => {
-    const outcome = await planStack(stack, {
-      ...options,
-      directory,
-      repoRoot,
-      ignore: config.classify.ignore,
-    });
-    options.onFinish?.(outcome);
-    return outcome;
-  });
+  // Wave by wave, so a stack created to be planned exists before the stacks that reference it
+  const outcomes: StackOutcome[] = [];
+  let failed = false;
+  for (const wave of selection.waves) {
+    const stacks = selection.stacks.filter((stack) => wave.includes(stack.id));
+    outcomes.push(
+      ...(await mapConcurrently(stacks, options.concurrency, async (stack) => {
+        const outcome: StackOutcome =
+          options.failFast && failed
+            ? {
+                kind: 'failed',
+                id: stack.id,
+                error: 'not planned: an earlier stack failed (fail-fast)',
+                reasons: stack.reasons,
+              }
+            : await planStack(stack, {
+                ...options,
+                directory,
+                repoRoot,
+                ignore: config.classify.ignore,
+              });
+        if (outcome.kind === 'failed') failed = true;
+        options.onFinish?.(outcome);
+        return outcome;
+      })),
+    );
+  }
 
   // A planned stack reading outputs another plan changes was planned with their old values: its
   // plan can only be right once the other is applied, so it belongs in a later change
@@ -86,6 +105,14 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
     };
   }
 
+  const warnings = [...selection.warnings];
+  const changesOutputs = planned.filter(
+    (stack) => !blocked.has(stack.id) && stack.outputs.length > 0,
+  );
+  if (changesOutputs.length > 0 && selection.unknownReaders.length > 0) {
+    warnings.push(unknownReadersWarning(changesOutputs, selection.unknownReaders));
+  }
+
   const manifest: Manifest = {
     version: 2,
     tree: git(repoRoot, ['rev-parse', 'HEAD^{tree}']).trim(),
@@ -111,7 +138,7 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
     skipped: selection.skipped,
     followUps: stale.filter((read) => !blocked.has(read.id)),
     dependencies: selection.dependencies,
-    warnings: selection.warnings,
+    warnings,
   };
   writeManifest(directory, manifest);
   return manifest;
@@ -155,11 +182,14 @@ async function planStack(stack: SelectedStack, context: StackContext): Promise<S
 
   let classification: Classification;
   let outputs: string[];
+  let unknownOutputs: string[];
   try {
     classification = classify(preview.stdout, context.ignore);
     if (!existsSync(planPath)) return fail('Pulumi wrote no plan file');
     // The preview doesn't show stack outputs that would change; the plan does
-    outputs = stackOutputChanges(readFileSync(planPath, 'utf8'));
+    const planText = readFileSync(planPath, 'utf8');
+    outputs = stackOutputChanges(planText);
+    unknownOutputs = unknownOutputChanges(planText);
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
   }
@@ -188,6 +218,7 @@ async function planStack(stack: SelectedStack, context: StackContext): Promise<S
       counts: classification.counts,
       changes: classification.changes,
       outputs,
+      ...(unknownOutputs.length > 0 ? { unknownOutputs } : {}),
       reasons: stack.reasons,
     },
   };
@@ -224,4 +255,9 @@ export function encryptionSaltOf(path: string) {
 export async function pulumiVersion(runner: PulumiRunner) {
   const result = await runner.runPulumi(['version'], {});
   return result.code === 0 ? result.stdout.trim() : 'unknown';
+}
+
+/** That stacks whose references can't be analysed may need planning once outputs change */
+export function unknownReadersWarning(changed: { id: string }[], readers: string[]) {
+  return `${changed.map((stack) => stack.id).join(', ')} change outputs, and ${readers.join(', ')} may read them in ways analysis can't see; plan those again after this is applied if they do, or declare what they read under dependsOn`;
 }

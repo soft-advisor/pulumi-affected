@@ -250,4 +250,53 @@ outputs:
     commit(dir, { 'Pulumi.yaml': program(16) });
     await assert.rejects(apply(dir, plans, runner), /are for tree/);
   });
+
+  test('refuses plans for stacks the change does not select', async () => {
+    const named = (name: string, length: number) =>
+      program(length).replace('name: words', `name: ${name}`);
+    const { dir, runner, plans } = setup({
+      'a/Pulumi.yaml': named('a', 8),
+      'a/Pulumi.dev.yaml': 'config: {}\n',
+      'b/Pulumi.yaml': named('b', 8),
+      'b/Pulumi.dev.yaml': 'config: {}\n',
+    });
+    deploy(dir, 'a');
+    deploy(dir, 'b');
+    const base = run(dir, 'git', ['rev-parse', 'HEAD']).trim();
+    commit(dir, { 'a/Pulumi.yaml': named('a', 12), 'b/Pulumi.yaml': named('b', 12) });
+    await plan(dir, base, plans, runner);
+    // Applied as a change that only touches a (a base after b's change): b's plan isn't its
+    const onlyA = commit(dir, {}, 'empty');
+    assert.ok(onlyA);
+    await assert.rejects(
+      applyPlans({
+        cwd: dir,
+        directory: plans,
+        runner,
+        concurrency: 2,
+        select: { base, skip: ['b/dev'] },
+      }),
+      /b\/dev has a plan, but this change doesn't select it/,
+    );
+  });
+
+  test('applies stacks that depend on each other in a cycle, one at a time', async () => {
+    const quiet = (name: string, length: number) =>
+      `name: ${name}\nruntime: yaml\nresources:\n  word:\n    type: random:RandomString\n    properties:\n      length: ${length}\n`;
+    const { dir, runner, plans } = setup({
+      'a/Pulumi.yaml': quiet('a', 8),
+      'a/Pulumi.dev.yaml': 'config: {}\n',
+      'b/Pulumi.yaml': quiet('b', 8),
+      'b/Pulumi.dev.yaml': 'config: {}\n',
+      'pulumi-affected.yaml': 'dependsOn:\n  a/dev: [b/dev]\n  b/dev: [a/dev]\n',
+    });
+    deploy(dir, 'a');
+    deploy(dir, 'b');
+    const base = run(dir, 'git', ['rev-parse', 'HEAD']).trim();
+    commit(dir, { 'a/Pulumi.yaml': quiet('a', 9), 'b/Pulumi.yaml': quiet('b', 9) });
+    const manifest = await plan(dir, base, plans, runner);
+    assert.deepEqual(manifest.failed, []);
+    const result = await apply(dir, plans, runner);
+    assert.deepEqual(outcomes(result), { 'a/dev': 'applied', 'b/dev': 'applied' });
+  });
 });

@@ -48,6 +48,10 @@ inputs:
     description: How many stacks to preview at once.
     required: false
     default: '4'
+  fail-fast:
+    description: Stop at the first stack that fails to plan, instead of planning every other one.
+    required: false
+    default: 'false'
   upload:
     description: Upload the plan directory as the artifact `pulumi-plans-<git tree SHA>`, which apply looks for.
     required: false
@@ -104,6 +108,7 @@ runs:
         INPUT_DIRECTORY: ${{ inputs.directory }}
         INPUT_COMMAND: ${{ inputs.command }}
         INPUT_CONCURRENCY: ${{ inputs.concurrency }}
+        INPUT_FAIL_FAST: ${{ inputs.fail-fast }}
         INPUT_COMMENT: ${{ inputs.comment }}
         INPUT_PULL_REQUEST: ${{ inputs.pull-request }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}

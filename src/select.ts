@@ -7,6 +7,7 @@ import {
   type ModuleCache,
   type ProjectAnalysis,
 } from './analysis/program.ts';
+import { ProgramReferences } from './analysis/references.ts';
 import { findUp, parseJson } from './analysis/resolve.ts';
 import { type Config, loadConfig } from './config.ts';
 import { addEdge, CycleError, computeWaves, type DependencyGraph } from './graph.ts';
@@ -78,6 +79,11 @@ export interface SelectResult {
    * can't be worked out (or the dependency comes from `dependsOn`)
    */
   outputsRead: OutputsRead;
+  /**
+   * Stacks that may read other stacks' outputs in ways analysis can't see (programs that aren't
+   * JavaScript or TypeScript, stack names that can't be worked out) and have no `dependsOn`
+   */
+  unknownReaders: string[];
   warnings: string[];
 }
 
@@ -208,6 +214,7 @@ export function select(options: SelectOptions): SelectResult {
       [...graph].map(([id, dependencies]) => [id, [...dependencies].sort()]),
     ),
     outputsRead: session.outputsReadRecord(),
+    unknownReaders: [...session.unknownReaders].sort(),
     warnings: [...new Set(warnings)],
   };
 }
@@ -225,6 +232,8 @@ function stackBase(options: SelectOptions, stack: Stack, defaultBase: string, re
 export class Session {
   readonly warnings: string[] = [];
   readonly graphWarnings: string[] = [];
+  /** Stacks that may read other stacks' outputs in ways analysis can't see */
+  readonly unknownReaders = new Set<string>();
   /** Stack id → dependency id → outputs read, filled in by dependencyGraph */
   private readonly outputsRead = new Map<string, Map<string, Set<string> | 'all'>>();
 
@@ -293,6 +302,23 @@ export class Session {
       this.changes.set(base, changed);
     }
     return changed;
+  }
+
+  private readonly references = new Map<string, ProgramReferences>();
+
+  /** The head program of a project, for following stack references across modules */
+  private programReferences(project: Project, analysis: ProjectAnalysis) {
+    let references = this.references.get(project.file);
+    if (!references) {
+      const files = new Map<string, string>();
+      for (const path of analysis.modules) {
+        const text = this.head.read(path);
+        if (text !== undefined) files.set(path, text);
+      }
+      references = new ProgramReferences(files, analysis.entry, analysis.resolveFile);
+      this.references.set(project.file, references);
+    }
+    return references;
   }
 
   analysis(snapshot: Snapshot, project: Project) {
@@ -565,7 +591,14 @@ export class Session {
   dependencyGraph(projects: Project[], stacks: Stack[]): DependencyGraph {
     const graph: DependencyGraph = new Map();
     for (const project of projects) {
-      if (!isNodeRuntime(project)) continue;
+      if (!isNodeRuntime(project)) {
+        // Their stack references aren't analysed; a YAML program shows whether it has any
+        const text = project.runtime === 'yaml' ? (this.head.read(project.file) ?? '') : undefined;
+        if (text === undefined || text.includes('StackReference')) {
+          for (const stack of project.stacks) this.unknownReaders.add(stack.id);
+        }
+        continue;
+      }
       const analysis = this.analysis(this.head, project);
       for (const stack of project.stacks) {
         const stackConfig = parseYamlFile(this.head, stack.configFile) as
@@ -587,30 +620,39 @@ export class Session {
             unknown: WILDCARD,
           });
           const targets = stacksNamed(name ?? WILDCARD, project, stacks);
+          if (targets.length === 0) this.unknownReaders.add(stack.id);
           if (name === undefined || name === WILDCARD) {
             this.graphWarnings.push(
               `${stack.id}: a StackReference in ${module.path} has a name that can't be worked out; add it to dependsOn`,
             );
           }
           // Output names are worked out like stack names: constants, templates, config
-          const outputs: string[] | 'all' =
-            use.outputs === 'all'
-              ? 'all'
-              : (() => {
-                  const names: string[] = [];
-                  for (const expression of use.outputs) {
-                    const output = evaluateString(expression, module, {
-                      lookup: analysis.lookup,
-                      stack: stack.stack,
-                      project: project.name,
-                      config: readConfig,
-                      unknown: undefined,
-                    });
-                    if (output === undefined) return 'all';
-                    names.push(output);
-                  }
-                  return names;
-                })();
+          // Names this module shows are worked out like stack names (constants, templates,
+          // config); beyond that, the reference is followed through the whole program
+          const local = (() => {
+            if (use.outputs === 'all') return 'all';
+            const names: string[] = [];
+            for (const expression of use.outputs) {
+              const output = evaluateString(expression, module, {
+                lookup: analysis.lookup,
+                stack: stack.stack,
+                project: project.name,
+                config: readConfig,
+                unknown: undefined,
+              });
+              if (output === undefined) return 'all';
+              names.push(output);
+            }
+            return names;
+          })();
+          const outputs =
+            local !== 'all'
+              ? local
+              : this.programReferences(project, analysis).outputsRead(
+                  module.path,
+                  use.ordinal,
+                  use.total,
+                );
           for (const target of targets) {
             addEdge(graph, stack.id, target.id);
             this.recordReads(stack.id, target.id, outputs);
@@ -626,6 +668,7 @@ export class Session {
           addEdge(graph, stack.id, dependency.id);
           // What a stack reads from a dependency the analysis can't see is unknown
           this.recordReads(stack.id, dependency.id, 'all');
+          this.unknownReaders.delete(stack.id);
         }
       }
     }
@@ -892,6 +935,7 @@ export function readDependencyGraph(options: { cwd: string; head?: string; confi
     stacks,
     graph,
     outputsRead: session.outputsReadRecord(),
+    unknownReaders: [...session.unknownReaders].sort(),
     warnings: session.graphWarnings,
   };
 }

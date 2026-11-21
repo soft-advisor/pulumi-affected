@@ -1,6 +1,7 @@
 import { existsSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { applyPlans } from '../plan/apply.ts';
+import { type ApplyOptions, applyPlans } from '../plan/apply.ts';
+import { eventContext } from './context.ts';
 import { MANIFEST_FILE } from '../plan/manifest.ts';
 import { describeRead } from '../plan/outputs.ts';
 import { renderApply } from '../plan/report.ts';
@@ -44,12 +45,50 @@ interface Artifact {
   name: string;
   expired: boolean;
   created_at: string;
-  workflow_run?: { id: number; repository_id: number; head_repository_id: number };
+  workflow_run?: {
+    id: number;
+    repository_id: number;
+    head_repository_id: number;
+    head_sha: string;
+  };
+}
+
+interface PullRequest {
+  number: number;
+  merged_at: string | null;
+  body: string | null;
+  head: { sha: string };
+}
+
+/**
+ * The pull requests the checked-out commit belongs to: the triggering one, the pull-request
+ * input, or those a pushed commit was merged from
+ */
+async function pullRequestsOf(api: GitHubApi, sha: string): Promise<PullRequest[]> {
+  const number = pullRequestNumber(readEvent());
+  if (number !== undefined) {
+    return [await api.request<PullRequest>('GET', api.repo(`/pulls/${number}`))];
+  }
+  return api.request<PullRequest[]>('GET', api.repo(`/commits/${sha}/pulls`));
+}
+
+/**
+ * Commits whose plan runs may supply the plans: the head of the pull request this code came
+ * from, or this commit itself. Another branch's run can't, even with the same tree: its plans
+ * weren't the ones reviewed.
+ */
+async function trustedHeads(api: GitHubApi, sha: string) {
+  const explicit = input('plan-sha');
+  if (explicit) return new Set([explicit]);
+  const heads = new Set([sha]);
+  for (const pull of await pullRequestsOf(api, sha)) heads.add(pull.head.sha);
+  return heads;
 }
 
 async function locate() {
   const repoRoot = repoRootOf(input('working-directory') || process.cwd());
   const tree = git(repoRoot, ['rev-parse', 'HEAD^{tree}']).trim();
+  const sha = git(repoRoot, ['rev-parse', 'HEAD']).trim();
   const name = `pulumi-plans-${tree}`;
   const directory = input('directory');
   if (directory && existsSync(join(resolve(directory), MANIFEST_FILE))) {
@@ -57,12 +96,14 @@ async function locate() {
     setOutput('directory', resolve(directory));
     return;
   }
-  const target = resolve(directory || join(process.env.RUNNER_TEMP ?? '.', name));
+  // Downloads go outside the checkout, so they can never land on its files
+  const target = join(process.env.RUNNER_TEMP ?? resolve('..'), name);
+  const token = input('github-token');
+  if (!token) throw new Error('No plans in directory and no github-token to find their artifact');
+  const api = new GitHubApi(token);
+  const heads = await trustedHeads(api, sha);
   let runId = input('run-id');
   if (!runId) {
-    const token = input('github-token');
-    if (!token) throw new Error('No plans in directory and no github-token to find their artifact');
-    const api = new GitHubApi(token);
     const { artifacts } = await api.request<{ artifacts: Artifact[] }>(
       'GET',
       api.repo(`/actions/artifacts?name=${encodeURIComponent(name)}&per_page=100`),
@@ -70,21 +111,22 @@ async function locate() {
     const usable = artifacts
       .filter(
         (artifact) =>
-          artifact.name === name && !artifact.expired && isOwnRun(artifact.workflow_run),
+          artifact.name === name &&
+          !artifact.expired &&
+          isOwnRun(artifact.workflow_run) &&
+          heads.has(artifact.workflow_run?.head_sha ?? ''),
       )
       .sort((a, b) => b.created_at.localeCompare(a.created_at));
     if (usable.length === 0) {
       throw new Error(
-        `No artifact ${name}: plan this exact code first (the checkout's tree is ${tree})`,
+        `No artifact ${name} from a run of ${[...heads].join(' or ')}: plan this exact code first (the checkout's tree is ${tree})`,
       );
     }
     runId = String(usable[0].workflow_run?.id);
   } else {
-    const token = input('github-token');
-    if (!token) throw new Error('No github-token to check run-id');
-    const api = new GitHubApi(token);
     const run = await api.request<{
       id: number;
+      head_sha: string;
       repository?: { id?: number };
       head_repository?: { id?: number };
     }>('GET', api.repo(`/actions/runs/${encodeURIComponent(runId)}`));
@@ -93,6 +135,11 @@ async function locate() {
     ) {
       throw new Error(`Run ${runId} isn't from this repository's own branches`);
     }
+    if (!heads.has(run.head_sha)) {
+      throw new Error(
+        `Run ${runId} ran on ${run.head_sha}, not on ${[...heads].join(' or ')}; set plan-sha if that's intended`,
+      );
+    }
   }
   setOutput('download', 'true');
   setOutput('name', name);
@@ -100,10 +147,45 @@ async function locate() {
   setOutput('directory', target);
 }
 
+/**
+ * How the change is selected, as the plan selected it: its base (the input, else the event's),
+ * Pulumi-Affected-Run/Skip lines in its pull request, and the same run/skip/all/bases inputs
+ */
+async function selection(cwd: string): Promise<ApplyOptions['select']> {
+  const repoRoot = repoRootOf(cwd);
+  const explicitBase = input('base');
+  const context = explicitBase ? undefined : eventContext(readEvent(), repoRoot);
+  for (const message of context?.warnings ?? []) warning(message);
+  const base = explicitBase || context?.base;
+  if (!base && !booleanInput('all') && !context?.all) {
+    throw new Error(
+      "There's no revision to compare with, so which stacks this change selects can't be checked; set the base input",
+    );
+  }
+  const messages = [...(context?.messages ?? [])];
+  const token = input('github-token');
+  if (token && messages.length === 0) {
+    const sha = git(repoRoot, ['rev-parse', 'HEAD']).trim();
+    for (const pull of await pullRequestsOf(new GitHubApi(token), sha)) {
+      messages.push(pull.body ?? '');
+    }
+  }
+  return {
+    base: base || 'HEAD',
+    bases: input('bases') ? JSON.parse(input('bases')) : undefined,
+    run: splitPatterns(input('run')),
+    skip: splitPatterns(input('skip')),
+    all: booleanInput('all') || context?.all,
+    messages,
+  };
+}
+
 async function apply() {
   const cwd = input('working-directory') || process.cwd();
   const directory = resolve(input('plans'));
   const result = await applyPlans({
+    select: await selection(cwd),
+    failFast: booleanInput('fail-fast'),
     cwd,
     directory,
     runner: commandRunner(input('command') || DEFAULT_COMMAND, repoRootOf(cwd)),
@@ -153,7 +235,7 @@ async function apply() {
 }
 
 /** The pull request a pushed commit came from */
-async function mergedPullRequest(token: string, cwd: string) {
+async function mergedPullRequest(token: string, cwd: string): Promise<number | undefined> {
   const api = new GitHubApi(token);
   const sha = git(repoRootOf(cwd), ['rev-parse', 'HEAD']).trim();
   const pulls = await api.request<{ number: number; merged_at: string | null }[]>(

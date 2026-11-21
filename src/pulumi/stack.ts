@@ -18,7 +18,14 @@ import {
  * self-managed backends always record 0.
  */
 
-export type StateFingerprint = { kind: 'exists'; fingerprint: string } | { kind: 'missing' };
+export type StateFingerprint =
+  | {
+      kind: 'exists';
+      fingerprint: string;
+      /** The passphrase secrets provider's salt, when the state records one */
+      salt?: string;
+    }
+  | { kind: 'missing' };
 
 export class StackError extends Error {}
 
@@ -30,7 +37,13 @@ export async function stateFingerprint(
   if (isMissingStack(result)) return { kind: 'missing' };
   if (result.code !== 0) throw failure(stack, "can't export the stack's state", result);
   const exported = parseLastJsonObject(result.stdout) as
-    | { deployment?: { resources?: unknown; pending_operations?: unknown } }
+    | {
+        deployment?: {
+          resources?: unknown;
+          pending_operations?: unknown;
+          secrets_providers?: { type?: string; state?: { salt?: unknown } };
+        };
+      }
     | undefined;
   if (!exported) throw new StackError(`${stack.id}: the stack export isn't JSON`);
   // Resources and pending operations are the state; the export's own timestamps aren't
@@ -38,7 +51,13 @@ export async function stateFingerprint(
     exported?.deployment?.resources ?? [],
     exported?.deployment?.pending_operations ?? [],
   ]);
-  return { kind: 'exists', fingerprint: createHash('sha256').update(state).digest('hex') };
+  const providers = exported?.deployment?.secrets_providers;
+  const salt = providers?.type === 'passphrase' ? providers.state?.salt : undefined;
+  return {
+    kind: 'exists',
+    fingerprint: createHash('sha256').update(state).digest('hex'),
+    ...(typeof salt === 'string' ? { salt } : {}),
+  };
 }
 
 interface HistoryEntry {

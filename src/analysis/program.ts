@@ -26,6 +26,8 @@ export interface ProjectAnalysis {
   /** npm package name → files that load it */
   packages: Map<string, Set<string>>;
   stackReferences: { module: ModuleInfo; use: StackReferenceUse }[];
+  /** Paths of the modules the program loads */
+  modules: string[];
   /**
    * Where analysis may have missed inputs (a computed `require`, an unresolvable import, a file
    * read whose path can't be worked out). Selection then also counts any change in the project
@@ -37,6 +39,8 @@ export interface ProjectAnalysis {
   programDir: string;
   /** Finds constants in this snapshot's modules, for evaluating stack reference names */
   lookup: EvaluationContext['lookup'];
+  /** Resolves an import to a repository file, as this analysis does */
+  resolveFile(specifier: string, from: string): string | undefined;
 }
 
 export interface Gap {
@@ -113,10 +117,15 @@ export function analyzeProject(
     chains: new Map(),
     packages: new Map(),
     stackReferences: [],
+    modules: [],
     gaps: [],
     entry: findEntry(snapshot, project, programDir, resolver),
     programDir,
     lookup: () => undefined,
+    resolveFile: (specifier, from) => {
+      const resolution = resolver.resolve(specifier, from);
+      return resolution.kind === 'file' ? resolution.path : undefined;
+    },
   };
   const addGap = (message: string, dir: string) => analysis.gaps.push({ message, dir });
   for (const extendsPackage of resolver.configPackages) {
@@ -482,6 +491,7 @@ export function analyzeProject(
     const used = bindings.get(path);
     if (used) facts.set(`imports:${path}`, [...used].sort().join(' '));
   }
+  analysis.modules = [...loaded].filter((path) => modules.get(path) !== undefined);
   return analysis;
 
   function addPackageReference(name: string, from: string) {
