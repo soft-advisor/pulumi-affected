@@ -283,29 +283,73 @@ async function readOutputs(runner: PulumiRunner, stack: Stack) {
   const result = await runner.run(stack, ['stack', 'output', '--json', '--show-secrets']);
   if (isMissingStack(result)) return 'missing' as const;
   if (result.code !== 0) return 'failed' as const;
-  try {
-    return (JSON.parse(result.stdout || '{}') ?? {}) as Record<string, unknown>;
-  } catch {
-    return 'failed' as const;
-  }
+  // A wrapper script may print lines of its own before Pulumi's JSON
+  const parsed = parseFirstJson(result.stdout || '{}');
+  return parsed && typeof parsed === 'object'
+    ? (parsed as Record<string, unknown>)
+    : ('failed' as const);
 }
 
+export type DeployHistory =
+  /**
+   * Compare with this commit. `lastFailed` when a newer deploy failed after it; `dirty` when it
+   * was deployed with uncommitted changes (Pulumi's own encryption salts count, so this is common
+   * and only worth a warning)
+   */
+  | { kind: 'commit'; sha: string; lastFailed: boolean; dirty: boolean }
+  /** No stack, no successful deploy, or destroyed since */
+  | { kind: 'never' }
+  /** Deployed, but not from a known commit; run it to be safe */
+  | { kind: 'unknown'; why: string };
+
+const HISTORY_PAGE_SIZE = 100;
+const MAX_HISTORY_PAGES = 20;
+
 /**
- * The commit a stack was last deployed from: Pulumi records `git.head` in each update's
- * environment. Null when the stack doesn't exist or has never been deployed successfully.
+ * What a stack was last deployed from: Pulumi records `git.head` in each update's environment.
+ * Refreshes are skipped. A deploy of only some resources (--target), or with no commit recorded,
+ * doesn't say what's deployed, so it's unknown.
  */
-export async function lastDeployedCommit(runner: PulumiRunner, stack: Stack) {
-  const result = await runner.run(stack, ['stack', 'history', '--json', '--page-size', '50']);
-  if (isMissingStack(result)) return null;
-  if (result.code !== 0)
-    throw new Error(`${stack.id}: can't read the stack history: ${errorText(result)}`);
-  const history = parseFirstJsonArray(result.stdout);
-  for (const update of history) {
-    if (update.kind !== 'update' || update.result !== 'succeeded') continue;
-    const head = update.environment?.['git.head'];
-    return typeof head === 'string' && head ? head : undefined;
+export async function deployHistory(runner: PulumiRunner, stack: Stack): Promise<DeployHistory> {
+  let lastFailed = false;
+  for (let page = 1; page <= MAX_HISTORY_PAGES; page++) {
+    const result = await runner.run(stack, [
+      'stack',
+      'history',
+      '--json',
+      '--page-size',
+      String(HISTORY_PAGE_SIZE),
+      '--page',
+      String(page),
+    ]);
+    if (isMissingStack(result)) return { kind: 'never' };
+    if (result.code !== 0) {
+      throw new Error(`${stack.id}: can't read the stack history: ${errorText(result)}`);
+    }
+    const history = parseJsonArray(result.stdout);
+    if (history === undefined) {
+      throw new Error(`${stack.id}: the stack history isn't the JSON Pulumi prints`);
+    }
+    for (const update of history) {
+      if (update.kind === 'destroy' && update.result === 'succeeded') return { kind: 'never' };
+      if (update.kind !== 'update') continue;
+      if (update.result !== 'succeeded') {
+        lastFailed = true;
+        continue;
+      }
+      const environment = update.environment ?? {};
+      const head = environment['git.head'];
+      if (environment['pulumi.flag.target'] && environment['pulumi.flag.target'] !== 'false') {
+        return { kind: 'unknown', why: 'its last deploy only updated some resources (--target)' };
+      }
+      if (typeof head !== 'string' || !/^[0-9a-f]{40}$/.test(head)) {
+        return { kind: 'unknown', why: "its last deploy didn't record a commit" };
+      }
+      return { kind: 'commit', sha: head, lastFailed, dirty: environment['git.dirty'] === 'true' };
+    }
+    if (history.length < HISTORY_PAGE_SIZE) break;
   }
-  return null;
+  return { kind: 'never' };
 }
 
 interface HistoryEntry {
@@ -314,13 +358,15 @@ interface HistoryEntry {
   environment?: Record<string, string>;
 }
 
-function parseFirstJsonArray(text: string): HistoryEntry[] {
-  const start = text.indexOf('[');
-  if (start === -1) return [];
+/** The JSON array in output that a wrapper script may have printed other lines around */
+function parseJsonArray(text: string): HistoryEntry[] | undefined {
+  const start = text.indexOf('\n[') === -1 ? text.indexOf('[') : text.indexOf('\n[') + 1;
+  const end = text.lastIndexOf(']');
+  if (start === -1 || end < start) return text.trim() === '' ? [] : undefined;
   try {
-    return JSON.parse(text.slice(start)) as HistoryEntry[];
+    return JSON.parse(text.slice(start, end + 1)) as HistoryEntry[];
   } catch {
-    return [];
+    return undefined;
   }
 }
 

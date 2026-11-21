@@ -235672,6 +235672,7 @@ function evaluateString(node, module2, context, depth = 0) {
   }
   if (import_typescript.default.isIdentifier(node)) {
     if (node.text === "__dirname") return MODULE_DIR;
+    if (isLocallyBound(node)) return unknown;
     const target = context.lookup(module2, node.text);
     return target ? evaluateString(target.node, target.module, context, depth + 1) : unknown;
   }
@@ -235743,6 +235744,38 @@ function evaluateConfigRead(node, module2, context, key) {
   const namespace = namespaceArgument ? evaluateString(namespaceArgument, receiverModule, { ...context, unknown: void 0 }) : context.project;
   return namespace === void 0 ? void 0 : context.config(namespace, key);
 }
+function isLocallyBound(identifier) {
+  const name = identifier.text;
+  for (let node = identifier.parent; node && !import_typescript.default.isSourceFile(node); node = node.parent) {
+    if (import_typescript.default.isFunctionLike(node)) {
+      if (node.parameters.some((parameter) => bindsName(parameter.name, name))) return true;
+    }
+    if (import_typescript.default.isCatchClause(node) && node.variableDeclaration && bindsName(node.variableDeclaration.name, name)) {
+      return true;
+    }
+    if ((import_typescript.default.isForStatement(node) || import_typescript.default.isForInStatement(node) || import_typescript.default.isForOfStatement(node)) && node.initializer && import_typescript.default.isVariableDeclarationList(node.initializer) && node.initializer.declarations.some((declaration) => bindsName(declaration.name, name))) {
+      return true;
+    }
+    if (import_typescript.default.isBlock(node) || import_typescript.default.isModuleBlock(node) || import_typescript.default.isCaseClause(node) || import_typescript.default.isDefaultClause(node)) {
+      for (const statement of node.statements) {
+        if (import_typescript.default.isVariableStatement(statement)) {
+          const declarations = statement.declarationList.declarations;
+          if (declarations.some((declaration) => bindsName(declaration.name, name))) return true;
+        }
+        if ((import_typescript.default.isFunctionDeclaration(statement) || import_typescript.default.isClassDeclaration(statement)) && statement.name?.text === name) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+function bindsName(binding, name) {
+  if (import_typescript.default.isIdentifier(binding)) return binding.text === name;
+  return binding.elements.some(
+    (element) => !import_typescript.default.isOmittedExpression(element) && bindsName(element.name, name)
+  );
+}
 function calleeName(callee) {
   if (import_typescript.default.isIdentifier(callee)) return callee.text;
   if (import_typescript.default.isPropertyAccessExpression(callee)) return callee.name.text;
@@ -235761,6 +235794,8 @@ var import_node_crypto = require("node:crypto");
 var import_node_fs = require("node:fs");
 var import_node_path = require("node:path");
 var MAX_GIT_OUTPUT = 512 * 1024 * 1024;
+var MAX_LINK_HOPS = 40;
+var PREFETCH = /\.(?:[cm]?[jt]sx?|json|ya?ml)$/;
 function git(repoRoot, args, input2) {
   return (0, import_node_child_process.execFileSync)("git", args, {
     cwd: repoRoot,
@@ -235778,10 +235813,50 @@ function resolveCommit(repoRoot, rev) {
 }
 var BaseSnapshot = class {
   directories;
+  get paths() {
+    return [...this.entries.keys()];
+  }
+  realPath(path) {
+    let current = trimSlashes(path);
+    for (let hops = 0; hops < MAX_LINK_HOPS; hops++) {
+      const parts = current.split("/");
+      let resolved = false;
+      for (let index = 1; index <= parts.length; index++) {
+        const prefix = parts.slice(0, index).join("/");
+        const entry = this.entries.get(prefix);
+        if (entry?.kind !== "link") continue;
+        const target = resolveLink(dirnameOf(prefix), entry.target);
+        if (target === void 0) return void 0;
+        current = joinPath(target, ...parts.slice(index));
+        resolved = true;
+        break;
+      }
+      if (!resolved) return current;
+    }
+    return void 0;
+  }
+  has(path) {
+    const real = this.realPath(path);
+    return real !== void 0 && this.entries.get(real)?.kind === "file";
+  }
+  hash(path) {
+    const real = this.realPath(path);
+    const target = real === void 0 ? void 0 : this.entries.get(real);
+    if (real !== void 0 && target) return this.idOf(real, target);
+    const own = this.entries.get(path);
+    return own ? this.idOf(path, own) : void 0;
+  }
+  read(path) {
+    const real = this.realPath(path);
+    const target = real === void 0 ? void 0 : this.entries.get(real);
+    if (real !== void 0 && target?.kind === "file") return this.readFile(real, target);
+    const own = this.entries.get(path);
+    return own?.kind === "link" ? own.target : void 0;
+  }
   isDirectory(path) {
     if (!this.directories) {
       this.directories = /* @__PURE__ */ new Set([""]);
-      for (const file of this.paths) {
+      for (const file of this.entries.keys()) {
         let slash = file.lastIndexOf("/");
         while (slash > 0) {
           const dir = file.slice(0, slash);
@@ -235791,92 +235866,139 @@ var BaseSnapshot = class {
         }
       }
     }
-    return this.directories.has(trimSlashes(path));
+    const real = this.realPath(path);
+    return real !== void 0 && this.directories.has(real);
   }
 };
+function resolveLink(dir, target) {
+  if (target.startsWith("/")) return void 0;
+  const parts = dir === "" ? [] : dir.split("/");
+  for (const segment of target.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      if (parts.length === 0) return void 0;
+      parts.pop();
+    } else {
+      parts.push(segment);
+    }
+  }
+  return parts.join("/");
+}
+var blobContents = /* @__PURE__ */ new Map();
 var GitSnapshot = class extends BaseSnapshot {
   label;
-  paths;
-  blobs = /* @__PURE__ */ new Map();
-  contents = /* @__PURE__ */ new Map();
+  entries = /* @__PURE__ */ new Map();
   repoRoot;
+  prefetched = false;
   constructor(repoRoot, commit) {
     super();
     this.repoRoot = repoRoot;
     this.label = commit;
     const listing = git(repoRoot, ["ls-tree", "-r", "-z", "--full-tree", commit]);
-    for (const entry of listing.split("\0")) {
-      if (!entry) continue;
-      const tab = entry.indexOf("	");
-      const [, type, object] = entry.slice(0, tab).split(" ");
-      if (type === "blob") this.blobs.set(entry.slice(tab + 1), object);
+    const links = [];
+    for (const record of listing.split("\0")) {
+      if (!record) continue;
+      const tab = record.indexOf("	");
+      const [mode, type, object] = record.slice(0, tab).split(" ");
+      const path = record.slice(tab + 1);
+      if (type === "commit") this.entries.set(path, { kind: "submodule", id: object });
+      else if (mode === "120000") links.push([path, object]);
+      else if (type === "blob") this.entries.set(path, { kind: "file", id: object });
     }
-    this.paths = [...this.blobs.keys()];
+    const targets = readBlobs(
+      repoRoot,
+      links.map(([, id]) => id)
+    );
+    for (const [path, id] of links) {
+      this.entries.set(path, { kind: "link", id, target: targets.get(id) ?? "" });
+    }
   }
-  has(path) {
-    return this.blobs.has(path);
+  idOf(_path, entry) {
+    return entry.id ?? "";
   }
-  hash(path) {
-    return this.blobs.get(path);
-  }
-  read(path) {
-    const blob = this.blobs.get(path);
-    if (!blob) return void 0;
-    let content = this.contents.get(blob);
+  readFile(_path, entry) {
+    const id = entry.id ?? "";
+    if (!blobContents.has(id) && !this.prefetched) {
+      this.prefetched = true;
+      const wanted = [...this.entries].filter(([path, other]) => other.kind === "file" && PREFETCH.test(path)).map(([, other]) => other.id ?? "").filter((other) => !blobContents.has(other));
+      for (const [blob, content2] of readBlobs(this.repoRoot, wanted))
+        blobContents.set(blob, content2);
+    }
+    let content = blobContents.get(id);
     if (content === void 0) {
-      content = git(this.repoRoot, ["cat-file", "blob", blob]);
-      this.contents.set(blob, content);
+      content = git(this.repoRoot, ["cat-file", "blob", id]);
+      blobContents.set(id, content);
     }
     return content;
   }
 };
+function readBlobs(repoRoot, ids) {
+  const contents = /* @__PURE__ */ new Map();
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) return contents;
+  const output = (0, import_node_child_process.execFileSync)("git", ["cat-file", "--batch"], {
+    cwd: repoRoot,
+    input: `${unique.join("\n")}
+`,
+    maxBuffer: MAX_GIT_OUTPUT,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  let offset = 0;
+  while (offset < output.length) {
+    const headerEnd = output.indexOf(10, offset);
+    if (headerEnd === -1) break;
+    const [id, type, size] = output.subarray(offset, headerEnd).toString("utf8").split(" ");
+    offset = headerEnd + 1;
+    if (type === "missing" || size === void 0) continue;
+    const length = Number(size);
+    contents.set(id, output.subarray(offset, offset + length).toString("utf8"));
+    offset += length + 1;
+  }
+  return contents;
+}
 var WorktreeSnapshot = class extends BaseSnapshot {
   label = "working tree";
-  paths;
-  present;
-  hashes = /* @__PURE__ */ new Map();
+  entries = /* @__PURE__ */ new Map();
   repoRoot;
   constructor(repoRoot) {
     super();
     this.repoRoot = repoRoot;
+    const submodules = /* @__PURE__ */ new Map();
+    for (const record of git(repoRoot, ["ls-files", "-z", "--stage"]).split("\0")) {
+      const tab = record.indexOf("	");
+      const [mode, object] = record.slice(0, tab).split(" ");
+      if (mode === "160000") submodules.set(record.slice(tab + 1), object);
+    }
     const listing = git(repoRoot, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]);
-    const paths = /* @__PURE__ */ new Set();
     for (const path of listing.split("\0")) {
-      if (path && isFileOrLink((0, import_node_path.join)(repoRoot, path))) {
-        paths.add(path);
+      if (!path) continue;
+      const submodule = submodules.get(path);
+      if (submodule) {
+        this.entries.set(path, { kind: "submodule", id: submodule });
+        continue;
+      }
+      let stats;
+      try {
+        stats = (0, import_node_fs.lstatSync)((0, import_node_path.join)(repoRoot, path));
+      } catch {
+        continue;
+      }
+      if (stats.isSymbolicLink()) {
+        const target = (0, import_node_fs.readlinkSync)((0, import_node_path.join)(repoRoot, path));
+        this.entries.set(path, { kind: "link", id: gitBlobId(Buffer.from(target)), target });
+      } else if (stats.isFile()) {
+        this.entries.set(path, { kind: "file" });
       }
     }
-    this.present = paths;
-    this.paths = [...paths];
   }
-  has(path) {
-    return this.present.has(path);
+  idOf(path, entry) {
+    if (entry.id === void 0) entry.id = gitBlobId((0, import_node_fs.readFileSync)((0, import_node_path.join)(this.repoRoot, path)));
+    return entry.id;
   }
-  read(path) {
-    if (!this.present.has(path)) return void 0;
-    return readRaw((0, import_node_path.join)(this.repoRoot, path)).toString("utf8");
-  }
-  hash(path) {
-    if (!this.present.has(path)) return void 0;
-    let hash = this.hashes.get(path);
-    if (!hash) {
-      hash = gitBlobId(readRaw((0, import_node_path.join)(this.repoRoot, path)));
-      this.hashes.set(path, hash);
-    }
-    return hash;
+  readFile(path) {
+    return (0, import_node_fs.readFileSync)((0, import_node_path.join)(this.repoRoot, path), "utf8");
   }
 };
-function isFileOrLink(path) {
-  try {
-    const stats = (0, import_node_fs.lstatSync)(path);
-    return stats.isFile() || stats.isSymbolicLink();
-  } catch {
-    return false;
-  }
-}
-function readRaw(path) {
-  return (0, import_node_fs.lstatSync)(path).isSymbolicLink() ? Buffer.from((0, import_node_fs.readlinkSync)(path)) : (0, import_node_fs.readFileSync)(path);
-}
 function gitBlobId(content) {
   return (0, import_node_crypto.createHash)("sha1").update(`blob ${content.length}\0`).update(content).digest("hex");
 }
@@ -235931,8 +236053,30 @@ var ASSET_READERS = /* @__PURE__ */ new Set([
   "readdirSync",
   "readdir",
   "FileAsset",
-  "FileArchive"
+  "FileArchive",
+  "existsSync",
+  "statSync",
+  "lstatSync",
+  "readJson",
+  "readJsonSync",
+  "globSync",
+  "glob"
 ]);
+var PATH_PROPERTIES = /* @__PURE__ */ new Set([
+  "context",
+  "dockerfile",
+  "path",
+  "dir",
+  "directory",
+  "location",
+  "cwd",
+  "source",
+  "root",
+  "file",
+  "filename",
+  "codePath"
+]);
+var RELATIVE_PATH = /^\.\.?\//;
 function parseModule(path, text, options) {
   if (path.endsWith(".json")) return parseJsonModule(path, text);
   const output = import_typescript2.default.transpileModule(text, {
@@ -235945,7 +236089,9 @@ function parseModule(path, text, options) {
       target: import_typescript2.default.ScriptTarget.ESNext,
       // TypeScript's default follows the target, so keep what the configured target implies
       useDefineForClassFields: options.useDefineForClassFields ?? (options.target ?? import_typescript2.default.ScriptTarget.ES5) >= import_typescript2.default.ScriptTarget.ES2022,
-      module: import_typescript2.default.ModuleKind.ESNext,
+      // ESM syntax stays as written, and `import x = require()` and `export =` become the
+      // require() and module.exports they are at runtime
+      module: import_typescript2.default.ModuleKind.Preserve,
       removeComments: true,
       sourceMap: false,
       inlineSourceMap: false,
@@ -235969,19 +236115,32 @@ function parseModule(path, text, options) {
     starExports: [],
     items: [],
     itemsByName: /* @__PURE__ */ new Map(),
-    source
+    source,
+    order: []
   };
-  const anonymous = /* @__PURE__ */ new Map();
+  const keys = /* @__PURE__ */ new Map();
   const addItem = (item) => {
     if (module2.opaque) item.eager = true;
+    const seen = (keys.get(item.key) ?? 0) + 1;
+    keys.set(item.key, seen);
+    if (seen > 1) item.key = `${item.key}.${seen}`;
+    for (const name of item.names) {
+      const earlier = module2.itemsByName.get(name);
+      if (earlier && earlier !== item) {
+        earlier.siblings.push(item);
+        item.siblings.push(earlier);
+      }
+      if (!earlier) module2.itemsByName.set(name, item);
+    }
     module2.items.push(item);
-    for (const name of item.names) module2.itemsByName.set(name, item);
+    module2.order.push(item.key);
   };
   for (const statement of source.statements) {
     if (import_typescript2.default.isImportDeclaration(statement)) {
       const specifier = stringValue(statement.moduleSpecifier);
       if (specifier === void 0) continue;
       module2.loads.push(specifier);
+      module2.order.push(`load ${specifier}`);
       const clause = statement.importClause;
       if (clause?.name) module2.imports.set(clause.name.text, { specifier, imported: "default" });
       const bindings = clause?.namedBindings;
@@ -235997,7 +236156,10 @@ function parseModule(path, text, options) {
     }
     if (import_typescript2.default.isExportDeclaration(statement)) {
       const specifier = statement.moduleSpecifier && stringValue(statement.moduleSpecifier);
-      if (specifier !== void 0) module2.loads.push(specifier);
+      if (specifier !== void 0) {
+        module2.loads.push(specifier);
+        module2.order.push(`load ${specifier}`);
+      }
       const clause = statement.exportClause;
       if (!clause) {
         if (specifier !== void 0) module2.starExports.push(specifier);
@@ -236046,10 +236208,7 @@ function parseModule(path, text, options) {
     }
     if (statement.kind === import_typescript2.default.SyntaxKind.EmptyStatement) continue;
     const item = makeItem("", [], true, statement);
-    const contentKey = `#${(0, import_node_crypto2.createHash)("sha256").update(item.code).digest("hex").slice(0, 10)}`;
-    const occurrence = (anonymous.get(contentKey) ?? 0) + 1;
-    anonymous.set(contentKey, occurrence);
-    item.key = occurrence === 1 ? contentKey : `${contentKey}.${occurrence}`;
+    item.key = `#${(0, import_node_crypto2.createHash)("sha256").update(item.code).digest("hex").slice(0, 10)}`;
     addItem(item);
   }
   return module2;
@@ -236062,6 +236221,10 @@ function makeItem(key, names, eager, node, prefix = "") {
     code: `${prefix} ${normalizeCode(node)}`.trim(),
     refs: [],
     assets: [],
+    calls: [],
+    pathCandidates: [],
+    resolved: [],
+    siblings: [],
     stackReferences: [],
     unanalysable: []
   };
@@ -236103,6 +236266,9 @@ function collectRefs(root, item, ownNames) {
     for (const modifier of [...modifiers ?? [], ...decorators ?? []]) visit(modifier);
   };
   function visit(node) {
+    if (import_typescript2.default.isStringLiteralLike(node) && RELATIVE_PATH.test(node.text) && !isModuleSpecifier(node)) {
+      item.pathCandidates.push(node);
+    }
     if (import_typescript2.default.isIdentifier(node)) {
       addName(node.text);
       return;
@@ -236130,6 +236296,8 @@ function collectRefs(root, item, ownNames) {
     }
     if (import_typescript2.default.isPropertyAssignment(node)) {
       visitPropertyName(node.name);
+      const property = import_typescript2.default.isIdentifier(node.name) || import_typescript2.default.isStringLiteral(node.name) ? node.name.text : "";
+      if (PATH_PROPERTIES.has(property)) item.pathCandidates.push(node.initializer);
       visit(node.initializer);
       return;
     }
@@ -236197,12 +236365,38 @@ function inspectCall(node, item) {
     }
     return;
   }
+  const isRequireResolve = import_typescript2.default.isPropertyAccessExpression(callee) && import_typescript2.default.isIdentifier(callee.expression) && callee.expression.text === "require" && callee.name.text === "resolve";
+  if (isRequireResolve && firstArgument) {
+    item.resolved.push(firstArgument);
+    return;
+  }
   const name = import_typescript2.default.isIdentifier(callee) ? callee.text : import_typescript2.default.isPropertyAccessExpression(callee) ? callee.name.text : void 0;
+  const isGlobal = import_typescript2.default.isIdentifier(callee);
+  if (isGlobal && (name === "eval" || name === "Function")) {
+    item.unanalysable.push(
+      `${name === "eval" ? "eval()" : "new Function()"} runs code that can't be analysed`
+    );
+  }
+  if (name === "createRequire") {
+    item.unanalysable.push("createRequire() makes requires that can't be followed");
+  }
   if (!name || !firstArgument) return;
   if (ASSET_READERS.has(name)) item.assets.push(firstArgument);
+  const object = import_typescript2.default.isPropertyAccessExpression(callee) && import_typescript2.default.isIdentifier(callee.expression) ? callee.expression.text : void 0;
+  if (import_typescript2.default.isIdentifier(callee) || object !== void 0) {
+    item.calls.push({ object, name, argument: firstArgument });
+  }
   if (name === "StackReference" && import_typescript2.default.isNewExpression(node)) {
     item.stackReferences.push(stackReferenceName(node) ?? firstArgument);
   }
+}
+function isModuleSpecifier(node) {
+  const parent = node.parent;
+  if (!parent || !import_typescript2.default.isCallExpression(parent) || parent.arguments[0] !== node) return false;
+  const callee = parent.expression;
+  if (callee.kind === import_typescript2.default.SyntaxKind.ImportKeyword) return true;
+  if (import_typescript2.default.isIdentifier(callee)) return callee.text === "require";
+  return import_typescript2.default.isPropertyAccessExpression(callee) && import_typescript2.default.isIdentifier(callee.expression) && callee.expression.text === "require";
 }
 function stackReferenceName(node) {
   const args = node.arguments?.[1];
@@ -236260,10 +236454,6 @@ function isPure(node) {
   if (import_typescript2.default.isConditionalExpression(node)) {
     return isPure(node.condition) && isPure(node.whenTrue) && isPure(node.whenFalse);
   }
-  if (import_typescript2.default.isPropertyAccessExpression(node)) return isPure(node.expression);
-  if (import_typescript2.default.isElementAccessExpression(node)) {
-    return isPure(node.expression) && isPure(node.argumentExpression);
-  }
   return false;
 }
 function isPureClass(node) {
@@ -236273,6 +236463,9 @@ function isPureClass(node) {
   }
   return node.members.every((member) => {
     if (import_typescript2.default.isClassStaticBlockDeclaration(member)) return false;
+    if (member.name && import_typescript2.default.isComputedPropertyName(member.name) && !isPure(member.name.expression)) {
+      return false;
+    }
     if (import_typescript2.default.canHaveDecorators(member) && import_typescript2.default.getDecorators(member)?.length) return false;
     const modifiers = import_typescript2.default.canHaveModifiers(member) ? import_typescript2.default.getModifiers(member) : void 0;
     const isStatic = modifiers?.some((m) => m.kind === import_typescript2.default.SyntaxKind.StaticKeyword);
@@ -236349,6 +236542,10 @@ function parseJsonModule(path, text) {
     code: code2,
     refs: [],
     assets: [],
+    calls: [],
+    pathCandidates: [],
+    resolved: [],
+    siblings: [],
     stackReferences: [],
     unanalysable: []
   };
@@ -236361,7 +236558,8 @@ function parseJsonModule(path, text) {
     starExports: [],
     items: [item],
     itemsByName: /* @__PURE__ */ new Map([["default", item]]),
-    source
+    source,
+    order: ["default"]
   };
 }
 
@@ -236378,39 +236576,73 @@ function toRelative(path) {
 }
 var BUILTINS = new Set(import_node_module.builtinModules);
 var SOURCE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
-var Resolver = class {
+var CONDITIONS = ["node", "require", "import", "default"];
+var Resolver = class _Resolver {
   options;
   /** The tsconfig.json used, if any */
   tsconfig;
+  /** npm packages the tsconfig extends; their versions count like any other package */
+  configPackages = [];
   host;
   workspacePackages;
   cache = /* @__PURE__ */ new Map();
   snapshot;
-  constructor(snapshot, projectDir) {
+  constructor(snapshot, projectDir, tsconfigPath) {
     this.snapshot = snapshot;
+    this.workspacePackages = workspacePackagesOf(snapshot);
+    const real = (path) => {
+      const relative = toRelative(path);
+      return relative === void 0 ? void 0 : this.throughWorkspaceLinks(relative);
+    };
     this.host = {
       fileExists: (path) => {
-        const relative = toRelative(path);
+        const relative = real(path);
         return relative !== void 0 && snapshot.has(relative);
       },
       readFile: (path) => {
-        const relative = toRelative(path);
+        const relative = real(path);
         return relative === void 0 ? void 0 : snapshot.read(relative);
       },
       directoryExists: (path) => {
-        const relative = toRelative(path);
+        const relative = real(path);
         return relative !== void 0 && snapshot.isDirectory(relative);
       },
-      realpath: (path) => path,
+      realpath: (path) => {
+        const relative = real(path);
+        return relative === void 0 ? path : toAbsolute(relative);
+      },
       getCurrentDirectory: () => toAbsolute(projectDir)
     };
-    this.tsconfig = findUp(snapshot, projectDir, "tsconfig.json");
+    this.tsconfig = tsconfigPath && snapshot.has(tsconfigPath) ? tsconfigPath : findUp(snapshot, projectDir, "tsconfig.json");
     this.options = this.tsconfig ? this.readCompilerOptions(this.tsconfig) : {};
-    this.workspacePackages = findWorkspacePackages(snapshot);
+  }
+  /** node_modules/<workspace package>/x → the package's own folder/x */
+  throughWorkspaceLinks(path) {
+    const marker = path.lastIndexOf("node_modules/");
+    if (marker === -1) return path;
+    const rest = path.slice(marker + "node_modules/".length);
+    const name = packageName(rest);
+    const dir = this.workspacePackages.get(name);
+    return dir === void 0 ? path : joinPath(dir, rest.slice(name.length));
   }
   readCompilerOptions(tsconfig) {
     const text = this.snapshot.read(tsconfig) ?? "{}";
     const json = import_typescript3.default.parseConfigFileTextToJson(tsconfig, text).config ?? {};
+    const extendsList = [json.extends ?? []].flat();
+    const realExtends = extendsList.map((extended) => {
+      const isBare = !extended.startsWith(".") && !extended.startsWith("/");
+      if (!isBare) return extended;
+      const name = packageName(extended);
+      const dir = this.workspacePackages.get(name);
+      if (dir === void 0) {
+        this.configPackages.push(name);
+        return extended;
+      }
+      return toAbsolute(joinPath(dir, extended.slice(name.length)));
+    });
+    if (json.extends !== void 0) {
+      json.extends = Array.isArray(json.extends) ? realExtends : realExtends[0];
+    }
     const parseHost = {
       useCaseSensitiveFileNames: true,
       readDirectory: () => [],
@@ -236438,17 +236670,40 @@ var Resolver = class {
   }
   resolveUncached(specifier, from) {
     if (specifier.startsWith("node:") || BUILTINS.has(specifier)) return { kind: "builtin" };
+    if (specifier.startsWith("#")) return this.resolveSubpathImport(specifier, from);
     const isRelative = specifier.startsWith(".") || specifier.startsWith("/");
     const local = this.resolveWithTypeScript(specifier, from);
     if (local) return { kind: "file", path: local };
-    if (isRelative) return { kind: "unresolved" };
+    if (isRelative) {
+      return {
+        kind: "unresolved",
+        dir: this.existingAncestor(joinPath(dirnameOf(from), specifier))
+      };
+    }
     const name = packageName(specifier);
     const workspaceDir = this.workspacePackages.get(name);
     if (workspaceDir !== void 0) {
-      const entry = this.resolveWorkspaceEntry(workspaceDir, specifier.slice(name.length));
-      return entry ? { kind: "file", path: entry } : { kind: "unresolved" };
+      const entry = this.resolveWorkspaceEntry(workspaceDir, specifier.slice(name.length + 1));
+      return entry ? { kind: "file", path: entry } : { kind: "unresolved", dir: workspaceDir };
     }
     return { kind: "package", name };
+  }
+  /** `#alias` specifiers, through the `imports` field of the nearest package.json */
+  resolveSubpathImport(specifier, from) {
+    let dir = dirnameOf(from);
+    while (true) {
+      const manifest = parseJson(this.snapshot.read(joinPath(dir, "package.json")));
+      if (manifest) {
+        const target = matchSubpath(manifest.imports, specifier);
+        if (target === void 0) return { kind: "unresolved", dir };
+        if (!target.startsWith(".")) return this.resolve(target, from);
+        const path = joinPath(dir, target);
+        const found = this.findSource(path) ?? this.sourceForOutput(path);
+        return found ? { kind: "file", path: found } : { kind: "unresolved", dir };
+      }
+      if (dir === "") return { kind: "unresolved", dir: dirnameOf(from) };
+      dir = dirnameOf(dir);
+    }
   }
   resolveWithTypeScript(specifier, from) {
     const options = {
@@ -236460,7 +236715,7 @@ var Resolver = class {
     };
     const result = import_typescript3.default.resolveModuleName(specifier, toAbsolute(from), options, this.host);
     const resolved = result.resolvedModule;
-    if (!resolved || resolved.isExternalLibraryImport) return void 0;
+    if (!resolved) return void 0;
     const relative = toRelative(resolved.resolvedFileName);
     if (relative === void 0 || relative.split("/").includes("node_modules")) return void 0;
     if (relative.endsWith(".d.ts")) return this.sourceForDeclaration(relative);
@@ -236471,29 +236726,37 @@ var Resolver = class {
     for (const extension of SOURCE_EXTENSIONS) {
       if (this.snapshot.has(stem + extension)) return stem + extension;
     }
-    return void 0;
+    return this.sourceForOutput(path);
   }
   /**
    * A workspace package's entry usually points at build output that isn't committed, so this
-   * looks for the source: the manifest's entry with dist/ mapped to src/, then src/index.
+   * looks for the source: through `exports` (with subpaths), the manifest's entries mapped from
+   * its tsconfig's outDir to rootDir or from dist/ to src/, then src/index.
    */
   resolveWorkspaceEntry(dir, subpath) {
-    const candidates = [];
-    if (subpath) {
-      candidates.push(joinPath(dir, subpath), joinPath(dir, "src", subpath));
-    } else {
-      const manifest = parseJson(this.snapshot.read(joinPath(dir, "package.json")));
-      for (const entry of manifestEntries(manifest)) {
-        candidates.push(joinPath(dir, entry));
-        candidates.push(joinPath(dir, entry.replace(/^(\.\/)?(dist|lib|build|out)\//, "src/")));
-      }
-      candidates.push(joinPath(dir, "src/index"), joinPath(dir, "index"));
-    }
-    for (const candidate of candidates) {
-      const found = this.findSource(candidate);
+    const manifest = parseJson(this.snapshot.read(joinPath(dir, "package.json")));
+    const entries = [];
+    const exported = matchSubpath(manifest?.exports, subpath ? `./${subpath}` : ".");
+    if (exported !== void 0) entries.push(exported);
+    if (subpath) entries.push(subpath, joinPath("src", subpath));
+    else entries.push(...manifestEntries(manifest), "src/index", "index");
+    const packageResolver = new _Resolver(this.snapshot, dir, joinPath(dir, "tsconfig.json"));
+    for (const entry of entries) {
+      const path = joinPath(dir, entry);
+      const found = this.findSource(path) ?? packageResolver.sourceForOutput(path) ?? this.findSource(joinPath(dir, entry.replace(/^(\.\/)?(dist|lib|build|out)\//, "src/")));
       if (found) return found;
     }
     return void 0;
+  }
+  /** The source for a path in the tsconfig's outDir: the same path in its rootDir */
+  sourceForOutput(path) {
+    const { outDir, rootDir } = this.options;
+    if (!outDir) return void 0;
+    const out = toRelative(outDir);
+    const root = rootDir ? toRelative(rootDir) : this.tsconfig ? dirnameOf(this.tsconfig) : void 0;
+    if (out === void 0 || root === void 0) return void 0;
+    if (path !== out && !path.startsWith(`${out}/`)) return void 0;
+    return this.findSource(joinPath(root, path.slice(out.length)));
   }
   /** Finds the source file for a path that may name build output or omit the extension */
   findSource(candidate) {
@@ -236508,7 +236771,57 @@ var Resolver = class {
     }
     return void 0;
   }
+  existingAncestor(path) {
+    let current = dirnameOf(path);
+    while (current !== "" && !this.snapshot.isDirectory(current)) current = dirnameOf(current);
+    return current;
+  }
 };
+function matchSubpath(map, key) {
+  if (map === void 0 || map === null) return void 0;
+  if (typeof map === "string" || Array.isArray(map)) {
+    return key === "." ? pickTarget(map) : void 0;
+  }
+  if (typeof map !== "object") return void 0;
+  const entries = map;
+  const isConditions = Object.keys(entries).every(
+    (name) => !name.startsWith(".") && !name.startsWith("#")
+  );
+  if (isConditions) return key === "." ? pickTarget(entries) : void 0;
+  if (key in entries) return pickTarget(entries[key]);
+  for (const [pattern, target] of Object.entries(entries)) {
+    const star = pattern.indexOf("*");
+    if (star === -1) continue;
+    const prefix = pattern.slice(0, star);
+    const suffix = pattern.slice(star + 1);
+    const fits = key.startsWith(prefix) && key.endsWith(suffix) && key.length >= prefix.length + suffix.length;
+    if (fits) {
+      const replacement = key.slice(prefix.length, key.length - suffix.length);
+      return pickTarget(target)?.replace(/\*/g, replacement);
+    }
+  }
+  return void 0;
+}
+function pickTarget(target) {
+  if (typeof target === "string") return target;
+  if (Array.isArray(target)) {
+    for (const option of target) {
+      const picked = pickTarget(option);
+      if (picked !== void 0) return picked;
+    }
+    return void 0;
+  }
+  if (target && typeof target === "object") {
+    const conditions = target;
+    for (const condition of CONDITIONS) {
+      if (condition in conditions) {
+        const picked = pickTarget(conditions[condition]);
+        if (picked !== void 0) return picked;
+      }
+    }
+  }
+  return void 0;
+}
 function packageName(specifier) {
   const parts = specifier.split("/");
   return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
@@ -236522,29 +236835,29 @@ function findUp(snapshot, dir, fileName) {
     current = dirnameOf(current);
   }
 }
-function findWorkspacePackages(snapshot) {
-  const packages = /* @__PURE__ */ new Map();
-  for (const path of snapshot.paths) {
-    if (!path.endsWith("package.json") || path.split("/").includes("node_modules")) continue;
-    if (path !== "package.json" && !path.endsWith("/package.json")) continue;
-    const manifest = parseJson(snapshot.read(path));
-    if (typeof manifest?.name === "string") packages.set(manifest.name, dirnameOf(path));
+var workspaceIndex = /* @__PURE__ */ new WeakMap();
+function workspacePackagesOf(snapshot) {
+  let packages = workspaceIndex.get(snapshot);
+  if (!packages) {
+    packages = /* @__PURE__ */ new Map();
+    for (const path of snapshot.paths) {
+      if (path !== "package.json" && !path.endsWith("/package.json")) continue;
+      if (path.split("/").includes("node_modules")) continue;
+      const manifest = parseJson(snapshot.read(path));
+      if (typeof manifest?.name === "string" && !packages.has(manifest.name)) {
+        packages.set(manifest.name, dirnameOf(path));
+      }
+    }
+    workspaceIndex.set(snapshot, packages);
   }
   return packages;
 }
 function manifestEntries(manifest) {
   if (!manifest) return [];
   const entries = [];
-  const collect = (value) => {
-    if (typeof value === "string") entries.push(value);
-    else if (value && typeof value === "object") {
-      for (const nested of Object.values(value)) collect(nested);
-    }
-  };
-  const exports2 = manifest.exports;
-  if (exports2 && typeof exports2 === "object" && "." in exports2) collect(exports2["."]);
-  else collect(exports2);
-  for (const field of ["source", "types", "module", "main"]) collect(manifest[field]);
+  for (const field of ["source", "types", "module", "main"]) {
+    if (typeof manifest[field] === "string") entries.push(manifest[field]);
+  }
   return entries;
 }
 function parseJson(text) {
@@ -236558,6 +236871,18 @@ function parseJson(text) {
 }
 
 // src/analysis/program.ts
+var FILE_SYSTEM_MODULES = /* @__PURE__ */ new Set([
+  "fs",
+  "node:fs",
+  "fs/promises",
+  "node:fs/promises",
+  "fs-extra",
+  "glob",
+  "fast-glob",
+  "globby",
+  "tinyglobby"
+]);
+var GLOB_CHARACTERS = /[*?[{]/;
 var EMIT_OPTIONS = [
   "target",
   "module",
@@ -236583,26 +236908,41 @@ var EMIT_OPTIONS = [
   "allowJs",
   "resolveJsonModule",
   "moduleSuffixes",
-  "customConditions"
+  "customConditions",
+  // These decide whether modules get "use strict"
+  "strict",
+  "alwaysStrict",
+  "noImplicitUseStrict"
 ];
 function analyzeProject(snapshot, project, cache) {
-  const resolver = new Resolver(snapshot, project.dir);
+  const runtimeTsconfig = stringOption(project, "tsconfig");
+  const resolver = new Resolver(
+    snapshot,
+    project.dir,
+    runtimeTsconfig ? joinPath(project.dir, runtimeTsconfig) : void 0
+  );
+  const programDir = project.main && !snapshot.has(joinPath(project.dir, project.main)) ? joinPath(project.dir, project.main) : project.dir;
   const analysis = {
     facts: /* @__PURE__ */ new Map(),
     chains: /* @__PURE__ */ new Map(),
     packages: /* @__PURE__ */ new Map(),
     stackReferences: [],
     gaps: [],
-    entry: findEntry(snapshot, project, resolver),
+    entry: findEntry(snapshot, project, programDir, resolver),
+    programDir,
     lookup: () => void 0
   };
+  const addGap = (message, dir) => analysis.gaps.push({ message, dir });
+  for (const extendsPackage of resolver.configPackages) {
+    addPackageReference(extendsPackage, resolver.tsconfig ?? project.file);
+  }
   const facts = analysis.facts;
   const optionsKey = JSON.stringify(pick(resolver.options, EMIT_OPTIONS));
   facts.set("compilerOptions", optionsKey);
   facts.set("entry", analysis.entry ?? "(none)");
   recordManifestFact(snapshot, project, facts);
   if (!analysis.entry) {
-    analysis.gaps.push("no entry file found");
+    addGap("no entry file found", programDir);
     return analysis;
   }
   const modules = /* @__PURE__ */ new Map();
@@ -236624,17 +236964,13 @@ function analyzeProject(snapshot, project, cache) {
     modules.set(path, module2);
     return module2;
   };
-  const addPackage = (name, from) => {
-    const files = analysis.packages.get(name) ?? /* @__PURE__ */ new Set();
-    files.add(from);
-    analysis.packages.set(name, files);
-  };
+  const addPackage = addPackageReference;
   const follow = (specifier, from) => {
     const resolution = resolver.resolve(specifier, from);
     if (resolution.kind === "file") return resolution.path;
     if (resolution.kind === "package") addPackage(resolution.name, from);
     if (resolution.kind === "unresolved") {
-      analysis.gaps.push(`${from}: can't resolve "${specifier}"`);
+      addGap(`${from}: can't resolve "${specifier}"`, resolution.dir ?? dirnameOf(from));
     }
     return void 0;
   };
@@ -236645,7 +236981,7 @@ function analyzeProject(snapshot, project, cache) {
     analysis.chains.set(path, [...parentChain, path]);
     const module2 = getModule(path);
     if (!module2) {
-      analysis.gaps.push(`${path} is imported but missing`);
+      addGap(`${path} is imported but missing`, dirnameOf(path));
       return;
     }
     for (const specifier of module2.loads) {
@@ -236653,10 +236989,6 @@ function analyzeProject(snapshot, project, cache) {
       if (target) markLoaded(target, path);
     }
     for (const item of module2.items) if (item.eager) markItem(module2, item);
-    facts.set(
-      `order:${path}`,
-      module2.items.filter((item) => item.eager).map((item) => item.key).join(" ")
-    );
   };
   const markWhole = (path, from) => {
     markLoaded(path, from);
@@ -236667,7 +236999,9 @@ function analyzeProject(snapshot, project, cache) {
     if (reachable.has(item)) return;
     reachable.add(item);
     facts.set(`code:${module2.path}#${item.key}`, item.code);
-    for (const reason of item.unanalysable) analysis.gaps.push(`${module2.path}: ${reason}`);
+    for (const sibling of item.siblings) markItem(module2, sibling);
+    for (const reason of item.unanalysable)
+      addGap(`${module2.path}: ${reason}`, dirnameOf(module2.path));
     for (const ref of item.refs) {
       if (ref.kind === "module") {
         const target = follow(ref.specifier, module2.path);
@@ -236685,7 +237019,12 @@ function analyzeProject(snapshot, project, cache) {
       const imported = binding.imported === "*" && ref.kind === "member" ? ref.property : binding.imported;
       markImport(module2.path, binding.specifier, imported);
     }
-    for (const asset of item.assets) recordAsset(module2, asset);
+    for (const asset of item.assets) recordPath(module2, asset, "read");
+    for (const call of item.calls) {
+      if (readsThroughFileSystemModule(module2, call)) recordPath(module2, call.argument, "read");
+    }
+    for (const candidate of item.pathCandidates) recordPath(module2, candidate, "candidate");
+    for (const expression of item.resolved) recordResolved(module2, expression);
     for (const expression of item.stackReferences) {
       analysis.stackReferences.push({ module: module2, expression });
     }
@@ -236739,35 +237078,145 @@ function analyzeProject(snapshot, project, cache) {
     return resolution.kind === "file" ? resolution.path : void 0;
   });
   analysis.lookup = lookup;
-  const recordAsset = (module2, expression) => {
+  const recordPath = (module2, expression, kind) => {
     const value = evaluateString(expression, module2, { lookup, unknown: void 0 });
     if (value === void 0) {
-      analysis.gaps.push(`${module2.path}: a file is read from a path that can't be worked out`);
+      if (kind === "read") {
+        addGap(
+          `${module2.path}: a file is read from a path that can't be worked out`,
+          dirnameOf(module2.path)
+        );
+      }
       return;
     }
-    const programDir = dirnameOf(analysis.entry);
-    const candidates = value.startsWith(MODULE_DIR) ? [joinPath(dirnameOf(module2.path), value.slice(MODULE_DIR.length))] : value.startsWith(WORKING_DIR) ? [joinPath(project.dir, value.slice(WORKING_DIR.length))] : value.startsWith("/") ? [] : [joinPath(project.dir, value), joinPath(programDir, value)];
-    if (candidates.length === 0) {
-      analysis.gaps.push(`${module2.path}: reads absolute path ${value}`);
+    const globAt = value.search(GLOB_CHARACTERS);
+    const path = globAt === -1 ? value : value.slice(0, value.lastIndexOf("/", globAt) + 1);
+    const candidates = pathCandidates(path, module2.path, kind);
+    if (candidates === void 0) {
+      if (kind === "read")
+        addGap(`${module2.path}: reads absolute path ${value}`, dirnameOf(module2.path));
       return;
     }
     for (const candidate of candidates) {
-      if (snapshot.isDirectory(candidate)) {
-        for (const file of snapshot.paths) {
-          if (isInside(file, candidate)) facts.set(`asset:${file}`, snapshot.hash(file) ?? "");
-        }
-        return;
-      }
-      if (snapshot.has(candidate)) {
-        facts.set(`asset:${candidate}`, snapshot.hash(candidate) ?? "");
-        return;
-      }
+      if (recordExisting(candidate)) return;
     }
-    facts.set(`asset:${candidates[0]}`, "(missing)");
+    if (kind === "read") {
+      facts.set(`asset:${candidates[0]}`, "(missing)");
+      addGap(
+        `${module2.path}: reads ${candidates[0]}, which isn't in the repository (build output?)`,
+        existingAncestor(candidates[0])
+      );
+    }
+  };
+  const pathCandidates = (value, modulePath, kind) => {
+    if (value.startsWith(MODULE_DIR))
+      return [joinPath(dirnameOf(modulePath), value.slice(MODULE_DIR.length))];
+    if (value.startsWith(WORKING_DIR))
+      return [joinPath(programDir, value.slice(WORKING_DIR.length))];
+    if (value.startsWith("/")) return void 0;
+    const list = [joinPath(programDir, value), joinPath(project.dir, value)];
+    if (kind === "candidate") list.push(joinPath(dirnameOf(modulePath), value));
+    return [...new Set(list)].filter((candidate) => candidate !== "");
+  };
+  const recordExisting = (candidate) => {
+    if (snapshot.isDirectory(candidate)) {
+      const real = snapshot.realPath(candidate) ?? candidate;
+      for (const file of snapshot.paths) {
+        if (isInside(file, real)) facts.set(`asset:${file}`, snapshot.hash(file) ?? "");
+      }
+      return true;
+    }
+    if (snapshot.has(candidate)) {
+      facts.set(`asset:${candidate}`, snapshot.hash(candidate) ?? "");
+      return true;
+    }
+    return false;
+  };
+  const existingAncestor = (path) => {
+    let current = dirnameOf(path);
+    while (current !== "" && !snapshot.isDirectory(current)) current = dirnameOf(current);
+    return current === "" ? project.dir : current;
+  };
+  const recordResolved = (module2, expression) => {
+    const value = evaluateString(expression, module2, { lookup, unknown: void 0 });
+    if (value === void 0) {
+      addGap(`${module2.path}: require.resolve() with a computed path`, dirnameOf(module2.path));
+    } else if (value.startsWith(".") || value.startsWith(MODULE_DIR)) {
+      const relative = value.startsWith(MODULE_DIR) ? value.slice(MODULE_DIR.length) : value;
+      const path = joinPath(dirnameOf(module2.path), relative);
+      if (!recordExisting(path)) {
+        addGap(
+          `${module2.path}: resolves ${path}, which isn't in the repository`,
+          existingAncestor(path)
+        );
+      }
+    } else if (!value.startsWith("/")) {
+      follow(value, module2.path);
+    }
+  };
+  const readsThroughFileSystemModule = (module2, call) => {
+    const binding = module2.imports.get(call.object ?? call.name);
+    return binding !== void 0 && FILE_SYSTEM_MODULES.has(binding.specifier);
   };
   markLoaded(analysis.entry, void 0);
   markExport(analysis.entry, "*");
+  for (const preload of nodeargsFiles(project)) {
+    if (preload.kind === "env-file") {
+      if (!recordExisting(joinPath(programDir, preload.path))) {
+        addGap(`nodeargs reads ${preload.path}, which isn't in the repository`, programDir);
+      }
+    } else if (/^\.\.?\//.test(preload.path)) {
+      const file = resolver.findSource(joinPath(programDir, preload.path));
+      if (file) markLoaded(file, void 0);
+      else addGap(`nodeargs loads ${preload.path}, which can't be found`, programDir);
+    } else {
+      addPackage(packageNameOf(preload.path), project.file);
+    }
+  }
+  if (analysis.packages.has("dotenv")) recordExisting(joinPath(programDir, ".env"));
+  for (const path of loaded) {
+    const module2 = modules.get(path);
+    if (!module2) continue;
+    const reachableKeys = new Set(
+      module2.items.filter((item) => reachable.has(item)).map((item) => item.key)
+    );
+    const order = module2.order.filter(
+      (entry) => entry.startsWith("load ") || reachableKeys.has(entry)
+    );
+    facts.set(`order:${path}`, order.join(" "));
+  }
   return analysis;
+  function addPackageReference(name, from) {
+    const files = analysis.packages.get(name) ?? /* @__PURE__ */ new Set();
+    files.add(from);
+    analysis.packages.set(name, files);
+  }
+}
+function stringOption(project, name) {
+  const value = project.runtimeOptions[name];
+  return typeof value === "string" ? value : void 0;
+}
+function nodeargsFiles(project) {
+  const nodeargs = stringOption(project, "nodeargs") ?? "";
+  const tokens = nodeargs.split(/\s+/).filter(Boolean);
+  const files = [];
+  const modules = ["--require", "-r", "--import", "--loader", "--experimental-loader"];
+  for (let index = 0; index < tokens.length; index++) {
+    const [flag, inline] = tokens[index].split(/=(.*)/s);
+    const value = inline ?? tokens[index + 1];
+    if (modules.includes(flag) && value) {
+      files.push({ kind: "module", path: value });
+      if (inline === void 0) index++;
+    } else if (flag === "--env-file" && value) {
+      files.push({ kind: "env-file", path: value });
+      if (inline === void 0) index++;
+    }
+  }
+  return files;
+}
+function packageNameOf(specifier) {
+  const parts = specifier.split("/");
+  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
 }
 function lookupConstant(module2, name, getModule, resolve, depth = 0) {
   if (depth > 10) return void 0;
@@ -236791,13 +237240,15 @@ function lookupConstant(module2, name, getModule, resolve, depth = 0) {
   }
   return void 0;
 }
-function findEntry(snapshot, project, resolver) {
-  const programDir = project.main ? joinPath(project.dir, project.main) : project.dir;
-  if (project.main && snapshot.has(programDir)) return programDir;
-  const manifest = parseJson(snapshot.read(joinPath(programDir, "package.json")));
-  if (typeof manifest?.main === "string") {
-    const main2 = joinPath(programDir, manifest.main);
-    const found = resolver.findSource(main2) ?? resolver.findSource(main2.replace(/(^|\/)(dist|lib|build|out|bin)\//, "$1"));
+function findEntry(snapshot, project, programDir, resolver) {
+  if (project.main && snapshot.has(joinPath(project.dir, project.main))) {
+    return joinPath(project.dir, project.main);
+  }
+  const manifestPath = findUp(snapshot, programDir, "package.json");
+  const manifest = manifestPath ? parseJson(snapshot.read(manifestPath)) : void 0;
+  if (manifestPath && typeof manifest?.main === "string") {
+    const main2 = joinPath(dirnameOf(manifestPath), manifest.main);
+    const found = resolver.findSource(main2) ?? resolver.findSource(resolver.sourceForOutput(main2) ?? main2) ?? resolver.findSource(main2.replace(/(^|\/)(dist|lib|build|out|bin)\//, "$1"));
     if (found) return found;
   }
   return resolver.findSource(joinPath(programDir, "index"));
@@ -237051,7 +237502,14 @@ function computeWaves(graph, selected) {
 // src/lockfile.ts
 var import_parsers = __toESM(require_lib(), 1);
 var import_yaml2 = __toESM(require_dist(), 1);
-var LOCKFILES = ["pnpm-lock.yaml", "yarn.lock", "package-lock.json", "npm-shrinkwrap.json"];
+var LOCKFILES = [
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "package-lock.json",
+  "npm-shrinkwrap.json",
+  "bun.lock",
+  "bun.lockb"
+];
 var LockfileError = class extends Error {
 };
 function findLockfile(snapshot, dir) {
@@ -237071,7 +237529,19 @@ function readLockfile(snapshot, path) {
   const name = path.slice(path.lastIndexOf("/") + 1);
   if (name === "pnpm-lock.yaml") return readPnpm(path, dir, text);
   if (name === "yarn.lock") return readYarn(snapshot, path, dir, text);
+  if (name === "bun.lock") return readBun(path, dir, text);
+  if (name === "bun.lockb")
+    throw new LockfileError(`${path}: the binary bun.lockb can't be read; bun.lock can`);
   return readNpm(path, dir, text);
+}
+function hasPackage(graph, name) {
+  return nodesNamed(graph, name).length > 0;
+}
+function identityOf(version, ...sources) {
+  return [
+    String(version),
+    ...sources.filter((source) => typeof source === "string" && source)
+  ].join(" ");
 }
 function packageClosure(graph, fromFiles) {
   const roots = /* @__PURE__ */ new Set();
@@ -237153,7 +237623,12 @@ function readNpm(path, dir, text) {
     if (entry.link) continue;
     const name = location.slice(location.lastIndexOf("node_modules/") + "node_modules/".length);
     const dependencies = Object.keys(dependencyNames(entry, false)).map((dependency) => resolveFrom(location, dependency)).filter((resolved) => resolved !== void 0);
-    graph.nodes.set(location, { name, version: String(entry.version), dependencies });
+    graph.nodes.set(location, {
+      name,
+      version: String(entry.version),
+      identity: identityOf(entry.version, entry.resolved, entry.integrity),
+      dependencies
+    });
   }
   return graph;
 }
@@ -237175,7 +237650,17 @@ function readYarn(snapshot, path, dir, text) {
       workspaceIds.set(id, joinPath(dir, workspace));
       continue;
     }
-    graph.nodes.set(id, { name, version: String(entry.version), dependencies: [] });
+    graph.nodes.set(id, {
+      name,
+      version: String(entry.version),
+      // Berry's resolution carries patch hashes and git commits; classic has resolved URLs
+      identity: identityOf(
+        entry.version,
+        resolution ?? entry.resolved,
+        entry.checksum ?? entry.integrity
+      ),
+      dependencies: []
+    });
   }
   const resolve = (name, range) => {
     const id = byDescriptor.get(`${name}@${range}`) ?? byDescriptor.get(`${name}@npm:${range}`);
@@ -237218,6 +237703,10 @@ function descriptorName(descriptor) {
 }
 function readPnpm(path, dir, text) {
   const lock = (0, import_yaml2.parse)(text) ?? {};
+  if (Number.parseFloat(String(lock.lockfileVersion)) < 6) {
+    throw new LockfileError(`${path}: only lockfileVersion 6 and later are supported`);
+  }
+  const packageInfo = lock.packages ?? {};
   const graph = { path, importers: /* @__PURE__ */ new Map(), nodes: /* @__PURE__ */ new Map() };
   const snapshots = lock.snapshots ?? lock.packages ?? {};
   const nodeId = (name, version) => {
@@ -237231,7 +237720,16 @@ function readPnpm(path, dir, text) {
     const id = key.replace(/^\//, "");
     const { name, version } = splitPnpmId(id);
     const dependencies = Object.entries(dependencyNames(entry ?? {}, false)).map(([dependency, version2]) => nodeId(dependency, version2)).filter((resolved) => resolved !== void 0);
-    graph.nodes.set(id, { name, version, dependencies });
+    const resolution = (packageInfo[key] ?? packageInfo[key.split("(")[0]] ?? {}).resolution ?? {};
+    const identity = identityOf(
+      version,
+      id,
+      resolution.integrity,
+      resolution.tarball,
+      resolution.commit,
+      resolution.repo
+    );
+    graph.nodes.set(id, { name, version, identity, dependencies });
   }
   const importers = lock.importers ?? { ".": lock };
   for (const [importerDir, entry] of Object.entries(importers)) {
@@ -237247,6 +237745,49 @@ function readPnpm(path, dir, text) {
   }
   return graph;
 }
+function readBun(path, dir, text) {
+  let lock;
+  try {
+    lock = JSON.parse(text.replace(/,(\s*[}\]])/g, "$1"));
+  } catch {
+    throw new LockfileError(`${path}: couldn't be parsed`);
+  }
+  const graph = { path, importers: /* @__PURE__ */ new Map(), nodes: /* @__PURE__ */ new Map() };
+  const packages = lock.packages ?? {};
+  const resolveFrom = (key, name) => {
+    let base = key;
+    while (true) {
+      const candidate = base ? `${base}/${name}` : name;
+      if (packages[candidate]) return candidate;
+      if (!base) return void 0;
+      const slash = base.lastIndexOf("/");
+      base = slash === -1 ? "" : base.slice(0, slash);
+    }
+  };
+  for (const [key, entry] of Object.entries(packages)) {
+    const spec = String(entry[0] ?? "");
+    const at = spec.lastIndexOf("@");
+    if (at <= 0 || spec.slice(at + 1).startsWith("workspace:")) continue;
+    const info = entry.find((part) => part && typeof part === "object") ?? {};
+    const dependencies = Object.keys(dependencyNames(info, false)).map((dependency) => resolveFrom(key, dependency)).filter((resolved) => resolved !== void 0);
+    const checksum = entry.find((part) => typeof part === "string" && part.startsWith("sha"));
+    graph.nodes.set(key, {
+      name: spec.slice(0, at),
+      version: spec.slice(at + 1),
+      identity: identityOf(spec.slice(at + 1), checksum),
+      dependencies
+    });
+  }
+  for (const [workspaceDir, workspace] of Object.entries(lock.workspaces ?? {})) {
+    const importer = /* @__PURE__ */ new Map();
+    for (const name of Object.keys(dependencyNames(workspace, true))) {
+      const resolved = resolveFrom("", name);
+      if (resolved && graph.nodes.has(resolved)) importer.set(name, resolved);
+    }
+    graph.importers.set(joinPath(dir, workspaceDir), importer);
+  }
+  return graph;
+}
 function splitPnpmId(id) {
   const peers = id.indexOf("(");
   const plain = peers === -1 ? id : id.slice(0, peers);
@@ -237258,14 +237799,13 @@ function splitPnpmId(id) {
 // src/projects.ts
 var import_yaml3 = __toESM(require_dist(), 1);
 var PROJECT_FILE = /(^|\/)Pulumi\.ya?ml$/;
-var STACK_FILE = /^Pulumi\.(.+)\.ya?ml$/;
+var STACK_FILE = /^Pulumi\.(.+)\.(ya?ml)$/;
 var ProjectError = class extends Error {
 };
 var NAME = /^[A-Za-z0-9_.-]+$/;
 var FOLDER = /^[A-Za-z0-9 _.@+/-]*$/;
 function discoverProjects(snapshot, config, warnings = []) {
   const projects = [];
-  const names = /* @__PURE__ */ new Map();
   for (const file of snapshot.paths) {
     if (!PROJECT_FILE.test(file) || file.split("/").includes("node_modules")) continue;
     const dir = dirnameOf(file);
@@ -237279,18 +237819,28 @@ function discoverProjects(snapshot, config, warnings = []) {
       );
       continue;
     }
-    const project = readProject(snapshot, file, warnings);
+    let project;
+    try {
+      project = readProject(snapshot, file, warnings);
+    } catch (error2) {
+      if (!(error2 instanceof ProjectError)) throw error2;
+      warnings.push(`${error2.message}; skipped`);
+      continue;
+    }
     if (!NAME.test(project.name)) {
       warnings.push(`${file}: project name "${project.name}" isn't a valid Pulumi name; skipped`);
       continue;
     }
-    const sameName = names.get(project.name);
-    if (sameName !== void 0) {
-      throw new ProjectError(
-        `Projects in "${sameName || "."}" and "${dir || "."}" are both named "${project.name}"; stack ids would be ambiguous`
-      );
+    const sameName = projects.find((other) => other.name === project.name);
+    if (sameName) {
+      const message = `Projects in "${sameName.dir || "."}" and "${dir || "."}" are both named "${project.name}"`;
+      if (sameName.stacks.length > 0 && project.stacks.length > 0) {
+        throw new ProjectError(`${message}; stack ids would be ambiguous`);
+      }
+      warnings.push(`${message}; the one without stacks is skipped`);
+      if (project.stacks.length === 0) continue;
+      projects.splice(projects.indexOf(sameName), 1);
     }
-    names.set(project.name, dir);
     projects.push(project);
   }
   for (const extra of config.stacks) {
@@ -237298,7 +237848,8 @@ function discoverProjects(snapshot, config, warnings = []) {
     const project = projects.find((p) => p.name === projectRef || (p.dir || ".") === projectRef);
     if (!project) throw new ProjectError(`stacks: no project matches "${projectRef}"`);
     if (!project.stacks.some((s) => s.stack === stack)) {
-      project.stacks.push(makeStack(project, stack, `Pulumi.${stack}.yaml`));
+      const extension = project.file.endsWith(".yml") ? "yml" : "yaml";
+      project.stacks.push(makeStack(project, stack, `Pulumi.${stack}.${extension}`));
     }
   }
   return projects.sort((a, b) => a.dir.localeCompare(b.dir));
@@ -237312,14 +237863,16 @@ function readProject(snapshot, file, warnings = []) {
     dir,
     file,
     runtime: settings.runtime,
+    runtimeOptions: settings.runtimeOptions,
     main: settings.main,
     stackConfigDir,
     stacks: []
   };
+  const extension = file.endsWith(".yml") ? "yml" : "yaml";
   for (const path of snapshot.paths) {
     if (dirnameOf(path) !== stackConfigDir) continue;
     const match = STACK_FILE.exec(path.slice(path.lastIndexOf("/") + 1));
-    if (!match) continue;
+    if (!match || match[2] !== extension) continue;
     if (!NAME.test(match[1])) {
       warnings.push(`${path}: "${match[1]}" isn't a valid Pulumi stack name; skipped`);
       continue;
@@ -237339,15 +237892,23 @@ function makeStack(project, stack, fileName) {
   };
 }
 function parseProjectFile(text, file) {
-  const raw = (0, import_yaml3.parse)(text);
+  let raw;
+  try {
+    raw = (0, import_yaml3.parse)(text);
+  } catch {
+    throw new ProjectError(`${file} isn't valid YAML`);
+  }
   if (!raw || typeof raw.name !== "string") {
     throw new ProjectError(`${file} has no project name`);
   }
+  if ("template" in raw) throw new ProjectError(`${file} is a project template`);
   const runtime = raw.runtime;
   const runtimeName = typeof runtime === "string" ? runtime : typeof runtime === "object" && runtime !== null && "name" in runtime ? String(runtime.name) : "unknown";
+  const options = typeof runtime === "object" && runtime !== null && "options" in runtime ? runtime.options : void 0;
   return {
     name: raw.name,
     runtime: runtimeName,
+    runtimeOptions: typeof options === "object" && options !== null ? options : {},
     main: typeof raw.main === "string" ? raw.main : void 0,
     stackConfigDir: typeof raw.stackConfigDir === "string" ? raw.stackConfigDir : void 0
   };
@@ -237372,8 +237933,22 @@ function select(options) {
     if (!list.includes(reason)) list.push(reason);
     reasons.set(stack.id, list);
   };
+  const requestsByBase = /* @__PURE__ */ new Map();
+  const requestsFor = (base) => {
+    let requests = requestsByBase.get(base);
+    if (!requests) {
+      requests = readRequests(repoRoot, base, options);
+      requestsByBase.set(base, requests);
+    }
+    return requests;
+  };
+  const forced = /* @__PURE__ */ new Set();
+  const skipped = /* @__PURE__ */ new Set();
+  const unmatched = /* @__PURE__ */ new Map();
   for (const project of projects) {
     for (const stack of project.stacks) {
+      const extra = options.reasons?.[stack.id];
+      if (extra) addReason(stack, extra);
       const base = stackBase(options, stack, defaultBase, repoRoot);
       if (base === null) {
         addReason(stack, "never deployed");
@@ -237381,35 +237956,29 @@ function select(options) {
       }
       for (const reason of session.projectReasons(project, base)) addReason(stack, reason);
       for (const reason of session.stackReasons(project, stack, base)) addReason(stack, reason);
+      const changed = session.changedFiles(base);
+      for (const rule of config.rules) {
+        if (!matchesAnyStack(rule.run, stack)) continue;
+        const trigger = [...changed.keys()].find((path) => matchesAnyGlob(rule.when, path));
+        if (trigger) addReason(stack, `rule: ${trigger} changed`);
+      }
+      if (matchesAnyStack(config.always, stack)) addReason(stack, "always selected (config)");
+      const requests = requestsFor(base);
+      for (const { pattern, source } of requests.run) {
+        if (!unmatched.has(pattern)) unmatched.set(pattern, source);
+        if (!matchesStack(pattern, stack)) continue;
+        unmatched.set(pattern, "");
+        addReason(stack, `requested by ${source}`);
+        forced.add(stack.id);
+      }
+      if (requests.skip.some(({ pattern }) => matchesStack(pattern, stack))) skipped.add(stack.id);
     }
   }
+  for (const [pattern, source] of unmatched) {
+    if (source) warnings.push(`${source}: "${pattern}" matches no stack`);
+  }
+  for (const id of skipped) if (!forced.has(id)) reasons.delete(id);
   warnings.push(...session.warnings);
-  const changed = session.changedFiles(defaultBase);
-  for (const rule of config.rules) {
-    const trigger = [...changed.keys()].find((path) => matchesAnyGlob(rule.when, path));
-    if (!trigger) continue;
-    for (const stack of stacks) {
-      if (matchesAnyStack(rule.run, stack)) addReason(stack, `rule: ${trigger} changed`);
-    }
-  }
-  for (const stack of stacks) {
-    if (matchesAnyStack(config.always, stack)) addReason(stack, "always selected (config)");
-  }
-  const requests = readRequests(repoRoot, defaultBase, options);
-  const forced = /* @__PURE__ */ new Set();
-  for (const { pattern, source } of requests.run) {
-    const matching = stacks.filter((stack) => matchesStack(pattern, stack));
-    if (matching.length === 0) warnings.push(`${source}: "${pattern}" matches no stack`);
-    for (const stack of matching) {
-      addReason(stack, `requested by ${source}`);
-      forced.add(stack.id);
-    }
-  }
-  for (const { pattern } of requests.skip) {
-    for (const stack of stacks) {
-      if (matchesStack(pattern, stack) && !forced.has(stack.id)) reasons.delete(stack.id);
-    }
-  }
   const graph = session.dependencyGraph(projects, stacks);
   warnings.push(...session.graphWarnings);
   const selectedIds = stacks.filter((stack) => reasons.has(stack.id)).map((stack) => stack.id);
@@ -237534,71 +238103,124 @@ var Session = class {
     }
     if (project.runtime !== "nodejs") {
       this.warnings.push(
-        `${project.name}: runtime "${project.runtime}" isn't analysed; any change in ${project.dir || "the repo"} selects it`
+        `${project.name}: runtime "${project.runtime}" isn't analysed; any change in ${project.dir || "the repo"} selects it (list other folders it reads under inputs)`
       );
-      return [...reasons, ...this.folderChanges(project, changed, "not a Node.js project")];
+      return [
+        ...reasons,
+        ...this.folderChanges(
+          project,
+          changed,
+          "not a Node.js project",
+          yamlFileReferences(this.head, project)
+        )
+      ];
     }
     const baseProject = readProject(baseSnapshot, project.file);
     const before = this.analysis(baseSnapshot, baseProject);
     const after = this.analysis(this.head, project);
     reasons.push(...describeFactChanges(before, after));
-    reasons.push(...this.packageChanges(project, baseSnapshot, before, after));
-    const gaps = [.../* @__PURE__ */ new Set([...after.gaps, ...before.gaps])];
-    if (gaps.length > 0) {
-      for (const gap of gaps) this.warnings.push(`${project.name}: ${gap}`);
-      const hasInputs = Object.keys(this.config.inputs).some(
-        (pattern) => project.stacks.some((stack) => matchesStack(pattern, stack))
+    const packages = this.packageChanges(project, baseSnapshot, before, after);
+    reasons.push(...packages.reasons);
+    const gaps = /* @__PURE__ */ new Map();
+    for (const gap of [...after.gaps, ...before.gaps, ...packages.gaps]) {
+      gaps.set(`${gap.dir}\0${gap.message}`, gap);
+    }
+    if (gaps.size > 0) {
+      for (const gap of gaps.values()) this.warnings.push(`${project.name}: ${gap.message}`);
+      const first = [...gaps.values()][0];
+      reasons.push(
+        ...this.folderChanges(
+          project,
+          changed,
+          first.message,
+          [...gaps.values()].map((gap) => gap.dir)
+        )
       );
-      if (!hasInputs) {
-        reasons.push(...this.folderChanges(project, changed, gaps[0]));
-      }
     }
     return reasons;
   }
-  /** The fallback when analysis can't be complete: any change in the project's folder */
-  folderChanges(project, changed, why) {
+  /**
+   * The fallback when analysis can't be complete: any change in the project's folder, or in the
+   * folders where what analysis couldn't see most likely lives
+   */
+  folderChanges(project, changed, why, extraDirs = []) {
+    const dirs = [project.dir, ...extraDirs];
     const files = [...changed.keys()].filter(
-      (path) => isInside(path, project.dir) && !matchesAnyGlob(IGNORED_FILES, path) && !/(^|\/)Pulumi\.[^/]+\.ya?ml$/.test(path) && !path.split("/").includes("node_modules")
+      (path) => dirs.some((dir) => isInside(path, dir)) && !matchesAnyGlob(IGNORED_FILES, path) && !/(^|\/)Pulumi\.[^/]+\.ya?ml$/.test(path) && !path.split("/").includes("node_modules")
     );
-    return files.map((file) => `${file} changed (${why}, so any change in the folder counts)`);
+    return files.map((file) => `${file} changed (${why}, so any change in that folder counts)`);
   }
+  /**
+   * Packages whose resolved identity (version, source, integrity, patch) differs between base and
+   * head, among those the program loads and everything they depend on
+   */
   packageChanges(project, baseSnapshot, before, after) {
-    const versions = (snapshot, analysis) => {
+    const gaps = [];
+    const resolve = (snapshot, analysis) => {
       const path = findLockfile(snapshot, project.dir);
       const graph = path ? this.lockfile(snapshot, path) : void 0;
       const result = /* @__PURE__ */ new Map();
-      if (!graph) return { result, path };
+      if (!graph) return { result, path, graph };
       const roots = new Map(analysis.packages);
-      if (!roots.has("@pulumi/pulumi"))
+      if (!roots.has("@pulumi/pulumi")) {
         roots.set("@pulumi/pulumi", /* @__PURE__ */ new Set([analysis.entry ?? project.file]));
+      }
+      for (const [name, files] of analysis.packages) {
+        if (!hasPackage(graph, name)) {
+          const from = [...files][0];
+          gaps.push({
+            message: `${from} imports "${name}", which the lockfile doesn't resolve`,
+            dir: dirnameOf(from)
+          });
+        }
+      }
+      const patches = patchFiles(snapshot, dirnameOf(graph.path));
       for (const id of packageClosure(graph, roots)) {
         const node = graph.nodes.get(id);
         if (!node || matchesAnyGlob(this.config.packages.ignore, node.name)) continue;
+        const patch = patches.get(`${node.name}@${node.version}`) ?? patches.get(node.name);
+        const identity = patch ? `${node.identity} patched ${patch}` : node.identity;
         const set = result.get(node.name) ?? /* @__PURE__ */ new Set();
-        set.add(node.version);
+        set.add(identity);
         result.set(node.name, set);
       }
-      return { result, path };
+      return { result, path, graph };
     };
-    const old = versions(baseSnapshot, before);
-    const current = versions(this.head, after);
+    const old = resolve(baseSnapshot, before);
+    const current = resolve(this.head, after);
     const reasons = [];
-    if (old.path && current.path && !this.lockfile(baseSnapshot, old.path)) {
-      if (baseSnapshot.hash(old.path) !== this.head.hash(current.path)) {
-        reasons.push(`${current.path} changed (couldn't be read package by package)`);
+    if (!old.path && !current.path) {
+      const manifestPath = findUp(this.head, project.dir, "package.json");
+      if (manifestPath) {
+        const ranges = (snapshot) => dependencyRanges(snapshot.read(manifestPath));
+        if (!(0, import_node_util.isDeepStrictEqual)(ranges(baseSnapshot), ranges(this.head))) {
+          reasons.push(
+            `${manifestPath} dependencies changed (there's no lockfile to narrow it down)`
+          );
+        }
       }
-      return reasons;
+      return { reasons, gaps };
+    }
+    if (!old.graph || !current.graph) {
+      const changed = old.path !== current.path || old.path !== void 0 && baseSnapshot.hash(old.path) !== this.head.hash(old.path);
+      if (changed) {
+        reasons.push(`${current.path ?? old.path} changed (couldn't be read package by package)`);
+      }
+      return { reasons, gaps };
     }
     const names = /* @__PURE__ */ new Set([...old.result.keys(), ...current.result.keys()]);
     for (const name of [...names].sort()) {
-      const from = [...old.result.get(name) ?? []].sort().join(", ");
-      const to = [...current.result.get(name) ?? []].sort().join(", ");
-      if (from === to) continue;
-      if (!from) reasons.push(`package ${name} ${to} added`);
-      else if (!to) reasons.push(`package ${name} ${from} removed`);
-      else reasons.push(`package ${name} ${from} \u2192 ${to}`);
+      const from = [...old.result.get(name) ?? []].sort();
+      const to = [...current.result.get(name) ?? []].sort();
+      if (from.join("\0") === to.join("\0")) continue;
+      const label = (identities) => identities.map((identity) => identity.split(" ")[0]).join(", ");
+      if (from.length === 0) reasons.push(`package ${name} ${label(to)} added`);
+      else if (to.length === 0) reasons.push(`package ${name} ${label(from)} removed`);
+      else if (label(from) === label(to))
+        reasons.push(`package ${name} ${label(to)} changed source or patch`);
+      else reasons.push(`package ${name} ${label(from)} \u2192 ${label(to)}`);
     }
-    return reasons;
+    return { reasons, gaps };
   }
   /** Why one stack, beyond its project, differs between `base` and head */
   stackReasons(project, stack, base) {
@@ -237694,10 +238316,50 @@ function parseYamlFile(snapshot, path) {
   const text = snapshot.read(path);
   if (text === void 0) return void 0;
   try {
-    return (0, import_yaml4.parse)(text) ?? {};
+    return (0, import_yaml4.parse)(text, { schema: "failsafe" }) ?? {};
   } catch {
     return text;
   }
+}
+function yamlFileReferences(snapshot, project) {
+  if (project.runtime !== "yaml") return [];
+  const text = snapshot.read(project.file) ?? "";
+  const dirs = [];
+  for (const match of text.matchAll(
+    /fn::(?:readFile|fileAsset|fileArchive)\s*:\s*["']?([^\s"'#]+)/g
+  )) {
+    const path = joinPath(project.dir, match[1]);
+    dirs.push(snapshot.isDirectory(path) ? path : dirnameOf(path));
+  }
+  return dirs;
+}
+function patchFiles(snapshot, root) {
+  const patches = /* @__PURE__ */ new Map();
+  const dir = joinPath(root, "patches");
+  for (const path of snapshot.paths) {
+    if (dirnameOf(path) !== dir || !path.endsWith(".patch")) continue;
+    const parts = path.slice(dir.length + 1, -".patch".length).split("+");
+    const version = parts.pop() ?? "";
+    const name = parts.join("/");
+    const hash = snapshot.hash(path) ?? "";
+    patches.set(`${name}@${version}`, hash);
+    patches.set(name, hash);
+  }
+  return patches;
+}
+function dependencyRanges(text) {
+  const manifest = parseJson(text) ?? {};
+  const ranges = {};
+  for (const field of [
+    "dependencies",
+    "optionalDependencies",
+    "peerDependencies",
+    "overrides",
+    "resolutions"
+  ]) {
+    ranges[field] = manifest[field];
+  }
+  return ranges;
 }
 function describeFactChanges(before, after) {
   const keys = /* @__PURE__ */ new Set([...before.facts.keys(), ...after.facts.keys()]);

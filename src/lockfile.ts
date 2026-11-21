@@ -13,6 +13,11 @@ import { dirnameOf, isInside, joinPath, type Snapshot } from './snapshot.ts';
 export interface LockNode {
   name: string;
   version: string;
+  /**
+   * Everything that pins what gets installed: the version, plus where it comes from and its
+   * checksum, so a git dependency moving to another commit or a changed patch counts too
+   */
+  identity: string;
   dependencies: string[];
 }
 
@@ -24,7 +29,14 @@ export interface LockGraph {
   nodes: Map<string, LockNode>;
 }
 
-const LOCKFILES = ['pnpm-lock.yaml', 'yarn.lock', 'package-lock.json', 'npm-shrinkwrap.json'];
+const LOCKFILES = [
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'package-lock.json',
+  'npm-shrinkwrap.json',
+  'bun.lock',
+  'bun.lockb',
+];
 
 export class LockfileError extends Error {}
 
@@ -47,7 +59,22 @@ export function readLockfile(snapshot: Snapshot, path: string): LockGraph {
   const name = path.slice(path.lastIndexOf('/') + 1);
   if (name === 'pnpm-lock.yaml') return readPnpm(path, dir, text);
   if (name === 'yarn.lock') return readYarn(snapshot, path, dir, text);
+  if (name === 'bun.lock') return readBun(path, dir, text);
+  if (name === 'bun.lockb')
+    throw new LockfileError(`${path}: the binary bun.lockb can't be read; bun.lock can`);
   return readNpm(path, dir, text);
+}
+
+/** True when the lockfile resolves a package of this name anywhere */
+export function hasPackage(graph: LockGraph, name: string) {
+  return nodesNamed(graph, name).length > 0;
+}
+
+function identityOf(version: unknown, ...sources: unknown[]) {
+  return [
+    String(version),
+    ...sources.filter((source) => typeof source === 'string' && source),
+  ].join(' ');
 }
 
 /** The package versions reachable from `names` as loaded by code in `fromFile` */
@@ -145,7 +172,12 @@ function readNpm(path: string, dir: string, text: string): LockGraph {
     const dependencies = Object.keys(dependencyNames(entry, false))
       .map((dependency) => resolveFrom(location, dependency))
       .filter((resolved): resolved is string => resolved !== undefined);
-    graph.nodes.set(location, { name, version: String(entry.version), dependencies });
+    graph.nodes.set(location, {
+      name,
+      version: String(entry.version),
+      identity: identityOf(entry.version, entry.resolved, entry.integrity),
+      dependencies,
+    });
   }
   return graph;
 }
@@ -171,7 +203,17 @@ function readYarn(snapshot: Snapshot, path: string, dir: string, text: string): 
       workspaceIds.set(id, joinPath(dir, workspace));
       continue;
     }
-    graph.nodes.set(id, { name, version: String(entry.version), dependencies: [] });
+    graph.nodes.set(id, {
+      name,
+      version: String(entry.version),
+      // Berry's resolution carries patch hashes and git commits; classic has resolved URLs
+      identity: identityOf(
+        entry.version,
+        resolution ?? entry.resolved,
+        entry.checksum ?? entry.integrity,
+      ),
+      dependencies: [],
+    });
   }
 
   const resolve = (name: string, range: string) => {
@@ -229,6 +271,13 @@ function descriptorName(descriptor: string) {
 
 function readPnpm(path: string, dir: string, text: string): LockGraph {
   const lock = (parseYaml(text) ?? {}) as Record<string, unknown>;
+  if (Number.parseFloat(String(lock.lockfileVersion)) < 6) {
+    throw new LockfileError(`${path}: only lockfileVersion 6 and later are supported`);
+  }
+  const packageInfo = (lock.packages ?? {}) as Record<
+    string,
+    { resolution?: Record<string, unknown> }
+  >;
   const graph: LockGraph = { path, importers: new Map(), nodes: new Map() };
   const snapshots = (lock.snapshots ?? lock.packages ?? {}) as Record<
     string,
@@ -252,7 +301,17 @@ function readPnpm(path: string, dir: string, text: string): LockGraph {
     const dependencies = Object.entries(dependencyNames(entry ?? {}, false))
       .map(([dependency, version]) => nodeId(dependency, version))
       .filter((resolved): resolved is string => resolved !== undefined);
-    graph.nodes.set(id, { name, version, dependencies });
+    // The id carries peers and patch hashes; the resolution pins tarballs and git commits
+    const resolution = (packageInfo[key] ?? packageInfo[key.split('(')[0]] ?? {}).resolution ?? {};
+    const identity = identityOf(
+      version,
+      id,
+      resolution.integrity,
+      resolution.tarball,
+      resolution.commit,
+      resolution.repo,
+    );
+    graph.nodes.set(id, { name, version, identity, dependencies });
   }
 
   const importers = (lock.importers ?? { '.': lock }) as Record<string, Record<string, unknown>>;
@@ -266,6 +325,61 @@ function readPnpm(path: string, dir: string, text: string): LockGraph {
       }
     }
     graph.importers.set(joinPath(dir, importerDir), importer);
+  }
+  return graph;
+}
+
+// bun: the text bun.lock (JSON with trailing commas)
+
+function readBun(path: string, dir: string, text: string): LockGraph {
+  let lock: {
+    workspaces?: Record<string, Record<string, unknown>>;
+    packages?: Record<string, unknown[]>;
+  };
+  try {
+    lock = JSON.parse(text.replace(/,(\s*[}\]])/g, '$1'));
+  } catch {
+    throw new LockfileError(`${path}: couldn't be parsed`);
+  }
+  const graph: LockGraph = { path, importers: new Map(), nodes: new Map() };
+  const packages = lock.packages ?? {};
+  // Keys are install paths ("a", or "b/a" for a nested copy); entries start with "name@version"
+  const resolveFrom = (key: string, name: string) => {
+    let base = key;
+    while (true) {
+      const candidate = base ? `${base}/${name}` : name;
+      if (packages[candidate]) return candidate;
+      if (!base) return undefined;
+      const slash = base.lastIndexOf('/');
+      base = slash === -1 ? '' : base.slice(0, slash);
+    }
+  };
+  for (const [key, entry] of Object.entries(packages)) {
+    const spec = String(entry[0] ?? '');
+    const at = spec.lastIndexOf('@');
+    if (at <= 0 || spec.slice(at + 1).startsWith('workspace:')) continue;
+    const info = (entry.find((part) => part && typeof part === 'object') ?? {}) as Record<
+      string,
+      unknown
+    >;
+    const dependencies = Object.keys(dependencyNames(info, false))
+      .map((dependency) => resolveFrom(key, dependency))
+      .filter((resolved): resolved is string => resolved !== undefined);
+    const checksum = entry.find((part) => typeof part === 'string' && part.startsWith('sha'));
+    graph.nodes.set(key, {
+      name: spec.slice(0, at),
+      version: spec.slice(at + 1),
+      identity: identityOf(spec.slice(at + 1), checksum),
+      dependencies,
+    });
+  }
+  for (const [workspaceDir, workspace] of Object.entries(lock.workspaces ?? {})) {
+    const importer = new Map<string, string>();
+    for (const name of Object.keys(dependencyNames(workspace, true))) {
+      const resolved = resolveFrom('', name);
+      if (resolved && graph.nodes.has(resolved)) importer.set(name, resolved);
+    }
+    graph.importers.set(joinPath(dir, workspaceDir), importer);
   }
   return graph;
 }
