@@ -86,7 +86,9 @@ export function classify(output: string, ignore: readonly IgnoreRule[] = []): Cl
     ) {
       outputs.push(...changedOutputs(step));
     }
-    if (NO_OP.has(step.op)) continue;
+    // The stack itself is a resource too; creating it is bookkeeping, and its outputs are
+    // compared above
+    if (NO_OP.has(step.op) || isStackStep(step)) continue;
     const change = toChange(step);
     const existing = byUrn.get(step.urn);
     if (!existing || priority(change.op) < priority(existing.op)) byUrn.set(step.urn, change);
@@ -108,6 +110,11 @@ export function classify(output: string, ignore: readonly IgnoreRule[] = []): Cl
     outputs,
     ignored,
   };
+}
+
+function isStackStep(step: Step) {
+  const type = step.newState?.type ?? step.oldState?.type ?? step.urn.split('::')[2];
+  return type === 'pulumi:pulumi:Stack';
 }
 
 function toChange(step: Step): ResourceChange {

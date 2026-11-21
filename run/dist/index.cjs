@@ -235662,7 +235662,7 @@ function classify(output, ignore = []) {
     if (step.newState?.type === "pulumi:pulumi:Stack" || step.oldState?.type === "pulumi:pulumi:Stack") {
       outputs.push(...changedOutputs(step));
     }
-    if (NO_OP.has(step.op)) continue;
+    if (NO_OP.has(step.op) || isStackStep(step)) continue;
     const change = toChange(step);
     const existing = byUrn.get(step.urn);
     if (!existing || priority(change.op) < priority(existing.op)) byUrn.set(step.urn, change);
@@ -235682,6 +235682,10 @@ function classify(output, ignore = []) {
     outputs,
     ignored
   };
+}
+function isStackStep(step) {
+  const type = step.newState?.type ?? step.oldState?.type ?? step.urn.split("::")[2];
+  return type === "pulumi:pulumi:Stack";
 }
 function toChange(step) {
   const urnParts = step.urn.split("::");
@@ -238443,6 +238447,32 @@ async function eventContext(event, repoRoot, api) {
     mergedPullRequests: []
   };
 }
+async function pullRequestContext(api, repoRoot, number) {
+  const pullRequest = await api.request(
+    "GET",
+    api.repo(`/pulls/${number}`)
+  );
+  const messages = [pullRequest.body ?? ""];
+  const requests = await commandRequests(api, number);
+  if (pullRequest.merged_at) {
+    return {
+      base: void 0,
+      messages,
+      requests,
+      all: false,
+      pullRequest: void 0,
+      mergedPullRequests: [pullRequest]
+    };
+  }
+  return {
+    base: mergeBase(repoRoot, pullRequest.base.sha),
+    messages,
+    requests,
+    all: false,
+    pullRequest,
+    mergedPullRequests: []
+  };
+}
 function mergeBase(repoRoot, baseSha) {
   try {
     return git(repoRoot, ["merge-base", baseSha, "HEAD"]).trim();
@@ -238605,7 +238635,10 @@ async function main() {
   const token = input("github-token");
   const api = token ? new GitHubApi(token) : void 0;
   const runUrl = runLink();
-  const context = await eventContext(event, repoRoot, api);
+  const pullRequestNumber = Number(input("pull-request"));
+  if (pullRequestNumber && !api)
+    throw new Error("The pull-request input needs the github-token input");
+  const context = pullRequestNumber && api ? await pullRequestContext(api, repoRoot, pullRequestNumber) : await eventContext(event, repoRoot, api);
   if (context === void 0) {
     notice("Not a /pulumi-affected command; nothing to run");
     writeOutputs([]);

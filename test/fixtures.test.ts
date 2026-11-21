@@ -23,6 +23,7 @@ function readTree(root: string, dir = root): Files {
   const files: Files = {};
   for (const name of readdirSync(dir)) {
     const path = join(dir, name);
+    if (name === 'node_modules') continue;
     if (statSync(path).isDirectory()) Object.assign(files, readTree(root, path));
     else files[relative(root, path)] = readFileSync(path, 'utf8');
   }
@@ -31,11 +32,10 @@ function readTree(root: string, dir = root): Files {
 
 const fixtures = readTree(join(E2E, 'fixtures'));
 const scenarios: Scenario[] = JSON.parse(readFileSync(join(E2E, 'scenarios.json'), 'utf8'));
-const config = 'dependsOn:\n  fixture-site/prod: [fixture-site/dev]\n';
 
 for (const scenario of scenarios) {
   test(`scenario: ${scenario.name}`, () => {
-    const result = selectChange({ ...fixtures, 'pulumi-affected.yaml': config }, scenario.changes, {
+    const result = selectChange(fixtures, scenario.changes, {
       messages: scenario.body ? [scenario.body] : [],
     });
     assert.deepEqual(selectedIds(result), scenario.expected);

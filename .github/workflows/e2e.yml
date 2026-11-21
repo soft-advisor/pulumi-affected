@@ -1,0 +1,123 @@
+name: E2E
+
+# Each scenario in e2e/scenarios.json runs the whole lifecycle for real in this repository:
+# deploy the fixtures, open a pull request with the scenario's change, preview it with the run
+# action from this commit, merge it, deploy it, and check the results and comments. State lives
+# in a file backend on the runner; nothing outside GitHub is touched.
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scenarios:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      # Forks get a read-only token and can't open the test pull requests; failing (rather than
+      # skipping, which required checks count as passing) keeps their pull requests unmergeable
+      - name: Refuse pull requests from forks
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error::Pull requests from forks can't run the end-to-end test"
+          exit 1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - id: list
+        run: echo "matrix=$(node e2e/driver.ts list)" >> "$GITHUB_OUTPUT"
+
+  scenario:
+    needs: scenarios
+    name: ${{ matrix.scenario.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write # throwaway branches
+      pull-requests: write # throwaway pull requests and their comments
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(needs.scenarios.outputs.matrix) }}
+    env:
+      INDEX: ${{ matrix.scenario.index }}
+      RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
+      PULUMI_CONFIG_PASSPHRASE: ''
+      PULUMI_SKIP_UPDATE_CHECK: 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: tool
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Install the Pulumi CLI
+        env:
+          PULUMI_VERSION: 3.210.0
+          PULUMI_SHA256: 4450ff72bbac9b4cb9ac28913842c9326568fe03a259d514a144a340f2a515ca
+        run: |
+          archive="pulumi-v${PULUMI_VERSION}-linux-x64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$archive" "https://get.pulumi.com/releases/sdk/$archive"
+          echo "$PULUMI_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/pulumi" >> "$GITHUB_PATH"
+          echo "PULUMI_BACKEND_URL=file://$RUNNER_TEMP/state" >> "$GITHUB_ENV"
+          echo "FIXTURE=$RUNNER_TEMP/fixture" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/state"
+      - name: Install the tool's dependencies
+        working-directory: tool
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+      - id: prepare
+        name: Deploy the fixtures and open the scenario's pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tool/e2e/driver.ts prepare "$INDEX" "$FIXTURE"
+
+      - id: preview
+        uses: ./tool/run
+        with:
+          mode: preview
+          pull-request: ${{ steps.prepare.outputs.pull-request }}
+          working-directory: ${{ env.FIXTURE }}
+      - name: Check the preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULTS: ${{ steps.preview.outputs.results }}
+        run: node tool/e2e/driver.ts assert-preview "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
+
+      - name: Merge the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tool/e2e/driver.ts merge "$INDEX" "${{ steps.prepare.outputs.pull-request }}" "$FIXTURE"
+      - id: deploy
+        uses: ./tool/run
+        with:
+          mode: up
+          pull-request: ${{ steps.prepare.outputs.pull-request }}
+          base: ${{ steps.prepare.outputs.base-sha }}
+          working-directory: ${{ env.FIXTURE }}
+      - name: Check the deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULTS: ${{ steps.deploy.outputs.results }}
+        run: node tool/e2e/driver.ts assert-deploy "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
+
+      - name: Clean up
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tool/e2e/driver.ts cleanup "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
