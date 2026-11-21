@@ -106,7 +106,8 @@ async function main() {
           marker('preview', index),
         );
         // A push that selects nothing updates an earlier comment rather than adding one
-        await syncComments(api, context.pullRequest.number, 'preview', bodies, runs.length === 0);
+        const nothingToSay = runs.length === 0 && selection.skipped.length === 0;
+        await syncComments(api, context.pullRequest.number, 'preview', bodies, nothingToSay);
       }
       // Nothing deployed means nothing to report on the merged pull requests
       if (mode === 'up' && runs.length > 0) {

@@ -95,10 +95,12 @@ jobs:
           mode: preview
           pull-request: ${{ steps.prepare.outputs.pull-request }}
           working-directory: ${{ env.FIXTURE }}
+          command: ${{ matrix.scenario.command }}
       - name: Check the preview
         env:
           GH_TOKEN: ${{ github.token }}
           RESULTS: ${{ steps.preview.outputs.results }}
+          OUTCOME: ${{ steps.preview.outcome }}
         run: node tool/e2e/driver.ts assert-preview "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
 
       - name: Push a second change
@@ -114,11 +116,13 @@ jobs:
           mode: preview
           pull-request: ${{ steps.prepare.outputs.pull-request }}
           working-directory: ${{ env.FIXTURE }}
+          command: ${{ matrix.scenario.command }}
       - name: Check the second preview
         if: matrix.scenario.second
         env:
           GH_TOKEN: ${{ github.token }}
           RESULTS: ${{ steps.second-preview.outputs.results }}
+          OUTCOME: ${{ steps.second-preview.outcome }}
         run: node tool/e2e/driver.ts assert-second-preview "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
 
       - name: Merge the pull request
@@ -133,10 +137,12 @@ jobs:
           pull-request: ${{ steps.prepare.outputs.pull-request }}
           base: ${{ steps.prepare.outputs.base-sha }}
           working-directory: ${{ env.FIXTURE }}
+          command: ${{ matrix.scenario.command }}
       - name: Check the deploy
         env:
           GH_TOKEN: ${{ github.token }}
           RESULTS: ${{ steps.deploy.outputs.results }}
+          OUTCOME: ${{ steps.deploy.outcome }}
         run: node tool/e2e/driver.ts assert-deploy "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
 
       - name: Clean up
