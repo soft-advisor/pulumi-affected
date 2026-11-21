@@ -60,6 +60,19 @@ function gitAuth(): NodeJS.ProcessEnv {
   };
 }
 
+/** Runs a GitHub-facing command again after a short wait when GitHub has a transient failure */
+function retried(cwd: string, command: string, args: string[]) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return sh(cwd, command, args);
+    } catch (error) {
+      if (attempt === 3) throw error;
+      console.log(`Attempt ${attempt} of ${command} ${args[0]} failed; retrying`);
+      execFileSync('sleep', [String(attempt * 5)]);
+    }
+  }
+}
+
 function output(name: string, value: string) {
   const file = process.env.GITHUB_OUTPUT;
   if (file) appendFileSync(file, `${name}=${value}\n`);
@@ -113,7 +126,7 @@ function prepare(index: number, dir: string) {
   );
   if (failed.length > 0) throw new Error(`The initial deploy failed: ${deploy}`);
   const baseSha = commitAll(dir, 'Commit the encryption salts Pulumi wrote');
-  sh(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${base}`]);
+  retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${base}`]);
 
   for (const [path, content] of Object.entries(scenario.changes)) {
     mkdirSync(dirname(join(dir, path)), { recursive: true });
@@ -126,9 +139,9 @@ function prepare(index: number, dir: string) {
     );
   }
   commitAll(dir, scenario.name);
-  sh(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${change}`]);
+  retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${change}`]);
 
-  const url = sh(dir, 'gh', [
+  const url = retried(dir, 'gh', [
     'pr',
     'create',
     '--repo',
@@ -207,7 +220,7 @@ function assertDeploy(index: number, number: string, results: string) {
 
 function merge(index: number, number: string, dir: string) {
   sh(TOOL, 'gh', ['pr', 'ready', number, '--repo', repository]);
-  sh(TOOL, 'gh', ['pr', 'merge', number, '--repo', repository, '--squash']);
+  retried(TOOL, 'gh', ['pr', 'merge', number, '--repo', repository, '--squash']);
   sh(dir, 'git', ['fetch', '-q', remote(), branches(index).base]);
   sh(dir, 'git', ['checkout', '-q', 'FETCH_HEAD']);
 }
