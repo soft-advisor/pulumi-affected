@@ -2,7 +2,13 @@ import ts from 'typescript';
 import type { Project } from '../projects.ts';
 import { dirnameOf, isInside, joinPath, type Snapshot } from '../snapshot.ts';
 import { anchorOf, type EvaluationContext, evaluateString } from './evaluate.ts';
-import { type Item, type ModuleInfo, type PathCandidate, parseModule } from './module.ts';
+import {
+  type Item,
+  type ModuleInfo,
+  type PathCandidate,
+  parseModule,
+  type StackReferenceUse,
+} from './module.ts';
 import { findUp, parseJson, Resolver } from './resolve.ts';
 
 /*
@@ -19,7 +25,7 @@ export interface ProjectAnalysis {
   chains: Map<string, string[]>;
   /** npm package name → files that load it */
   packages: Map<string, Set<string>>;
-  stackReferences: { module: ModuleInfo; expression: ts.Expression }[];
+  stackReferences: { module: ModuleInfo; use: StackReferenceUse }[];
   /**
    * Where analysis may have missed inputs (a computed `require`, an unresolvable import, a file
    * read whose path can't be worked out). Selection then also counts any change in the project
@@ -218,9 +224,7 @@ export function analyzeProject(
     }
     for (const candidate of item.pathCandidates) recordCandidate(module, candidate);
     for (const expression of item.resolved) recordResolved(module, expression);
-    for (const expression of item.stackReferences) {
-      analysis.stackReferences.push({ module, expression });
-    }
+    for (const use of item.stackReferences) analysis.stackReferences.push({ module, use });
   };
 
   const markImport = (from: string, specifier: string, name: string) => {

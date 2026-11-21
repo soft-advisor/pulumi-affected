@@ -2,6 +2,7 @@ import { writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { planStacks } from '../plan/plan.ts';
 import { COMMENT_FILE } from '../plan/manifest.ts';
+import { describeRead } from '../plan/outputs.ts';
 import { renderPlan } from '../plan/report.ts';
 import { commandRunner, DEFAULT_COMMAND } from '../pulumi/runner.ts';
 import { repoRootOf } from '../snapshot.ts';
@@ -47,6 +48,9 @@ async function main() {
     },
   });
   for (const message of manifest.warnings) warning(message);
+  for (const read of manifest.followUps) {
+    warning(`Plan ${read.id} again after this is applied: it ${describeRead(read)}`);
+  }
 
   const report = renderPlan(manifest, (index) => marker('plan', index));
   writeFileSync(join(directory, COMMENT_FILE), report.bodies.join('\n\n'));

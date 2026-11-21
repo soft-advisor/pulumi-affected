@@ -73,8 +73,15 @@ export interface SelectResult {
   skipped: { id: string; source: string; reasons: string[] }[];
   /** Every stack id to the ids of the stacks it depends on */
   dependencies: Record<string, string[]>;
+  /**
+   * Stack id → dependency id → the outputs it reads from that dependency, or "all" when that
+   * can't be worked out (or the dependency comes from `dependsOn`)
+   */
+  outputsRead: OutputsRead;
   warnings: string[];
 }
+
+export type OutputsRead = Record<string, Record<string, string[] | 'all'>>;
 
 export const RUN_TRAILER = 'Pulumi-Affected-Run';
 export const SKIP_TRAILER = 'Pulumi-Affected-Skip';
@@ -200,6 +207,7 @@ export function select(options: SelectOptions): SelectResult {
     dependencies: Object.fromEntries(
       [...graph].map(([id, dependencies]) => [id, [...dependencies].sort()]),
     ),
+    outputsRead: session.outputsReadRecord(),
     warnings: [...new Set(warnings)],
   };
 }
@@ -217,6 +225,31 @@ function stackBase(options: SelectOptions, stack: Stack, defaultBase: string, re
 export class Session {
   readonly warnings: string[] = [];
   readonly graphWarnings: string[] = [];
+  /** Stack id → dependency id → outputs read, filled in by dependencyGraph */
+  private readonly outputsRead = new Map<string, Map<string, Set<string> | 'all'>>();
+
+  private recordReads(stack: string, dependency: string, outputs: string[] | 'all') {
+    if (stack === dependency) return;
+    const reads = this.outputsRead.get(stack) ?? new Map<string, Set<string> | 'all'>();
+    this.outputsRead.set(stack, reads);
+    const current = reads.get(dependency) ?? new Set<string>();
+    if (current === 'all' || outputs === 'all') reads.set(dependency, 'all');
+    else reads.set(dependency, new Set([...current, ...outputs]));
+  }
+
+  outputsReadRecord(): OutputsRead {
+    return Object.fromEntries(
+      [...this.outputsRead].map(([stack, reads]) => [
+        stack,
+        Object.fromEntries(
+          [...reads].map(([dependency, outputs]) => [
+            dependency,
+            outputs === 'all' ? 'all' : [...outputs].sort(),
+          ]),
+        ),
+      ]),
+    );
+  }
   private readonly snapshots = new Map<string, Snapshot>();
   private readonly analyses = new Map<string, ProjectAnalysis>();
   private readonly lockfiles = new Map<string, LockGraph | undefined>();
@@ -545,8 +578,8 @@ export class Session {
             values[`${namespace}:${key}`] ?? (namespace === project.name ? values[key] : undefined);
           return typeof value === 'string' ? value : undefined;
         };
-        for (const { module, expression } of analysis.stackReferences) {
-          const name = evaluateString(expression, module, {
+        for (const { module, use } of analysis.stackReferences) {
+          const name = evaluateString(use.name, module, {
             lookup: analysis.lookup,
             stack: stack.stack,
             project: project.name,
@@ -559,7 +592,29 @@ export class Session {
               `${stack.id}: a StackReference in ${module.path} has a name that can't be worked out; add it to dependsOn`,
             );
           }
-          for (const target of targets) addEdge(graph, stack.id, target.id);
+          // Output names are worked out like stack names: constants, templates, config
+          const outputs: string[] | 'all' =
+            use.outputs === 'all'
+              ? 'all'
+              : (() => {
+                  const names: string[] = [];
+                  for (const expression of use.outputs) {
+                    const output = evaluateString(expression, module, {
+                      lookup: analysis.lookup,
+                      stack: stack.stack,
+                      project: project.name,
+                      config: readConfig,
+                      unknown: undefined,
+                    });
+                    if (output === undefined) return 'all';
+                    names.push(output);
+                  }
+                  return names;
+                })();
+          for (const target of targets) {
+            addEdge(graph, stack.id, target.id);
+            this.recordReads(stack.id, target.id, outputs);
+          }
         }
       }
     }
@@ -567,7 +622,10 @@ export class Session {
       for (const stack of stacks) {
         if (!matchesStack(pattern, stack)) continue;
         for (const dependency of stacks) {
-          if (matchesAnyStack(dependencies, dependency)) addEdge(graph, stack.id, dependency.id);
+          if (!matchesAnyStack(dependencies, dependency)) continue;
+          addEdge(graph, stack.id, dependency.id);
+          // What a stack reads from a dependency the analysis can't see is unknown
+          this.recordReads(stack.id, dependency.id, 'all');
         }
       }
     }
@@ -830,5 +888,10 @@ export function readDependencyGraph(options: { cwd: string; head?: string; confi
   const projects = discoverProjects(head, config);
   const stacks = projects.flatMap((project) => project.stacks);
   const graph = session.dependencyGraph(projects, stacks);
-  return { stacks, graph, warnings: session.graphWarnings };
+  return {
+    stacks,
+    graph,
+    outputsRead: session.outputsReadRecord(),
+    warnings: session.graphWarnings,
+  };
 }

@@ -50,10 +50,16 @@ export interface Item {
   siblings: Item[];
   /** A function declaration, which is hoisted, so where it sits doesn't matter */
   hoisted: boolean;
-  /** Name expressions of `new StackReference(...)` */
-  stackReferences: ts.Expression[];
+  /** `new StackReference(...)`: the referenced stack's name, and the outputs read from it */
+  stackReferences: StackReferenceUse[];
   /** Why this item can't be analysed precisely, e.g. a `require` with a computed path */
   unanalysable: string[];
+}
+
+export interface StackReferenceUse {
+  name: ts.Expression;
+  /** Expressions naming the outputs read, or "all" when the reference is used in other ways */
+  outputs: ts.Expression[] | 'all';
 }
 
 export interface PathCandidate {
@@ -584,7 +590,10 @@ function inspectCall(node: ts.CallExpression | ts.NewExpression, item: Item) {
     item.calls.push({ object, name, argument: firstArgument });
   }
   if (name === 'StackReference' && ts.isNewExpression(node)) {
-    item.stackReferences.push(stackReferenceName(node) ?? firstArgument);
+    item.stackReferences.push({
+      name: stackReferenceName(node) ?? firstArgument,
+      outputs: outputsRead(node),
+    });
   }
 }
 
@@ -607,6 +616,91 @@ function isModuleSpecifier(node: ts.Node) {
     ts.isIdentifier(callee.expression) &&
     callee.expression.text === 'require'
   );
+}
+
+/** StackReference methods that read one output, named by their first argument */
+const OUTPUT_READERS = new Set([
+  'getOutput',
+  'requireOutput',
+  'getOutputValue',
+  'requireOutputValue',
+  'getOutputDetails',
+]);
+
+/**
+ * The outputs a program reads from a stack reference: through its output methods or
+ * `.outputs.name`, directly on the `new` expression or on the constant it's assigned to in the
+ * same module. A reference used any other way (exported, passed to a function, its outputs
+ * spread) could have any output read, so it reads "all".
+ */
+function outputsRead(node: ts.NewExpression): StackReferenceUse['outputs'] {
+  let reference: ts.Expression = node;
+  while (ts.isParenthesizedExpression(reference.parent) || ts.isAsExpression(reference.parent)) {
+    reference = reference.parent as ts.Expression;
+  }
+  const declaration = reference.parent;
+  if (
+    !ts.isVariableDeclaration(declaration) ||
+    !ts.isIdentifier(declaration.name) ||
+    declaration.initializer !== reference
+  ) {
+    const read = readAt(reference);
+    return read === undefined ? 'all' : [read];
+  }
+  const statement = declaration.parent?.parent;
+  if (
+    statement &&
+    ts.isVariableStatement(statement) &&
+    statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
+  ) {
+    return 'all';
+  }
+  const binding = declaration.name.text;
+  const reads: ts.Expression[] = [];
+  let escapes = false;
+  const visit = (current: ts.Node) => {
+    if (escapes) return;
+    if (ts.isIdentifier(current) && current.text === binding && current !== declaration.name) {
+      // A property name or a key that happens to match isn't a use
+      const parent = current.parent;
+      const isName =
+        (ts.isPropertyAccessExpression(parent) && parent.name === current) ||
+        (ts.isPropertyAssignment(parent) && parent.name === current);
+      if (!isName) {
+        const read = readAt(current);
+        if (read === undefined) escapes = true;
+        else reads.push(read);
+      }
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node.getSourceFile());
+  return escapes ? 'all' : reads;
+}
+
+/** The output name read where `reference` is used, if it's used to read one output */
+function readAt(reference: ts.Expression): ts.Expression | undefined {
+  const parent = reference.parent;
+  if (!ts.isPropertyAccessExpression(parent) || parent.expression !== reference) return undefined;
+  const member = parent.name.text;
+  if (OUTPUT_READERS.has(member)) {
+    const call = parent.parent;
+    if (ts.isCallExpression(call) && call.expression === parent && call.arguments[0]) {
+      return call.arguments[0];
+    }
+    return undefined;
+  }
+  if (member === 'outputs') {
+    // `ref.outputs.name` or `ref.outputs["name"]`; the whole `outputs` object could be any
+    const access = parent.parent;
+    if (ts.isPropertyAccessExpression(access) && access.expression === parent) {
+      return ts.factory.createStringLiteral(access.name.text);
+    }
+    if (ts.isElementAccessExpression(access) && access.expression === parent) {
+      return access.argumentExpression;
+    }
+  }
+  return undefined;
 }
 
 /** `new StackReference(resourceName, { name })` refers to `name` when it's given */

@@ -15,7 +15,8 @@
     },
     "expected": ["fixture-accounts/business", "fixture-accounts/shop"],
     "changed": ["fixture-accounts/business", "fixture-accounts/shop"],
-    "applied": ["fixture-accounts/business", "fixture-accounts/shop"]
+    "applied": ["fixture-accounts/business", "fixture-accounts/shop"],
+    "needsPlan": ["fixture-access/prod", "fixture-dns/prod"]
   },
   {
     "name": "comment-only change",
@@ -33,7 +34,8 @@
     },
     "expected": ["fixture-accounts/shop"],
     "changed": ["fixture-accounts/shop"],
-    "applied": ["fixture-accounts/shop"]
+    "applied": ["fixture-accounts/shop"],
+    "needsPlan": ["fixture-access/prod"]
   },
   {
     "name": "file read by the program",
@@ -41,10 +43,10 @@
       "site/site/index.html": "<h1>Hello, world</h1>\n"
     },
     "expected": ["fixture-site/dev", "fixture-site/prod"],
-    "changed": ["fixture-site/dev", "fixture-site/prod"],
-    "applied": ["fixture-site/dev"],
+    "changed": ["fixture-site/dev"],
+    "applied": [],
     "waves": [["fixture-site/dev"], ["fixture-site/prod"]],
-    "replan": ["fixture-site/prod"]
+    "failing": ["fixture-site/prod"]
   },
   {
     "name": "docs only",
@@ -74,13 +76,23 @@
     "applied": []
   },
   {
+    "name": "a new output nobody reads",
+    "changes": {
+      "org/accounts/index.ts": "import * as pulumi from '@pulumi/pulumi';\nimport * as random from '@pulumi/random';\nimport { accountName } from '../lib/naming';\n\nconst config = new pulumi.Config();\nconst name = accountName(config.require('alias'));\n\nexport const accountId = new random.RandomInteger(name, { min: 100000, max: 999999 }).result;\nexport const tier = 'standard';\n"
+    },
+    "expected": ["fixture-accounts/business", "fixture-accounts/shop"],
+    "changed": ["fixture-accounts/business", "fixture-accounts/shop"],
+    "applied": ["fixture-accounts/business", "fixture-accounts/shop"]
+  },
+  {
     "name": "a new stack",
     "changes": {
       "org/accounts/Pulumi.newco.yaml": "config:\n  fixture-accounts:alias: newco\n"
     },
     "expected": ["fixture-accounts/newco"],
     "changed": ["fixture-accounts/newco"],
-    "applied": ["fixture-accounts/newco"]
+    "applied": ["fixture-accounts/newco"],
+    "needsPlan": ["fixture-access/prod"]
   },
   {
     "name": "a stack whose state changed after planning",
@@ -101,7 +113,8 @@
     "expected": ["fixture-accounts/shop"],
     "banner": "Assuming role {deploy}",
     "changed": ["fixture-accounts/shop"],
-    "applied": ["fixture-accounts/shop"]
+    "applied": ["fixture-accounts/shop"],
+    "needsPlan": ["fixture-access/prod"]
   },
   {
     "name": "a skip in a commit message",
@@ -146,7 +159,8 @@
     },
     "expected": ["fixture-accounts/shop"],
     "changed": ["fixture-accounts/shop"],
-    "applied": ["fixture-accounts/shop"]
+    "applied": ["fixture-accounts/shop"],
+    "needsPlan": ["fixture-access/prod"]
   },
   {
     "name": "a package a program loads (yarn classic)",
@@ -180,7 +194,8 @@
     },
     "expected": ["fixture-accounts/shop"],
     "changed": ["fixture-accounts/shop"],
-    "applied": ["fixture-accounts/shop"]
+    "applied": ["fixture-accounts/shop"],
+    "needsPlan": ["fixture-access/prod"]
   },
   {
     "name": "a package a program loads (yarn berry)",
@@ -214,7 +229,8 @@
     },
     "expected": ["fixture-accounts/shop"],
     "changed": ["fixture-accounts/shop"],
-    "applied": ["fixture-accounts/shop"]
+    "applied": ["fixture-accounts/shop"],
+    "needsPlan": ["fixture-access/prod"]
   },
   {
     "name": "a package a program loads (pnpm)",

@@ -8,6 +8,7 @@ import { secretsProviderOf, stateFingerprint } from '../pulumi/stack.ts';
 import { type SelectedStack, type SelectOptions, select } from '../select.ts';
 import { git, repoRootOf, WorktreeSnapshot } from '../snapshot.ts';
 import { mapConcurrently } from './concurrency.ts';
+import { describeRead, type StaleRead, staleReads } from './outputs.ts';
 import { stackOutputChanges } from './planfile.ts';
 import {
   hashFile,
@@ -36,7 +37,7 @@ export interface PlanOptions {
 export type StackOutcome =
   | { kind: 'planned'; stack: PlannedStack }
   | { kind: 'unchanged'; id: string; reasons: string[] }
-  | { kind: 'failed'; id: string; error: string; reasons: string[] };
+  | { kind: 'failed'; id: string; error: string; reasons: string[]; blockedBy?: StaleRead[] };
 
 export async function planStacks(options: PlanOptions): Promise<Manifest> {
   const repoRoot = repoRootOf(options.select.cwd);
@@ -56,6 +57,35 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
     return outcome;
   });
 
+  // A planned stack reading outputs another plan changes was planned with their old values: its
+  // plan can only be right once the other is applied, so it belongs in a later change
+  const planned = outcomes.flatMap((outcome) =>
+    outcome.kind === 'planned' ? [outcome.stack] : [],
+  );
+  const stale = staleReads(planned, selection.dependencies, selection.outputsRead);
+  const blocked = new Map<string, StaleRead[]>();
+  for (const read of stale) {
+    if (planned.some((stack) => stack.id === read.id)) {
+      blocked.set(read.id, [...(blocked.get(read.id) ?? []), read]);
+    }
+  }
+  for (const [index, outcome] of outcomes.entries()) {
+    if (outcome.kind !== 'planned' || !blocked.has(outcome.stack.id)) continue;
+    rmSync(join(directory, outcome.stack.plan), { force: true });
+    rmSync(join(directory, outcome.stack.preview), { force: true });
+    const reads = (blocked.get(outcome.stack.id) ?? []).map(describeRead).join('; ');
+    const dependencies = [
+      ...new Set((blocked.get(outcome.stack.id) ?? []).map((read) => `\`${read.dependency}\``)),
+    ].join(', ');
+    outcomes[index] = {
+      kind: 'failed',
+      id: outcome.stack.id,
+      reasons: outcome.stack.reasons,
+      blockedBy: blocked.get(outcome.stack.id),
+      error: `It changes, and it ${reads}. Its plan would be made with the old values. Change ${dependencies} first, then this stack in a later pull request; or leave it out of this one with Pulumi-Affected-Skip: ${outcome.stack.id}`,
+    };
+  }
+
   const manifest: Manifest = {
     version: 2,
     tree: git(repoRoot, ['rev-parse', 'HEAD^{tree}']).trim(),
@@ -68,10 +98,18 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
     ),
     failed: outcomes.flatMap((outcome) =>
       outcome.kind === 'failed'
-        ? [{ id: outcome.id, error: outcome.error, reasons: outcome.reasons }]
+        ? [
+            {
+              id: outcome.id,
+              error: outcome.error,
+              reasons: outcome.reasons,
+              ...(outcome.blockedBy ? { blockedBy: outcome.blockedBy } : {}),
+            },
+          ]
         : [],
     ),
     skipped: selection.skipped,
+    followUps: stale.filter((read) => !blocked.has(read.id)),
     dependencies: selection.dependencies,
     warnings: selection.warnings,
   };

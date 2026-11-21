@@ -2,6 +2,7 @@ import { existsSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { applyPlans } from '../plan/apply.ts';
 import { MANIFEST_FILE } from '../plan/manifest.ts';
+import { describeRead } from '../plan/outputs.ts';
 import { renderApply } from '../plan/report.ts';
 import { commandRunner, DEFAULT_COMMAND } from '../pulumi/runner.ts';
 import { git, repoRootOf } from '../snapshot.ts';
@@ -123,15 +124,14 @@ async function apply() {
     JSON.stringify({
       stacks: result.stacks,
       needsPlan: result.needsPlan,
+      followUps: result.followUps,
       warnings: result.warnings,
     }),
   );
   setOutput('needs-plan', JSON.stringify(result.needsPlan));
   setOutput('failed', result.ok ? 'false' : 'true');
-  if (result.needsPlan.length > 0) {
-    warning(
-      `These stacks read outputs the plans changed; plan them again: ${result.needsPlan.join(', ')}`,
-    );
+  for (const read of result.followUps) {
+    warning(`Plan ${read.id} again: it ${describeRead(read)}`);
   }
 
   if (booleanInput('comment')) {

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ResourceChange } from '../classify.ts';
+import type { StaleRead } from './outputs.ts';
 
 /*
  * The plan directory's manifest: what `plan` planned and `apply` applies. It's the contract
@@ -54,8 +55,11 @@ export interface Manifest {
   stacks: PlannedStack[];
   /** Previewed, nothing to apply */
   unchanged: { id: string; reasons: string[] }[];
-  failed: { id: string; error: string; reasons: string[] }[];
+  /** Stacks that couldn't be planned; `blockedBy` when they read outputs another plan changes */
+  failed: { id: string; error: string; reasons: string[]; blockedBy?: StaleRead[] }[];
   skipped: { id: string; source: string; reasons: string[] }[];
+  /** Stacks that read outputs these plans change, to plan again once they're applied */
+  followUps: StaleRead[];
   /** Stack id → ids of the stacks it depends on, for the report */
   dependencies: Record<string, string[]>;
   warnings: string[];
@@ -113,6 +117,7 @@ export function readManifest(directory: string): Manifest {
     'stacks or failed missing',
   );
   check(typeof manifest.pulumiVersion === 'string', 'pulumiVersion missing');
+  check(Array.isArray(manifest.followUps), 'followUps missing');
   const ids = new Set<string>();
   for (const stack of manifest.stacks) {
     check(NAME.test(stack.project) && NAME.test(stack.stack), `bad name in ${String(stack.id)}`);

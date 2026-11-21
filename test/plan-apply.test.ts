@@ -177,7 +177,7 @@ outputs:
     assert.deepEqual(outcomes(result), { 'secrets/prod': 'applied' });
   });
 
-  test('skips a stack planned before outputs it reads changed', async () => {
+  test('a stack reading outputs another plan changes is planned after it, never with it', async () => {
     const up = (word: string) => `name: up\nruntime: yaml\noutputs:\n  word: ${word}\n`;
     const down = (suffix: string) => `name: down
 runtime: yaml
@@ -198,12 +198,29 @@ outputs:
     });
     deploy(dir, 'up');
     deploy(dir, 'down');
-    commit(dir, { 'up/Pulumi.yaml': up('two'), 'down/Pulumi.yaml': down('!') });
 
-    const manifest = await plan(dir, base, plans, runner);
-    assert.deepEqual(manifest.stacks.map((stack) => stack.id).sort(), ['down/dev', 'up/dev']);
+    // Both change: down's plan would read up's old outputs, so planning fails for it
+    commit(dir, { 'up/Pulumi.yaml': up('two'), 'down/Pulumi.yaml': down('!') });
+    const both = await plan(dir, base, plans, runner);
+    assert.deepEqual(
+      both.stacks.map((stack) => stack.id),
+      ['up/dev'],
+    );
+    assert.deepEqual(
+      both.failed.map((stack) => [stack.id, stack.blockedBy?.map((read) => read.dependency)]),
+      [['down/dev', ['up/dev']]],
+    );
+    await assert.rejects(apply(dir, plans, runner), /Planning failed for down\/dev/);
+
+    // Only up changes: down is to be planned again once up is applied
+    commit(dir, { 'down/Pulumi.yaml': down('') });
+    const only = await plan(dir, base, plans, runner);
+    assert.deepEqual(
+      only.followUps.map((read) => [read.id, read.dependency, read.outputs]),
+      [['down/dev', 'up/dev', ['word']]],
+    );
     const result = await apply(dir, plans, runner);
-    assert.deepEqual(outcomes(result), { 'up/dev': 'applied', 'down/dev': 'skipped' });
+    assert.deepEqual(outcomes(result), { 'up/dev': 'applied' });
     assert.deepEqual(result.needsPlan, ['down/dev']);
   });
 
