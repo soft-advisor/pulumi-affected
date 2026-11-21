@@ -33,8 +33,6 @@ interface Scenario {
   changed: string[];
   /** Stacks whose plan is applied after merge */
   applied: string[];
-  /** The plan action's create-stacks input */
-  createStacks?: 'plan' | 'apply';
   /** A stack to update after planning, so applying its plan is refused */
   changeState?: string;
   /** Stacks whose plan is refused */
@@ -211,7 +209,6 @@ function prepare(index: number, dir: string) {
   output('base-sha', baseSha);
   output('head-sha', head);
   output('banner', scenario.banner ?? '');
-  output('create-stacks', scenario.createStacks ?? 'plan');
 }
 
 function writeChanges(dir: string, changes: Record<string, string | null>) {
@@ -261,7 +258,7 @@ function assertSelect(index: number, file: string) {
 }
 
 interface Manifest {
-  stacks: { id: string; state: { kind: string } }[];
+  stacks: { id: string }[];
   failed: { id: string }[];
 }
 
@@ -284,11 +281,6 @@ function assertPlans(index: number, directory: string) {
     scenario.changed,
     'plans',
   );
-  if (scenario.createStacks === 'apply') {
-    for (const stack of manifest.stacks) {
-      check(stack.state.kind === 'created-on-apply', `${stack.id} was created when planning`);
-    }
-  }
 }
 
 function merge(number: string, index: number, dir: string, planned: string) {

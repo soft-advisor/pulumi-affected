@@ -86,6 +86,9 @@ export class ApiError extends Error {
   }
 }
 
+/** Who the workflow's own token comments as */
+const WORKFLOW_BOT = 'github-actions[bot]';
+
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAY = 2_000;
 const MAX_RETRY_DELAY = 30_000;
@@ -151,17 +154,16 @@ export class GitHubApi {
   private ownership: Promise<(author: Author | null) => boolean> | undefined;
 
   /**
-   * How to tell the action's own comments: by the login behind a personal token, or, for
-   * the workflow's token and GitHub App tokens (which can't read /user and post as
-   * <name>[bot]), by being a bot. Only installed apps can be bots, and only people with write
-   * access can install apps.
+   * How to tell the action's own comments: by the login behind a personal token, or, for the
+   * workflow's token (which can't read /user), by being github-actions[bot]. Other bots' comments
+   * are never edited, even with the marker; a GitHub App token posts new comments each run.
    */
   ownComments() {
     this.ownership ??= this.request<{ login: string }>('GET', '/user').then(
       (user) => (author: Author | null) => author?.login === user.login,
       (error: unknown) => {
         if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
-          return (author: Author | null) => author?.type === 'Bot';
+          return (author: Author | null) => author?.login === WORKFLOW_BOT;
         }
         throw error;
       },

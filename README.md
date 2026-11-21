@@ -130,7 +130,7 @@ The comparison base comes from the event: a pull request's merge base with its t
 
 **Outputs:** `changed` and `unchanged` (JSON arrays of the preview files), `any`. A preview counts as changed when a resource would be created, updated, replaced or deleted. Reads and unchanged resources don't count, and neither does known noise listed under `classify.ignore`, such as a provider whose `assumeRole` differs because previews use a read-only role. Output that a wrapper script prints before Pulumi's JSON is skipped.
 
-A preview usually can't tell whether **stack outputs alone** will change, so a stack whose only change is its outputs counts as unchanged. If other stacks read those outputs, keep its plan anyway (`plan` does).
+A preview doesn't show **stack outputs alone** changing, so a stack whose only change is its outputs counts as unchanged here. The plan file does show them; `plan` reads them from there.
 
 ### `plan` (optional)
 
@@ -141,21 +141,22 @@ Selects like `select`, then previews each selected stack in parallel with `--sav
   uses: soft-advisor/pulumi-affected/plan@<commit sha>
 ```
 
-| Input                                                              | Default                                     |                                                                                                                                                                                         |
-| ------------------------------------------------------------------ | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `base`, `head`, `bases`, `run`, `skip`, `all`, `working-directory` |                                             | As for `select`                                                                                                                                                                         |
-| `directory`                                                        | `pulumi-plans`                              | Where plans, previews, `manifest.json` and `comment.md` go                                                                                                                              |
-| `command`                                                          | `pulumi --cwd {dir} --stack {stack}`        | How to run Pulumi for a stack; placeholders `{dir}`, `{stack}`, `{project}`, `{id}`. Run without a shell, so a wrapper script that picks credentials per stack goes here                |
-| `concurrency`                                                      | `4`                                         | Previews at once                                                                                                                                                                        |
-| `create-stacks`                                                    | `plan`                                      | A selected stack that doesn't exist yet: `plan` creates it, empty, before previewing; `apply` previews it in a temporary local backend, so nothing is created until its plan is applied |
-| `upload`                                                           | `true`                                      | Upload `directory` as the artifact `pulumi-plans-<git tree SHA>`. Turn off to store the plans yourself                                                                                  |
-| `retention-days`                                                   | repository setting                          | For the artifact                                                                                                                                                                        |
-| `comment`                                                          | `true`                                      | Post the report on the pull request, updated in place on later runs. `comment.md` is written either way, for posting elsewhere                                                          |
-| `pull-request`, `github-token`                                     | the triggering pull request, `github.token` | Where and as whom to comment                                                                                                                                                            |
+| Input                                                      | Default                                     |                                                                                                                                                                          |
+| ---------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `base`, `bases`, `run`, `skip`, `all`, `working-directory` |                                             | As for `select`. The checked-out code is what's planned                                                                                                                  |
+| `directory`                                                | `pulumi-plans`                              | Where plans, previews, `manifest.json` and `comment.md` go                                                                                                               |
+| `command`                                                  | `pulumi --cwd {dir} --stack {stack}`        | How to run Pulumi for a stack; placeholders `{dir}`, `{stack}`, `{project}`, `{id}`. Run without a shell, so a wrapper script that picks credentials per stack goes here |
+| `concurrency`                                              | `4`                                         | Previews at once                                                                                                                                                         |
+| `upload`                                                   | `true`                                      | Upload `directory` as the artifact `pulumi-plans-<git tree SHA>`. Turn off to store the plans yourself                                                                   |
+| `retention-days`                                           | repository setting                          | For the artifact                                                                                                                                                         |
+| `comment`                                                  | `true`                                      | Post the report on the pull request, updated in place on later runs. `comment.md` is written either way, for posting elsewhere                                           |
+| `pull-request`, `github-token`                             | the triggering pull request, `github.token` | Where and as whom to comment                                                                                                                                             |
 
 **Outputs:** `directory`, `artifact`, `tree`, `any`, `ids`, `failed`.
 
-- A stack is kept when its preview would change a resource, when it's new, or when other stacks read its outputs.
+- A stack is kept when its plan would change a resource or a stack output, or when it's new.
+- A selected stack that doesn't exist yet is **created, empty,** so Pulumi can plan it (with the secrets provider its config file names). Its passphrase encryption salt goes into the manifest, so `apply` works from a checkout where the salt isn't committed.
+- When a planned stack reads outputs that another plan changes, the report says it must be **planned again** after that one applies; `apply` skips it rather than apply a plan made against old outputs.
 - A stack that fails to preview fails the action, after uploading and commenting. `apply` refuses a manifest with failures.
 - For each plan, the manifest records the stack's **state fingerprint** (a hash of its exported resources) at planning time.
 
@@ -171,14 +172,28 @@ Applies the plans for **exactly the checked-out code**: `pulumi up --plan` per s
 ```
 
 - **Where the plans come from:** `directory`, if it already holds a `manifest.json` (you fetched them yourself); otherwise the artifact `pulumi-plans-<tree SHA of the checkout>`, from `run-id` or else the newest run of this repository (not a fork) that uploaded it. No plans for this tree means failure: plan this exact code first.
-- **Checks before applying anything:** the manifest and every plan file's hash are valid, planning had no failures, the checkout's tree is the one planned, and each stack is one this code defines.
+- **Checks before applying anything:** the manifest and every plan file's hash are valid, planning had no failures, the checkout's tree is the one planned, the checkout has nothing the commit doesn't (no modified or untracked files outside the plan directory, apart from encryption salts Pulumi writes), and each stack is one the commit defines and `stacks` allows.
+- **Trusted inputs only:** the plans came from a job that ran the pull request's code, so the stacks, their order and the config are read from the commit, never from the manifest. Each plan file's hash is checked again right before it's applied.
 - **Per stack:** the state fingerprint must still match the one planned from. If it doesn't, the stack's plan is **refused** (plan again) and stacks depending on it are **skipped**; unrelated stacks still apply. Pulumi's own stack lock keeps two updates from running at once.
-- **Reruns are safe:** each update is tagged `pulumi-affected:<plan hash>`, so a plan already applied is reported as `already-applied` and not applied twice.
-- **New stacks** with `create-stacks: apply` are created here, with the secrets provider their config file names.
-- If an apply changes outputs that **stacks outside the plans** read, they're listed in `needs-plan` and the report: plan them next.
+- **Reruns are safe:** each update is tagged `pulumi-affected:<plan hash>`, and a plan found among the stack's last 25 updates is reported as `already-applied`, not applied twice.
+- If an applied plan changes outputs that **other stacks** read, those stacks are listed in `needs-plan` and the report: plan them next.
+- **Preview credentials that differ from deploy credentials:** see [below](#preview-and-deploy-roles).
 
-**Inputs:** `directory`, `run-id`, `working-directory`, `command`, `concurrency`, `comment` (default `true`: on the triggering pull request, `pull-request`, or the pull request the pushed commit came from), `pull-request`, `github-token` (needs `actions: read` to find the artifact, `pull-requests: write` to comment).
+**Inputs:** `directory`, `run-id`, `stacks` (patterns that may be applied; a plan for any other stack fails the apply), `working-directory`, `command`, `concurrency`, `comment` (default `true`: on the triggering pull request, `pull-request`, or the pull request the pushed commit came from), `pull-request`, `github-token` (needs `actions: read` to find the artifact, `pull-requests: write` to comment).
 **Outputs:** `directory`, `result` (each stack's outcome: `applied`, `already-applied`, `refused`, `failed` or `skipped`), `needs-plan`, `failed`.
+
+#### Preview and deploy roles
+
+Previews should run with read-only credentials, and applies with deploy credentials. When a program passes the role to its provider (`new aws.Provider(..., { assumeRole: ... })`, chosen by an environment variable), the plan records the preview role as the provider's input, and Pulumi refuses to apply it with another role. List such properties under `classify.ignore`, with their names:
+
+```yaml
+classify:
+  ignore:
+    - type: pulumi:providers:aws
+      properties: [assumeRoles] # assumeRole in @pulumi/aws before v7
+```
+
+`classify` then doesn't count the difference as a change, and `apply` leaves exactly those properties open in the plan, so any value is accepted for them; every other input is still held to the plan. Rules without `properties` never relax a plan. The apply report lists every property left open. Credentials that come from the environment (OIDC, `AWS_*` variables) need none of this.
 
 Whether a change may be applied (approvals, who may trigger it, required checks) is for your workflow and repository rules to decide before this step runs; see [Guardrails](#guardrails-and-limitations).
 
@@ -234,7 +249,9 @@ jobs:
       - uses: soft-advisor/pulumi-affected/apply@<commit sha>
 ```
 
-A squash merge of a branch that was up to date with `main` has the same tree as the pull request's head, so `apply` finds that pull request's plans by the tree. If the branch wasn't up to date, there are no plans for the merged tree and `apply` fails instead of planning again.
+`pull_request` runs check out the pull request merged into `main`. When `main` hasn't moved since, that's the tree a squash merge produces, so `apply` finds the plans by the tree. If `main` moved, the trees differ, and `apply` fails instead of planning again: re-run the plan (requiring branches to be up to date makes GitHub enforce this).
+
+A checkout for `apply` must not gain files the commit doesn't have: dependency installs must only write ignored files (`node_modules/`, and for Yarn Berry its [recommended ignores](https://yarnpkg.com/getting-started/qa#which-files-should-be-gitignored)).
 
 To plan more stacks on a pull request, add `Pulumi-Affected-Run: <patterns>` to its description (the `edited` trigger re-plans) or touch a force file.
 
@@ -279,8 +296,8 @@ It also catches anything selection missed. Fix drift through a pull request, or 
 
 The actions plan and apply; your repository's rules decide what may be applied:
 
-- **Applies only run reviewed code.** Require an approval to merge into the default branch, and dismiss approvals when new commits are pushed, so the approved plan is the applied plan.
-- **Plans must not go stale.** Require branches to be up to date with the default branch before merging (or use a merge queue). Otherwise the merged tree differs from the planned one and `apply` finds no plans.
+- **Applies only run reviewed code.** Require an approval to merge into the default branch, and dismiss approvals when new commits are pushed. What's applied is the reviewed code against the state that was planned. The plan comment itself comes from a job that ran the pull request's code, so it shows what that code reported; review the code, not just the comment.
+- **Plans must not go stale.** Require branches to be up to date with the default branch before merging (or use a merge queue). Otherwise the merged tree can differ from the planned one, and `apply` finds no plans.
 - **Make the plan a required check**, so a pull request can't merge with a failing preview.
 - **One apply workflow at a time**: a `concurrency` group that isn't cancelled midway. On self-managed backends, set `PULUMI_SELF_MANAGED_STATE_LOCKING`.
 - **Credentials by event.** Previews run the pull request's code, so they get read-only roles. Give the deploy role a trust policy that only accepts the default branch's push (or the branches you apply from), and never give a job that runs a pull request's code a way to obtain it. Hiding variables from a step isn't isolation: code running in a job can read anything the job can.

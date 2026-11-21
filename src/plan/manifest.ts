@@ -7,12 +7,13 @@ import type { ResourceChange } from '../classify.ts';
  * The plan directory's manifest: what `plan` planned and `apply` applies. It's the contract
  * between them, whatever moves the directory (an artifact, a cache, a bucket). The plan job ran
  * the pull request's code, which could have rewritten anything in the directory, so `apply`
- * checks the manifest's shape, every name and path, and each plan file's hash before trusting it.
+ * checks the manifest's shape, every name and path, and each plan file's hash before trusting it,
+ * and takes the order stacks apply in from the checked-out code, not from here.
  */
 
 export const MANIFEST_FILE = 'manifest.json';
 export const COMMENT_FILE = 'comment.md';
-const MANIFEST_VERSION = 1;
+const MANIFEST_VERSION = 2;
 
 export interface PlannedStack {
   id: string;
@@ -21,10 +22,15 @@ export interface PlannedStack {
   dir: string;
   stack: string;
   wave: number;
-  /** The stack's state when planned, or that it didn't exist yet and is created when applying */
-  state: { kind: 'exists'; fingerprint: string } | { kind: 'created-on-apply' };
+  /** A hash of the stack's state when planned; applying refuses any other state */
+  fingerprint: string;
   /** Whether `plan` created the stack, empty, to plan it */
   created: boolean;
+  /**
+   * The passphrase encryption salt Pulumi wrote into the config file of a stack `plan` created.
+   * The plan's secrets are encrypted with it, so `apply` restores it in a checkout without one.
+   */
+  encryptionSalt?: string;
   /** File names in the plan directory */
   plan: string;
   preview: string;
@@ -32,8 +38,8 @@ export interface PlannedStack {
   planHash: string;
   counts: Record<string, number>;
   changes: ResourceChange[];
-  /** Kept without resource changes because other stacks read its outputs */
-  keptForDependents: boolean;
+  /** Stack outputs the plan adds, changes or removes */
+  outputs: string[];
   reasons: string[];
 }
 
@@ -50,18 +56,23 @@ export interface Manifest {
   unchanged: { id: string; reasons: string[] }[];
   failed: { id: string; error: string; reasons: string[] }[];
   skipped: { id: string; source: string; reasons: string[] }[];
-  /** Stack id → ids of the stacks it depends on */
+  /** Stack id → ids of the stacks it depends on, for the report */
   dependencies: Record<string, string[]>;
   warnings: string[];
 }
 
+/** File names for a stack's plan; `+` can't appear in project or stack names, so they're unique */
 export function planFileNames(id: string) {
-  const base = id.replace('/', '__');
+  const base = id.replace('/', '+');
   return { plan: `${base}.plan.json`, preview: `${base}.preview.json` };
 }
 
 export function hashFile(path: string) {
-  return createHash('sha256').update(readFileSync(path)).digest('hex');
+  return hashText(readFileSync(path));
+}
+
+export function hashText(content: string | Buffer) {
+  return createHash('sha256').update(content).digest('hex');
 }
 
 export function writeManifest(directory: string, manifest: Manifest) {
@@ -73,8 +84,10 @@ export class ManifestError extends Error {}
 const SHA = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const NAME = /^[A-Za-z0-9_.-]+$/;
-const FOLDER = /^[A-Za-z0-9 _.@+/-]*$/;
-const FILE = /^[A-Za-z0-9_.-]+\.json$/;
+/** Any relative folder, without control characters or backslashes */
+const FOLDER = /^(?!\/)[^\\\p{Cc}]*$/u;
+const FILE = /^[A-Za-z0-9_.+-]+\.json$/;
+const SALT = /^v1:[A-Za-z0-9+/=:]+$/;
 
 /** Reads and checks a manifest, and the hash of every plan file it names */
 export function readManifest(directory: string): Manifest {
@@ -92,14 +105,14 @@ export function readManifest(directory: string): Manifest {
   check(manifest && typeof manifest === 'object', 'not an object');
   check(
     manifest.version === MANIFEST_VERSION,
-    `version ${manifest.version} isn't ${MANIFEST_VERSION}`,
+    `version ${manifest.version} isn't ${MANIFEST_VERSION}; plan again with this version`,
   );
   check(SHA.test(manifest.tree) && SHA.test(manifest.head), 'tree or head is not a SHA');
   check(
     Array.isArray(manifest.stacks) && Array.isArray(manifest.failed),
     'stacks or failed missing',
   );
-  check(manifest.dependencies && typeof manifest.dependencies === 'object', 'dependencies missing');
+  check(typeof manifest.pulumiVersion === 'string', 'pulumiVersion missing');
   const ids = new Set<string>();
   for (const stack of manifest.stacks) {
     check(NAME.test(stack.project) && NAME.test(stack.stack), `bad name in ${String(stack.id)}`);
@@ -110,7 +123,6 @@ export function readManifest(directory: string): Manifest {
         !stack.dir.split('/').includes('..'),
       `bad folder for ${stack.id}`,
     );
-    check(Number.isInteger(stack.wave) && stack.wave >= 0, `bad wave for ${stack.id}`);
     const files = planFileNames(stack.id);
     check(
       stack.plan === files.plan && stack.preview === files.preview,
@@ -118,11 +130,14 @@ export function readManifest(directory: string): Manifest {
     );
     check(FILE.test(stack.plan), `bad plan file for ${stack.id}`);
     check(SHA256.test(stack.planHash), `bad plan hash for ${stack.id}`);
-    const state = stack.state;
+    check(SHA256.test(stack.fingerprint), `bad fingerprint for ${stack.id}`);
     check(
-      (state?.kind === 'exists' && SHA256.test(state.fingerprint)) ||
-        state?.kind === 'created-on-apply',
-      `bad state for ${stack.id}`,
+      stack.encryptionSalt === undefined || SALT.test(stack.encryptionSalt),
+      `bad encryption salt for ${stack.id}`,
+    );
+    check(
+      Array.isArray(stack.outputs) && stack.outputs.every((key) => typeof key === 'string'),
+      `bad outputs for ${stack.id}`,
     );
     check(!ids.has(stack.id), `${stack.id} listed twice`);
     ids.add(stack.id);

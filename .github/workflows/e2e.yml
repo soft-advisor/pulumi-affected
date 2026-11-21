@@ -112,7 +112,6 @@ jobs:
           directory: ${{ runner.temp }}/plans
           # The wrapper prints BANNER first, as scripts that assume a role often do
           command: sh ${{ github.workspace }}/tool/e2e/wrapper.sh --cwd {dir} --stack {stack}
-          create-stacks: ${{ steps.prepare.outputs.create-stacks }}
           pull-request: ${{ steps.prepare.outputs.pull-request }}
           retention-days: 1
       - name: Check the plans
@@ -123,7 +122,9 @@ jobs:
       - name: Merge the pull request
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node tool/e2e/driver.ts merge "$INDEX" "${{ steps.prepare.outputs.pull-request }}" "$FIXTURE" "${{ steps.prepare.outputs.head-sha }}"
+          PULL_REQUEST: ${{ steps.prepare.outputs.pull-request }}
+          HEAD_SHA: ${{ steps.prepare.outputs.head-sha }}
+        run: node tool/e2e/driver.ts merge "$INDEX" "$PULL_REQUEST" "$FIXTURE" "$HEAD_SHA"
       - name: Change a stack after planning
         run: node tool/e2e/driver.ts change-state "$INDEX" "$FIXTURE"
       # No directory: the plans come from the artifact for the merged tree, as after a merge
@@ -154,7 +155,8 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node tool/e2e/driver.ts cleanup "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
+          PULL_REQUEST: ${{ steps.prepare.outputs.pull-request }}
+        run: node tool/e2e/driver.ts cleanup "$INDEX" "$PULL_REQUEST"
 
   # One check to require in branch rules, whatever the scenarios are called
   e2e:
