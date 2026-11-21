@@ -43,15 +43,23 @@ export interface Item {
    * Values that look like paths: path-like properties (`context`, `dir`, …) and "./" or "../"
    * strings. They count as inputs when they name something in the repository.
    */
-  pathCandidates: ts.Expression[];
+  pathCandidates: PathCandidate[];
   /** `require.resolve(...)` arguments: a path relative to the module, or a package */
   resolved: ts.Expression[];
   /** Other declarations of the same name (`var x` twice): using one uses all */
   siblings: Item[];
+  /** A function declaration, which is hoisted, so where it sits doesn't matter */
+  hoisted: boolean;
   /** Name expressions of `new StackReference(...)` */
   stackReferences: ts.Expression[];
   /** Why this item can't be analysed precisely, e.g. a `require` with a computed path */
   unanalysable: string[];
+}
+
+export interface PathCandidate {
+  expression: ts.Expression;
+  /** The property it's the value of, if any: `context`, `dir`, … */
+  property?: string;
 }
 
 export interface ImportBinding {
@@ -123,6 +131,12 @@ const PATH_PROPERTIES = new Set([
 
 const RELATIVE_PATH = /^\.\.?\//;
 
+/**
+ * Names this module imports, while it's being parsed: reading a property of an imported
+ * namespace (aws.ec2.InstanceType.T3_Micro) is treated as pure, like reading a constant
+ */
+let importedNames = new Set<string>();
+
 export function parseModule(path: string, text: string, options: ts.CompilerOptions): ModuleInfo {
   if (path.endsWith('.json')) return parseJsonModule(path, text);
 
@@ -187,7 +201,9 @@ export function parseModule(path: string, text: string, options: ts.CompilerOpti
     module.order.push(item.key);
   };
 
+  importedNames = new Set();
   for (const statement of source.statements) {
+    recordRequireBindings(module, statement);
     if (ts.isImportDeclaration(statement)) {
       const specifier = stringValue(statement.moduleSpecifier);
       if (specifier === undefined) continue;
@@ -204,6 +220,7 @@ export function parseModule(path: string, text: string, options: ts.CompilerOpti
           module.imports.set(element.name.text, { specifier, imported });
         }
       }
+      for (const name of module.imports.keys()) importedNames.add(name);
       continue;
     }
 
@@ -249,7 +266,9 @@ export function parseModule(path: string, text: string, options: ts.CompilerOpti
       const name = statement.name?.text ?? 'default';
       recordDeclarationExports(module, statement, [name]);
       const eager = ts.isClassDeclaration(statement) && !isPureClass(statement);
-      addItem(makeItem(name, [name], eager, statement));
+      const item = makeItem(name, [name], eager, statement);
+      item.hoisted = ts.isFunctionDeclaration(statement);
+      addItem(item);
       continue;
     }
 
@@ -266,13 +285,71 @@ export function parseModule(path: string, text: string, options: ts.CompilerOpti
     }
 
     if (statement.kind === ts.SyntaxKind.EmptyStatement) continue;
+    // A TypeScript enum compiles to `var E; (function (E) { … })(E || (E = {}));`. The function
+    // only fills in E, so it belongs to E's declaration and is as lazy as E is.
+    const enumName = enumFillName(statement);
+    const enumDeclaration = enumName === undefined ? undefined : module.itemsByName.get(enumName);
+    if (enumDeclaration && !enumDeclaration.eager) {
+      const fill = makeItem(enumName as string, [], false, statement);
+      enumDeclaration.code += ` ${fill.code}`;
+      enumDeclaration.refs.push(...fill.refs);
+      continue;
+    }
     // Keyed by content rather than position, so inserting a statement doesn't make every later
     // one look changed; the module's statement order is compared separately
     const item = makeItem('', [], true, statement);
     item.key = `#${createHash('sha256').update(item.code).digest('hex').slice(0, 10)}`;
     addItem(item);
   }
+  importedNames = new Set();
   return module;
+}
+
+/**
+ * `const fs = require('fs')`, `const { readFileSync } = require('node:fs')` and (after
+ * transpiling) `import fs = require('fs')` bind names like imports do
+ */
+function recordRequireBindings(module: ModuleInfo, statement: ts.Statement) {
+  if (!ts.isVariableStatement(statement)) return;
+  for (const declaration of statement.declarationList.declarations) {
+    const initializer = declaration.initializer;
+    if (!initializer || !ts.isCallExpression(initializer)) continue;
+    const callee = initializer.expression;
+    const specifier = initializer.arguments[0] && stringValue(initializer.arguments[0]);
+    if (!ts.isIdentifier(callee) || callee.text !== 'require' || specifier === undefined) continue;
+    if (ts.isIdentifier(declaration.name)) {
+      module.imports.set(declaration.name.text, { specifier, imported: '*' });
+    } else if (ts.isObjectBindingPattern(declaration.name)) {
+      for (const element of declaration.name.elements) {
+        if (!ts.isIdentifier(element.name)) continue;
+        const imported =
+          element.propertyName && ts.isIdentifier(element.propertyName)
+            ? element.propertyName.text
+            : element.name.text;
+        module.imports.set(element.name.text, { specifier, imported });
+      }
+    }
+    for (const name of module.imports.keys()) importedNames.add(name);
+  }
+}
+
+/** E, when the statement is TypeScript's enum fill `(function (E) { … })(E || (E = {}))` */
+function enumFillName(statement: ts.Statement) {
+  if (!ts.isExpressionStatement(statement)) return undefined;
+  const call = statement.expression;
+  if (!ts.isCallExpression(call) || call.arguments.length !== 1) return undefined;
+  const fill = ts.isParenthesizedExpression(call.expression)
+    ? call.expression.expression
+    : call.expression;
+  if (!ts.isFunctionExpression(fill) || fill.parameters.length !== 1) return undefined;
+  const argument = call.arguments[0];
+  if (
+    !ts.isBinaryExpression(argument) ||
+    argument.operatorToken.kind !== ts.SyntaxKind.BarBarToken
+  ) {
+    return undefined;
+  }
+  return ts.isIdentifier(argument.left) ? argument.left.text : undefined;
 }
 
 function makeItem(key: string, names: string[], eager: boolean, node: ts.Node, prefix = ''): Item {
@@ -287,6 +364,7 @@ function makeItem(key: string, names: string[], eager: boolean, node: ts.Node, p
     pathCandidates: [],
     resolved: [],
     siblings: [],
+    hoisted: false,
     stackReferences: [],
     unanalysable: [],
   };
@@ -340,7 +418,7 @@ function collectRefs(root: ts.Node, item: Item, ownNames: Set<string>) {
 
   function visit(node: ts.Node): void {
     if (ts.isStringLiteralLike(node) && RELATIVE_PATH.test(node.text) && !isModuleSpecifier(node)) {
-      item.pathCandidates.push(node);
+      item.pathCandidates.push({ expression: node });
     }
     if (ts.isIdentifier(node)) {
       addName(node.text);
@@ -371,11 +449,17 @@ function collectRefs(root: ts.Node, item: Item, ownNames: Set<string>) {
       visitPropertyName(node.name);
       const property =
         ts.isIdentifier(node.name) || ts.isStringLiteral(node.name) ? node.name.text : '';
-      if (PATH_PROPERTIES.has(property)) item.pathCandidates.push(node.initializer);
+      if (PATH_PROPERTIES.has(property)) {
+        item.pathCandidates.push({ expression: node.initializer, property });
+      }
       visit(node.initializer);
       return;
     }
     if (ts.isShorthandPropertyAssignment(node)) {
+      // `{ context }` is `{ context: context }`
+      if (PATH_PROPERTIES.has(node.name.text)) {
+        item.pathCandidates.push({ expression: node.name, property: node.name.text });
+      }
       addName(node.name.text);
       if (node.objectAssignmentInitializer) visit(node.objectAssignmentInitializer);
       return;
@@ -480,18 +564,35 @@ function inspectCall(node: ts.CallExpression | ts.NewExpression, item: Item) {
   if (name === 'createRequire') {
     item.unanalysable.push("createRequire() makes requires that can't be followed");
   }
+  // process.loadEnvFile() reads .env from the working directory
+  if (name === 'loadEnvFile' && ts.isPropertyAccessExpression(callee)) {
+    item.assets.push(firstArgument ?? ts.factory.createStringLiteral('.env'));
+    return;
+  }
   if (!name || !firstArgument) return;
-  if (ASSET_READERS.has(name)) item.assets.push(firstArgument);
-  const object =
-    ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)
-      ? callee.expression.text
-      : undefined;
+  // A method merely named like a reader (zip.readFile, handle.readFile) isn't one; Pulumi's
+  // asset classes, a bare call, and calls through a file-system binding (checked once imports
+  // are known) are
+  const isAssetClass = name === 'FileAsset' || name === 'FileArchive';
+  if (isAssetClass || (ts.isIdentifier(callee) && ASSET_READERS.has(name))) {
+    item.assets.push(firstArgument);
+  }
+  const object = ts.isPropertyAccessExpression(callee)
+    ? rootIdentifier(callee.expression)
+    : undefined;
   if (ts.isIdentifier(callee) || object !== undefined) {
     item.calls.push({ object, name, argument: firstArgument });
   }
   if (name === 'StackReference' && ts.isNewExpression(node)) {
     item.stackReferences.push(stackReferenceName(node) ?? firstArgument);
   }
+}
+
+/** `fs` in `fs.promises.readFile`: the identifier a member chain starts from */
+function rootIdentifier(node: ts.Expression): string | undefined {
+  if (ts.isIdentifier(node)) return node.text;
+  if (ts.isPropertyAccessExpression(node)) return rootIdentifier(node.expression);
+  return undefined;
 }
 
 /** A string that names a module to load rather than a file to read */
@@ -578,7 +679,12 @@ export function isPure(node: ts.Expression): boolean {
   if (ts.isConditionalExpression(node)) {
     return isPure(node.condition) && isPure(node.whenTrue) && isPure(node.whenFalse);
   }
-  // Reading a property can run a getter, so it isn't pure
+  // Reading a property can run a getter, so it isn't pure, unless it's a member of something
+  // imported: a namespace's constants and enums (aws.ec2.InstanceType.T3_Micro)
+  if (ts.isPropertyAccessExpression(node)) {
+    const root = rootIdentifier(node);
+    return root !== undefined && importedNames.has(root);
+  }
   return false;
 }
 
@@ -685,6 +791,7 @@ function parseJsonModule(path: string, text: string): ModuleInfo {
     pathCandidates: [],
     resolved: [],
     siblings: [],
+    hoisted: false,
     stackReferences: [],
     unanalysable: [],
   };
