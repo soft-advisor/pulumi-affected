@@ -48,6 +48,7 @@ function manifestWith(overrides: Record<string, unknown> = {}) {
     unchanged: [],
     failed: [],
     skipped: [],
+    followUps: [],
     dependencies: {},
     warnings: [],
   };

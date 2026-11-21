@@ -156,7 +156,9 @@ Selects like `select`, then previews each selected stack in parallel with `--sav
 
 - A stack is kept when its plan would change a resource or a stack output, or when it's new.
 - A selected stack that doesn't exist yet is **created, empty,** so Pulumi can plan it (with the secrets provider its config file names). Its passphrase encryption salt goes into the manifest, so `apply` works from a checkout where the salt isn't committed.
-- When a planned stack reads outputs that another plan changes, the report says it must be **planned again** after that one applies; `apply` skips it rather than apply a plan made against old outputs.
+- **Stacks that read outputs a plan changes.** A plan is made with the outputs other stacks have at planning time, so a stack reading outputs that another plan in the same change alters can't be planned correctly until that one is applied. The plan file says which outputs change, and the code says which outputs each stack reads (`getOutput`, `requireOutput`, `outputs.name` and the like, with names worked out from literals, constants, templates and config). When the names can't be worked out, or the dependency comes from `dependsOn`, the stack is assumed to read every output.
+  - **It has no changes of its own:** the plan comment opens with a warning to plan it again after this change is applied, and the action warns too. `apply` repeats it and lists it in `needs-plan`. Opening that follow-up is up to you.
+  - **It has changes of its own:** planning **fails** for it, so the change can't be applied as one: its code would be merged with a plan made against old values. Change the stack it reads first, then this stack in a later pull request (which is planned against the real, applied outputs). To merge anyway, leave it out with `Pulumi-Affected-Skip: <stack>`; the report then says it has undeployed changes to plan after this is applied.
 - A stack that fails to preview fails the action, after uploading and commenting. `apply` refuses a manifest with failures.
 - For each plan, the manifest records the stack's **state fingerprint** (a hash of its exported resources) at planning time.
 
@@ -176,7 +178,7 @@ Applies the plans for **exactly the checked-out code**: `pulumi up --plan` per s
 - **Trusted inputs only:** the plans came from a job that ran the pull request's code, so the stacks, their order and the config are read from the commit, never from the manifest. Each plan file's hash is checked again right before it's applied.
 - **Per stack:** the state fingerprint must still match the one planned from. If it doesn't, the stack's plan is **refused** (plan again) and stacks depending on it are **skipped**; unrelated stacks still apply. Pulumi's own stack lock keeps two updates from running at once.
 - **Reruns are safe:** each update is tagged `pulumi-affected:<plan hash>`, and a plan found among the stack's last 25 updates is reported as `already-applied`, not applied twice.
-- If an applied plan changes outputs that **other stacks** read, those stacks are listed in `needs-plan` and the report: plan them next.
+- If an applied plan changes outputs that **other stacks** read, those stacks are listed in `needs-plan`, the report and a warning: plan them next.
 - **Preview credentials that differ from deploy credentials:** see [below](#preview-and-deploy-roles).
 
 **Inputs:** `directory`, `run-id`, `stacks` (patterns that may be applied; a plan for any other stack fails the apply), `working-directory`, `command`, `concurrency`, `comment` (default `true`: on the triggering pull request, `pull-request`, or the pull request the pushed commit came from), `pull-request`, `github-token` (needs `actions: read` to find the artifact, `pull-requests: write` to comment).
@@ -254,6 +256,19 @@ jobs:
 A checkout for `apply` must not gain files the commit doesn't have: dependency installs must only write ignored files (`node_modules/`, and for Yarn Berry its [recommended ignores](https://yarnpkg.com/getting-started/qa#which-files-should-be-gitignored)).
 
 To plan more stacks on a pull request, add `Pulumi-Affected-Run: <patterns>` to its description (the `edited` trigger re-plans) or touch a force file.
+
+### Keeping undeployed code from being missed
+
+Selection compares with the base branch, so code merged but never deployed (a skipped stack, a refused or failed apply) isn't selected again by later changes. Pass `bases` with the commit each stack was last deployed from, which Pulumi records as `environment["git.head"]` in `pulumi stack history --json`, and every stack is compared with what it actually runs:
+
+```yaml
+- id: bases
+  run: |
+    # for each stack: pulumi stack history --json --page-size 1 | jq -r '.[0].environment["git.head"]'
+    echo 'bases={"site/prod":"<sha>"}' >> "$GITHUB_OUTPUT"
+- uses: soft-advisor/pulumi-affected/plan@<commit sha>
+  with: { bases: '${{ steps.bases.outputs.bases }}' }
+```
 
 ### Recovering from a refused or failed apply
 

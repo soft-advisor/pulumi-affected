@@ -2,6 +2,7 @@ import { formatCounts } from '../classify.ts';
 import { code, reasonText, safeText } from '../render.ts';
 import { fence, splitComments } from '../action/split.ts';
 import type { ApplyResult } from './apply.ts';
+import { describeRead, type StaleRead } from './outputs.ts';
 import type { Manifest, PlannedStack } from './manifest.ts';
 
 /*
@@ -18,14 +19,22 @@ export function renderPlan(manifest: Manifest, marker: (index: number) => string
   const rows = [
     ...manifest.stacks.map(
       (stack) =>
-        `| ${code(stack.id)} | ${planSummary(stack, manifest)} | ${stack.reasons.map(reasonText).join('<br>')} |`,
+        `| ${code(stack.id)} | ${planSummary(stack)} | ${stack.reasons.map(reasonText).join('<br>')} |`,
     ),
     ...manifest.failed.map(
       (stack) =>
         `| ${code(stack.id)} | **failed** | ${stack.reasons.map(reasonText).join('<br>')} |`,
     ),
   ];
+  const blocked = manifest.failed.filter((stack) => stack.blockedBy);
   const intro = [
+    ...blocked.map(
+      (stack) =>
+        `> [!CAUTION]\n> ${code(stack.id)} can't be planned in this change: it ${(stack.blockedBy ?? []).map(readText).join('; ')}. Its plan would be made with the old values. Change ${[...new Set((stack.blockedBy ?? []).map((read) => code(read.dependency)))].join(', ')} first and ${code(stack.id)} in a later pull request, or leave it out of this one with ${code(`Pulumi-Affected-Skip: ${stack.id}`)} and plan it after this is applied.`,
+    ),
+    manifest.followUps.length > 0
+      ? `> [!WARNING]\n> **Plan again after this is applied:**\n${manifest.followUps.map((read) => `> - ${code(read.id)} ${readText(read)}${manifest.skipped.some((skip) => skip.id === read.id) ? ', and has changes this pull request skips' : ''}`).join('\n')}`
+      : '',
     rows.length > 0
       ? ['| Stack | Plan | Why |', '| --- | --- | --- |', ...rows].join('\n')
       : 'Nothing to apply.',
@@ -34,10 +43,12 @@ export function renderPlan(manifest: Manifest, marker: (index: number) => string
     .filter(Boolean)
     .join('\n\n');
   const sections = [
-    ...manifest.failed.map(
-      (stack) =>
-        `<details><summary>${code(stack.id)} failed</summary>\n\n${fence(stack.error)}\n\n</details>`,
-    ),
+    ...manifest.failed
+      .filter((stack) => !stack.blockedBy)
+      .map(
+        (stack) =>
+          `<details><summary>${code(stack.id)} failed</summary>\n\n${fence(stack.error)}\n\n</details>`,
+      ),
     ...manifest.stacks.filter((stack) => stack.changes.length > 0).map(changesSection),
     `<sub>Planned ${manifest.head.slice(0, 7)} (tree ${manifest.tree.slice(0, 7)}) against ${manifest.base.slice(0, 7)} with Pulumi ${safeText(manifest.pulumiVersion)}</sub>`,
   ];
@@ -60,8 +71,8 @@ export function renderApply(result: ApplyResult, marker: (index: number) => stri
   );
   const intro = [
     rows.length > 0 ? ['| Stack | Result |', '| --- | --- |', ...rows].join('\n') : '',
-    result.needsPlan.length > 0
-      ? `**Plan again:** these stacks read outputs that changed: ${result.needsPlan.map(code).join(', ')}`
+    result.followUps.length > 0
+      ? `> [!WARNING]\n> **Plan again now:**\n${result.followUps.map((read) => `> - ${code(read.id)} ${readText(read)}`).join('\n')}`
       : '',
     ...result.warnings.map((warning) => `> ${safeText(warning)}`),
     relaxedNote(result),
@@ -88,17 +99,15 @@ function relaxedNote(result: ApplyResult) {
   return `<details><summary>${relaxed.length} properties left open by <code>classify.ignore</code></summary>\n\n${relaxed.map((entry) => `- ${code(entry)}`).join('\n')}\n\n</details>`;
 }
 
-function planSummary(stack: PlannedStack, manifest: Manifest) {
+/** A stale read as escaped Markdown: names from the repository become code */
+function readText(read: StaleRead) {
+  return reasonText(describeRead(read));
+}
+
+function planSummary(stack: PlannedStack) {
   const parts = [safeText(countsOf(stack))];
   if (stack.outputs.length > 0) parts.push(`outputs: ${stack.outputs.map(code).join(', ')}`);
   if (stack.created) parts.push('new stack');
-  // Its plan reads outputs that another plan changes, so applying it waits for a new plan
-  const stale = (manifest.dependencies[stack.id] ?? []).filter((id) =>
-    manifest.stacks.some((other) => other.id === id && other.outputs.length > 0),
-  );
-  if (stale.length > 0) {
-    parts.push(`**plan again after** ${stale.map(code).join(', ')} **is applied**`);
-  }
   return parts.join('; ');
 }
 

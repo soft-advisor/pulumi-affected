@@ -12,7 +12,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { parse as parseYaml } from 'yaml';
 import type { IgnoreRule } from '../classify.ts';
 import { loadConfig } from '../config.ts';
-import { CycleError, computeWaves, type DependencyGraph, dependentsOf } from '../graph.ts';
+import { CycleError, computeWaves, type DependencyGraph } from '../graph.ts';
 import { matchesAnyStack } from '../patterns.ts';
 import { errorText, onCancel, type PulumiRunner } from '../pulumi/runner.ts';
 import { recentUpdates, stateFingerprint } from '../pulumi/stack.ts';
@@ -21,6 +21,7 @@ import { GitSnapshot, git, repoRootOf, resolveCommit } from '../snapshot.ts';
 import { mapConcurrently } from './concurrency.ts';
 import { hashText, type Manifest, type PlannedStack, readManifest } from './manifest.ts';
 import { encryptionSaltOf, pulumiVersion } from './plan.ts';
+import { describeRead, type StaleRead, staleReads } from './outputs.ts';
 import { relaxPlan } from './planfile.ts';
 
 /*
@@ -68,6 +69,8 @@ export interface ApplyResult {
   stacks: StackApplyResult[];
   /** Stacks that read outputs the applied plans change, and need planning again */
   needsPlan: string[];
+  /** The same, with the outputs each reads */
+  followUps: StaleRead[];
   warnings: string[];
   ok: boolean;
 }
@@ -99,7 +102,11 @@ export async function applyPlans(options: ApplyOptions): Promise<ApplyResult> {
   // Stacks, their order and the config come from the commit, never from files beside it
   const commit = resolveCommit(repoRoot, 'HEAD');
   const config = loadConfig(new GitSnapshot(repoRoot, commit));
-  const { stacks: known, graph } = readDependencyGraph({ cwd: repoRoot, head: commit, config });
+  const {
+    stacks: known,
+    graph,
+    outputsRead,
+  } = readDependencyGraph({ cwd: repoRoot, head: commit, config });
   checkCheckout(repoRoot, directory, known);
   const byId = new Map(known.map((stack) => [stack.id, stack]));
   for (const stack of manifest.stacks) {
@@ -119,12 +126,17 @@ export async function applyPlans(options: ApplyOptions): Promise<ApplyResult> {
   }
 
   const planned = new Map(manifest.stacks.map((stack) => [stack.id, stack]));
+  const stale = staleReads(
+    manifest.stacks,
+    Object.fromEntries([...graph].map(([id, dependencies]) => [id, [...dependencies]])),
+    outputsRead,
+  );
   const results = new Map<string, StackApplyResult>();
   for (const wave of applyWaves(graph, [...planned.keys()])) {
     const stacks = wave.map((id) => planned.get(id) as PlannedStack);
     await mapConcurrently(stacks, options.concurrency, async (stack) => {
       const result =
-        blockedBy(stack, graph, planned, results) ??
+        blockedBy(stack, graph, planned, stale, results) ??
         (await applyStack(stack, {
           ...options,
           directory,
@@ -139,18 +151,13 @@ export async function applyPlans(options: ApplyOptions): Promise<ApplyResult> {
 
   const stacks = manifest.stacks.map((stack) => results.get(stack.id) as StackApplyResult);
   const applied = (id: string) => DONE.has(results.get(id)?.outcome ?? 'failed');
-  // A stack reading outputs that an applied plan changes was planned (or deployed) without them
-  const needsPlan = new Set<string>();
-  for (const stack of manifest.stacks) {
-    if (stack.outputs.length === 0 || !applied(stack.id)) continue;
-    for (const dependent of dependentsOf(graph, stack.id)) {
-      if (!applied(dependent)) needsPlan.add(dependent);
-    }
-  }
+  // A stack reading outputs that an applied plan changed was planned (or deployed) without them
+  const followUps = stale.filter((read) => applied(read.dependency) && !applied(read.id));
   return {
     manifest,
     stacks,
-    needsPlan: [...needsPlan].sort(),
+    needsPlan: [...new Set(followUps.map((read) => read.id))].sort(),
+    followUps,
     warnings,
     ok: stacks.every((stack) => DONE.has(stack.outcome)),
   };
@@ -171,6 +178,7 @@ function blockedBy(
   stack: PlannedStack,
   graph: DependencyGraph,
   planned: Map<string, PlannedStack>,
+  stale: StaleRead[],
   results: Map<string, StackApplyResult>,
 ): StackApplyResult | undefined {
   const dependencies = [...(graph.get(stack.id) ?? [])].filter((id) => planned.has(id));
@@ -178,13 +186,13 @@ function blockedBy(
   if (notApplied.length > 0) {
     return { id: stack.id, outcome: 'skipped', error: `not applied: ${notApplied.join(', ')}` };
   }
-  // Its plan was made with those stacks' outputs as they were before
-  const changed = dependencies.filter((id) => (planned.get(id)?.outputs.length ?? 0) > 0);
-  if (changed.length > 0) {
+  // Its plan was made with outputs that have changed since; `plan` doesn't keep such plans
+  const reads = stale.filter((read) => read.id === stack.id);
+  if (reads.length > 0) {
     return {
       id: stack.id,
       outcome: 'skipped',
-      error: `plan it again: it was planned before ${changed.join(', ')} changed outputs`,
+      error: `plan it again: it ${reads.map(describeRead).join('; ')}`,
     };
   }
   return undefined;
