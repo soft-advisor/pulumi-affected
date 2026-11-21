@@ -56,7 +56,7 @@ function remote() {
 }
 
 function branches(index: number) {
-  const prefix = `e2e/${required('RUN_KEY')}/${index}`;
+  const prefix = `e2e-runs/${required('RUN_KEY')}/${index}`;
   return { base: `${prefix}/base`, change: `${prefix}/change` };
 }
 
