@@ -178,11 +178,18 @@ function writeChanges(dir: string, changes: Record<string, string | null>) {
   }
 }
 
-function pushSecond(index: number, dir: string) {
+function pushSecond(index: number, number: string, dir: string) {
   const scenario = scenarios[index];
   writeChanges(dir, scenario.second ?? {});
-  commitAll(dir, `${scenario.name}, again`);
+  const sha = commitAll(dir, `${scenario.name}, again`);
   retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${branches(index).change}`]);
+  // GitHub updates the pull request's head a moment after the push; the action checks it
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const head = sh(dir, 'gh', ['api', `repos/${repository}/pulls/${number}`, '--jq', '.head.sha']);
+    if (head === sha) return;
+    execFileSync('sleep', ['2']);
+  }
+  throw new Error(`Pull request #${number} never showed the pushed commit ${sha}`);
 }
 
 function comments(number: string) {
@@ -328,7 +335,7 @@ if (command === 'list') {
     second: Boolean(scenario.second),
   }));
   console.log(JSON.stringify(list));
-} else if (command === 'push-second') pushSecond(index, rest[0]);
+} else if (command === 'push-second') pushSecond(index, rest[0], rest[1]);
 else if (command === 'assert-second-preview') {
   assertSecondPreview(index, rest[0], process.env.RESULTS ?? '');
 } else if (command === 'prepare') prepare(index, rest[0]);
