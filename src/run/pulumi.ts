@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -74,14 +74,69 @@ function stackVariables(stack: Stack): NodeJS.ProcessEnv {
   };
 }
 
+/*
+ * Cancellation: GitHub stops a cancelled job with SIGINT, then SIGTERM. Pulumi needs SIGINT to
+ * stop cleanly and release its stack lock, and files changed for a new-stack preview need
+ * restoring, so both signals are forwarded and cleanup runs before exiting.
+ */
+const running = new Set<ChildProcess>();
+const cleanups = new Set<() => void>();
+let cancelling = false;
+let handlersInstalled = false;
+const CANCEL_GRACE = 25_000;
+
+function installCancelHandlers() {
+  if (handlersInstalled) return;
+  handlersInstalled = true;
+  const cancel = (signal: NodeJS.Signals) => {
+    if (cancelling) return;
+    cancelling = true;
+    for (const child of running) {
+      try {
+        if (child.pid) process.kill(-child.pid, 'SIGINT');
+      } catch {
+        // Already gone
+      }
+    }
+    const finish = () => {
+      for (const cleanup of cleanups) cleanup();
+      process.exit(signal === 'SIGINT' ? 130 : 143);
+    };
+    const deadline = Date.now() + CANCEL_GRACE;
+    const wait = setInterval(() => {
+      if (running.size === 0 || Date.now() > deadline) {
+        clearInterval(wait);
+        finish();
+      }
+    }, 200);
+  };
+  process.once('SIGINT', () => cancel('SIGINT'));
+  process.once('SIGTERM', () => cancel('SIGTERM'));
+}
+
+/** Runs `cleanup` on cancellation too; returns a function that unregisters it */
+function onCancel(cleanup: () => void) {
+  cleanups.add(cleanup);
+  return () => cleanups.delete(cleanup);
+}
+
 export function commandRunner(
   template: string,
   repoRoot: string,
   options: RunnerOptions = {},
 ): PulumiRunner {
+  installCancelHandlers();
   const exec = (command: string, env: NodeJS.ProcessEnv) =>
     new Promise<CommandResult>((resolve) => {
-      const child = spawn('/bin/sh', ['-c', command], { cwd: repoRoot, env });
+      if (cancelling) {
+        resolve({ code: 130, stdout: '', stderr: 'cancelled' });
+        return;
+      }
+      // Its own process group, so cancelling reaches Pulumi through any wrapper script
+      const child = spawn('/bin/sh', ['-c', command], { cwd: repoRoot, env, detached: true });
+      running.add(child);
+      // Exit, not close: helpers it started (plugins) may hold its output open a while longer
+      child.on('exit', () => running.delete(child));
       let stdout = '';
       let stderr = '';
       child.stdout.on('data', (chunk) => {
@@ -167,6 +222,12 @@ async function previewNewStack(
     PULUMI_CONFIG_PASSPHRASE: process.env.PULUMI_CONFIG_PASSPHRASE ?? '',
   };
   const cwd = stack.dir === '' ? '.' : stack.dir;
+  const restore = () => {
+    if (originalConfig === undefined) rmSync(configPath, { force: true });
+    else writeFileSync(configPath, originalConfig);
+    rmSync(backend, { recursive: true, force: true });
+  };
+  const unregister = onCancel(restore);
   try {
     const secretsProvider = readSecretsProvider(originalConfig);
     const init = await runner.runPulumi(
@@ -190,9 +251,8 @@ async function previewNewStack(
     const outcome = toOutcome(result, ignore, true);
     return outcome.kind === 'failed' ? { ...outcome, error: newStackHint(outcome.error) } : outcome;
   } finally {
-    if (originalConfig === undefined) rmSync(configPath, { force: true });
-    else writeFileSync(configPath, originalConfig);
-    rmSync(backend, { recursive: true, force: true });
+    unregister();
+    restore();
   }
 }
 
@@ -239,11 +299,16 @@ export type UpOutcome =
     }
   | { kind: 'failed'; error: string };
 
+function isReadError(value: Outputs | { error: string }): value is { error: string } {
+  return Object.keys(value).length === 1 && typeof value.error === 'string';
+}
+
 export async function upStack(
   runner: PulumiRunner,
   stack: Stack,
   repoRoot: string,
   ignore: readonly IgnoreRule[],
+  createStacks = true,
 ): Promise<UpOutcome> {
   let newStack = false;
   const notes: string[] = [];
@@ -251,6 +316,15 @@ export async function upStack(
   if (before === 'missing') {
     const configPath = join(repoRoot, stack.configFile);
     const configBefore = existsSync(configPath) ? readFileSync(configPath, 'utf8') : undefined;
+    if (!createStacks) {
+      return { kind: 'failed', error: "doesn't exist, and run.createStacks is false" };
+    }
+    if (wasCreatedBefore(configBefore)) {
+      return {
+        kind: 'failed',
+        error: `doesn't exist in this backend, but ${stack.configFile} has an encryption salt or key from when it was created, so this is likely the wrong backend or organisation. Not creating it again.`,
+      };
+    }
     const secretsProvider = readSecretsProvider(configBefore);
     const init = await runner.run(stack, [
       'stack',
@@ -268,7 +342,8 @@ export async function upStack(
     newStack = true;
     before = {};
   }
-  if (before === 'failed') return { kind: 'failed', error: 'could not read the stack outputs' };
+  if (isReadError(before)) return { kind: 'failed', error: before.error };
+  const outputsBefore = before as Outputs;
 
   const result = await runner.run(stack, ['up', '--yes', '--json', '--non-interactive']);
   if (result.code !== 0) return { kind: 'failed', error: errorText(result) };
@@ -280,25 +355,45 @@ export async function upStack(
   }
 
   const after = await readOutputs(runner, stack);
-  const afterValues = typeof after === 'object' ? after : {};
-  const keys = new Set([...Object.keys(before), ...Object.keys(afterValues)]);
+  const afterValues = after !== 'missing' && !isReadError(after) ? after : {};
+  const keys = new Set([...Object.keys(outputsBefore), ...Object.keys(afterValues)]);
   const changedOutputs = [...keys]
-    .filter((key) => !isDeepStrictEqual(before[key], afterValues[key]))
+    .filter((key) => !isDeepStrictEqual(outputsBefore[key], afterValues[key]))
     .sort();
   return { kind: 'applied', classification, changedOutputs, newStack, notes };
 }
 
 /** Stack outputs including secrets, compared in memory only and never printed */
-async function readOutputs(runner: PulumiRunner, stack: Stack) {
+type Outputs = Record<string, unknown>;
+
+async function readOutputs(
+  runner: PulumiRunner,
+  stack: Stack,
+): Promise<Outputs | 'missing' | { error: string }> {
   const result = await runner.run(stack, ['stack', 'output', '--json', '--show-secrets']);
-  if (isMissingStack(result)) return 'missing' as const;
-  if (result.code !== 0) return 'failed' as const;
-  // A wrapper script may print lines of its own before Pulumi's JSON
+  if (isMissingStack(result)) return 'missing';
+  if (result.code !== 0) return { error: `couldn't read the stack outputs: ${errorText(result)}` };
   // A wrapper may print its own JSON first (e.g. the caller identity); outputs are the last object
   const parsed = parseLastJsonObject(result.stdout || '{}');
   return parsed && typeof parsed === 'object'
-    ? (parsed as Record<string, unknown>)
-    : ('failed' as const);
+    ? (parsed as Outputs)
+    : { error: "couldn't read the stack outputs: the output isn't JSON" };
+}
+
+/**
+ * Creating a stack during a deploy is only safe when it's really new. A config file that already
+ * has an encryption salt or key was created against some backend, so a missing stack then means
+ * the job is pointed at the wrong backend or organisation, and creating it would duplicate every
+ * resource.
+ */
+function wasCreatedBefore(config: string | undefined) {
+  if (!config) return false;
+  try {
+    const parsed = parseYaml(config) as Record<string, unknown> | null;
+    return Boolean(parsed && (parsed.encryptionsalt || parsed.encryptedkey));
+  } catch {
+    return false;
+  }
 }
 
 /** The last top-level JSON object in output, after anything a wrapper printed */
@@ -348,7 +443,14 @@ export async function deployHistory(runner: PulumiRunner, stack: Stack): Promise
       throw new Error(`${stack.id}: the stack history isn't the JSON Pulumi prints`);
     }
     for (const update of history) {
-      if (update.kind === 'destroy' && update.result === 'succeeded') return { kind: 'never' };
+      if (update.kind === 'destroy') {
+        if (update.result === 'succeeded') return { kind: 'never' };
+        return { kind: 'unknown', why: 'a destroy of it failed partway' };
+      }
+      // An import changes what's managed without a commit to compare with
+      if (update.kind === 'import' && update.result === 'succeeded') {
+        return { kind: 'unknown', why: 'resources were imported into it since its last deploy' };
+      }
       if (update.kind !== 'update') continue;
       if (update.result !== 'succeeded') {
         lastFailed = true;
@@ -356,17 +458,28 @@ export async function deployHistory(runner: PulumiRunner, stack: Stack): Promise
       }
       const environment = update.environment ?? {};
       const head = environment['git.head'];
-      if (environment['pulumi.flag.target'] && environment['pulumi.flag.target'] !== 'false') {
-        return { kind: 'unknown', why: 'its last deploy only updated some resources (--target)' };
+      // A deploy of only some resources leaves the rest as they were
+      for (const flag of ['target', 'exclude', 'target-replace']) {
+        const value = environment[`pulumi.flag.${flag}`];
+        if (value && value !== 'false') {
+          return {
+            kind: 'unknown',
+            why: `its last deploy only updated some resources (--${flag})`,
+          };
+        }
       }
       if (typeof head !== 'string' || !/^[0-9a-f]{40}$/.test(head)) {
         return { kind: 'unknown', why: "its last deploy didn't record a commit" };
       }
       return { kind: 'commit', sha: head, lastFailed, dirty: environment['git.dirty'] === 'true' };
     }
-    if (history.length < HISTORY_PAGE_SIZE) break;
+    // Pages can be smaller than asked for, so only an empty page ends the history
+    if (history.length === 0) return { kind: 'never' };
   }
-  return { kind: 'never' };
+  return {
+    kind: 'unknown',
+    why: `no successful deploy in its last ${MAX_HISTORY_PAGES * HISTORY_PAGE_SIZE} history entries`,
+  };
 }
 
 interface HistoryEntry {

@@ -106,6 +106,7 @@ export async function runCommand(options: RunCommandOptions): Promise<RunCommand
     concurrency,
     failFast: options.failFast ?? config.run.failFast,
     newStacks: config.run.newStacks,
+    createStacks: config.run.createStacks,
     onFinish: options.onFinish,
   });
   return { selection, runs };

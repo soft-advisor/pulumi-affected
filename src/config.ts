@@ -16,7 +16,13 @@ export interface Config {
   globalInputs: string[];
   packages: { ignore: string[] };
   classify: { ignore: IgnoreRule[] };
-  run: { command: string; concurrency: number; failFast: boolean; newStacks: 'preview' | 'skip' };
+  run: {
+    command: string;
+    concurrency: number;
+    failFast: boolean;
+    newStacks: 'preview' | 'skip';
+    createStacks: boolean;
+  };
 }
 
 export const DEFAULT_COMMAND = 'pulumi --cwd {dir} --stack {stack}';
@@ -34,7 +40,13 @@ export function defaultConfig(): Config {
     globalInputs: [...DEFAULT_GLOBAL_INPUTS],
     packages: { ignore: [] },
     classify: { ignore: [] },
-    run: { command: DEFAULT_COMMAND, concurrency: 4, failFast: false, newStacks: 'preview' },
+    run: {
+      command: DEFAULT_COMMAND,
+      concurrency: 4,
+      failFast: false,
+      newStacks: 'preview',
+      createStacks: true,
+    },
   };
 }
 
@@ -77,6 +89,7 @@ export function parseConfig(text: string, path = CONFIG_FILE): Config {
       concurrency: parsed.run?.concurrency ?? defaults.run.concurrency,
       failFast: parsed.run?.failFast ?? defaults.run.failFast,
       newStacks: parsed.run?.newStacks ?? defaults.run.newStacks,
+      createStacks: parsed.run?.createStacks ?? defaults.run.createStacks,
     },
   };
 }

@@ -99,6 +99,7 @@ run:
   concurrency: 4
   failFast: false
   newStacks: preview # or skip
+  createStacks: true # whether deploys create stacks that don't exist yet
 ```
 
 ## GitHub Actions
@@ -155,7 +156,9 @@ A preview runs the pull request's Pulumi program, so whoever can open a pull req
 - **Skipping.** `Pulumi-Affected-Skip` lines in commit messages and pull request descriptions are honoured in previews, which list what they skipped and who asked. Deploys ignore them, so no pull request can hold a change back; only the `skip` input counts there.
 - **Comments and logs** show resource types, names and changed property names, never values, with anything from the repository escaped so it can't add links, images or mentions. A failed stack shows Pulumi's error diagnostics. With a GitHub App token, the action recognises its own comments as a bot's.
 
-**Concurrency.** Two deploys of the same stacks at once fight over stack locks, or apply out of order. Previews of the same pull request duplicate comments. Use concurrency groups:
+**Cancelling** a run interrupts Pulumi so it can stop cleanly and release its lock, and restores files a new-stack preview changed.
+
+**Concurrency.** Two deploys of the same stacks at once fight over stack locks on Pulumi Cloud, or apply out of order; self-managed backends only lock when `PULUMI_SELF_MANAGED_STATE_LOCKING` is set. Previews of the same pull request duplicate comments. Use concurrency groups:
 
 ```yaml
 concurrency:
@@ -202,8 +205,9 @@ jobs:
 **Up** compares each stack with the commit it was last deployed from (Pulumi records it as `git.head` in the stack's history), so a stack whose deploy failed, or that was never deployed, runs again on the next push.
 
 - A stack whose latest deploy failed is selected, with that reason.
-- A stack whose last deploy recorded no commit, or used `--target`, is selected too.
-- A destroyed stack counts as never deployed.
+- A stack whose last deploy recorded no commit, or covered only some resources (`--target`, `--exclude`, `--target-replace`), is selected too, as is one with resources imported since, a destroy that failed partway, or no successful deploy in its last 2,000 history entries.
+- A destroyed stack counts as never deployed, and is created again.
+- A stack that doesn't exist is created, unless `run.createStacks` is false, or its config file has an encryption salt or key: that means it was created against some backend before, so a missing stack points at the wrong backend or organisation, and creating it again would duplicate every resource.
 - A deploy from a working tree with uncommitted changes keeps its commit, with a warning. Stacks run after the ones they depend on. When a deploy changes a stack's outputs, the stacks that depend on it are deployed too, with the reason. A failure skips the stacks that depend on the failed one, lets the others finish, and fails the job at the end (`fail-fast` stops early instead).
 
 **Comments.** A preview posts one comment on the pull request and edits it on every push: a table of stacks with their result and why they ran, then each stack's resource changes. A push that selects nothing rewrites an earlier comment rather than adding one. A deploy comments its results on the pull requests the push merged. GitHub limits a comment to 65,536 characters, so a long report continues in further comments, split between stacks. Resource changes show types, names and changed property names, never values; a failed stack shows the error Pulumi printed. Pull requests from forks can't be commented on with the default token; the job summary has everything.

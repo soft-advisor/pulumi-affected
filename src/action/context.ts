@@ -144,12 +144,28 @@ export async function eventContext(
     }
     const branch = String(payload.ref ?? '').replace(/^refs\/heads\//, '');
     // Stacks forced in a merged pull request (description lines and commands) still apply
-    const merged = api ? await mergedPullRequests(api, repoRoot, before, branch) : [];
+    // The deploy matters more than its comments: an API failure here only costs those
+    let merged: PullRequest[] = [];
+    if (api) {
+      try {
+        merged = await mergedPullRequests(api, repoRoot, before, branch);
+      } catch (error) {
+        warnings.push(
+          `Couldn't find the pull requests this push merged, so their requests and comments are skipped: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+    }
     const messages: string[] = [];
     const requests: Request[] = [];
     for (const pullRequest of merged) {
       messages.push(pullRequest.body ?? '');
-      if (api) requests.push(...(await commandRequests(api, pullRequest.number, warnings)));
+      try {
+        if (api) requests.push(...(await commandRequests(api, pullRequest.number, warnings)));
+      } catch (error) {
+        warnings.push(
+          `Couldn't read the commands on #${pullRequest.number}: ${error instanceof Error ? error.message : error}`,
+        );
+      }
     }
     return { ...EMPTY, base: before, messages, requests, mergedPullRequests: merged, warnings };
   }

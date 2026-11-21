@@ -95,7 +95,7 @@ async function main() {
     runs.length > 0 ? renderTable(runs) : 'No stacks affected.',
     skipped ? `\n**Skipped** although affected:<br>${skipped}` : '',
   ].join('');
-  appendSummary(limitSummary([heading, intro, ...sections].join('\n\n'), runUrl));
+  appendSummary(limitSummary(heading, intro, sections, runUrl));
   if (runs.length === 0) appendSummary(renderMarkdown(selection));
 
   if (api && booleanInput('comment')) {
@@ -178,9 +178,26 @@ const SUMMARY_LIMIT = 900_000;
 /** Each step output is limited too; errors are the part that can grow without bound */
 const OUTPUT_ERROR_LIMIT = 4_000;
 
-function limitSummary(markdown: string, runUrl: string | undefined) {
-  if (markdown.length <= SUMMARY_LIMIT) return markdown;
-  return `${markdown.slice(0, SUMMARY_LIMIT)}\n\n…cut short; the full output is in the ${runUrl ? `[run log](${runUrl})` : 'run log'}.`;
+/** The summary, dropping whole stack sections once over the limit, counted in bytes as GitHub does */
+function limitSummary(
+  heading: string,
+  intro: string,
+  sections: string[],
+  runUrl: string | undefined,
+) {
+  const parts = [heading, intro];
+  let bytes = Buffer.byteLength(parts.join('\n\n'));
+  for (const [index, section] of sections.entries()) {
+    const size = Buffer.byteLength(section) + 2;
+    if (bytes + size > SUMMARY_LIMIT) {
+      const where = runUrl ? `[run log](${runUrl})` : 'run log';
+      parts.push(`…${sections.length - index} more stacks are in the ${where}.`);
+      break;
+    }
+    parts.push(section);
+    bytes += size;
+  }
+  return parts.join('\n\n');
 }
 
 function concurrencyInput() {

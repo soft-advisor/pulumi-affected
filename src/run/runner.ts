@@ -43,6 +43,8 @@ export interface RunOptions {
   failFast: boolean;
   /** Whether stacks that don't exist yet are previewed in a temporary backend or left out */
   newStacks?: NewStacks;
+  /** Whether deploys may create stacks that don't exist yet */
+  createStacks?: boolean;
   /** Called as each stack finishes, e.g. to print its log */
   onFinish?: (run: StackRun) => void;
 }
@@ -180,7 +182,13 @@ async function runDeploys(options: RunOptions) {
             status: 'skipped',
             error: 'an earlier stack failed',
           });
-        const outcome = await upStack(options.runner, stack, options.repoRoot, options.ignore);
+        const outcome = await upStack(
+          options.runner,
+          stack,
+          options.repoRoot,
+          options.ignore,
+          options.createStacks ?? true,
+        );
         if (outcome.kind === 'failed') {
           if (options.failFast) stop = true;
           return finish(options, { stack, reasons, status: 'failed', error: outcome.error });
