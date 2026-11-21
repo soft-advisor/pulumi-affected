@@ -22,13 +22,24 @@ jobs:
       - name: Activate the pinned package manager
         run: corepack enable
       - run: pnpm install --frozen-lockfile
+      # The run tests drive the real CLI against a local file backend
+      - name: Install the Pulumi CLI
+        env:
+          PULUMI_VERSION: 3.210.0
+          PULUMI_SHA256: 4450ff72bbac9b4cb9ac28913842c9326568fe03a259d514a144a340f2a515ca
+        run: |
+          archive="pulumi-v${PULUMI_VERSION}-linux-x64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$archive" "https://get.pulumi.com/releases/sdk/$archive"
+          echo "$PULUMI_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/pulumi" >> "$GITHUB_PATH"
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
       # The action runs the committed bundle, so it must match the source
       - name: Check the action bundle and schema.json are up to date
-        run: git diff --exit-code -- select/dist schema.json
+        run: git diff --exit-code -- select/dist run/dist schema.json
       - name: Show what would be published
         run: npm pack --dry-run
 

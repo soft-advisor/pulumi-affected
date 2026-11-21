@@ -82,7 +82,9 @@ export class GitHubApi {
       const text = await response.text();
       throw new Error(`GitHub API ${method} ${path} failed with ${response.status}: ${text}`);
     }
-    return (await response.json()) as T;
+    // DELETE and some other calls answer 204 with no body
+    const text = await response.text();
+    return (text ? JSON.parse(text) : undefined) as T;
   }
 
   /** Every page of a list endpoint */

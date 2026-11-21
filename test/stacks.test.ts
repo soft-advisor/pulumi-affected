@@ -237,3 +237,21 @@ test('uncommitted changes in the working tree are analysed when no head is given
   write(dir, { 'accounts/Pulumi.hyperchick.yaml': 'config:\n  org-accounts:region: x\n' });
   assert.deepEqual(selectedIds(select({ cwd: dir, base })), ['org-accounts/hyperchick']);
 });
+
+test('an encryption salt Pulumi adds is not a change, but a changed salt is', () => {
+  const added = selectChange(ACCOUNTS, {
+    'accounts/Pulumi.business.yaml':
+      'encryptionsalt: v1:abc\nconfig:\n  org-accounts:region: eu-west-2\n',
+  });
+  assert.deepEqual(selectedIds(added), []);
+  const salted = {
+    ...ACCOUNTS,
+    'accounts/Pulumi.business.yaml':
+      'encryptionsalt: v1:abc\nconfig:\n  org-accounts:region: eu-west-2\n',
+  };
+  const changed = selectChange(salted, {
+    'accounts/Pulumi.business.yaml':
+      'encryptionsalt: v1:def\nconfig:\n  org-accounts:region: eu-west-2\n',
+  });
+  assert.deepEqual(selectedIds(changed), ['org-accounts/business']);
+});
