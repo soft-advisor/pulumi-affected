@@ -1,2 +1,3 @@
 config:
   fixture-dns:domain: Example.com
+encryptionsalt: v1:twm+QtiWisk=:v1:eYE/EHNuP0ke0jwQ:cCGSe7sBbyDaw5MZG2XHRudV/uvMuA==
