@@ -5,7 +5,13 @@
       "org/lib/naming.ts": "export function accountName(alias: string) {\n  return `acme-${alias}`;\n}\n\nexport function zoneName(domain: string) {\n  return `${domain.toLowerCase()}.`;\n}\n"
     },
     "expected": ["fixture-dns/prod"],
-    "deployed": ["fixture-dns/prod"]
+    "deployed": ["fixture-dns/prod"],
+    "previewStatuses": {
+      "fixture-dns/prod": "no-changes"
+    },
+    "deployStatuses": {
+      "fixture-dns/prod": "changes"
+    }
   },
   {
     "name": "shared function used by a multi-stack project",
@@ -18,7 +24,17 @@
       "fixture-accounts/business",
       "fixture-accounts/shop",
       "fixture-dns/prod"
-    ]
+    ],
+    "previewStatuses": {
+      "fixture-accounts/business": "changes",
+      "fixture-accounts/shop": "changes"
+    },
+    "deployStatuses": {
+      "fixture-access/prod": "changes",
+      "fixture-accounts/business": "changes",
+      "fixture-accounts/shop": "changes",
+      "fixture-dns/prod": "changes"
+    }
   },
   {
     "name": "comment-only change",
@@ -34,7 +50,14 @@
       "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
     },
     "expected": ["fixture-accounts/shop"],
-    "deployed": ["fixture-access/prod", "fixture-accounts/shop"]
+    "deployed": ["fixture-access/prod", "fixture-accounts/shop"],
+    "previewStatuses": {
+      "fixture-accounts/shop": "changes"
+    },
+    "deployStatuses": {
+      "fixture-accounts/shop": "changes",
+      "fixture-access/prod": "changes"
+    }
   },
   {
     "name": "file read by the program",
@@ -58,6 +81,65 @@
     "changes": {},
     "body": "Checking for drift.\n\nPulumi-Affected-Run: fixture-dns/prod\n",
     "expected": ["fixture-dns/prod"],
-    "deployed": ["fixture-dns/prod"]
+    "deployed": ["fixture-dns/prod"],
+    "previewStatuses": {
+      "fixture-dns/prod": "no-changes"
+    },
+    "deployStatuses": {
+      "fixture-dns/prod": "no-changes"
+    }
+  },
+  {
+    "name": "a stack that fails",
+    "changes": {
+      "org/accounts/index.ts": "import * as pulumi from '@pulumi/pulumi';\nimport * as random from '@pulumi/random';\nimport { accountName } from '../lib/naming';\n\nconst config = new pulumi.Config();\nconst name = accountName(config.require('alias'));\nif (config.require('alias') === 'shop') throw new Error('broken on purpose');\n\nexport const accountId = new random.RandomInteger(name, { min: 100000, max: 999999 }).result;\n"
+    },
+    "expected": ["fixture-accounts/business", "fixture-accounts/shop"],
+    "deployed": ["fixture-accounts/business", "fixture-accounts/shop"],
+    "previewStatuses": {
+      "fixture-accounts/business": "no-changes",
+      "fixture-accounts/shop": "failed"
+    },
+    "deployStatuses": {
+      "fixture-accounts/business": "no-changes",
+      "fixture-accounts/shop": "failed"
+    }
+  },
+  {
+    "name": "a new stack",
+    "changes": {
+      "org/accounts/Pulumi.newco.yaml": "config:\n  fixture-accounts:alias: newco\n"
+    },
+    "expected": ["fixture-accounts/newco"],
+    "deployed": ["fixture-access/prod", "fixture-accounts/newco"],
+    "previewStatuses": {
+      "fixture-accounts/newco": "changes"
+    },
+    "deployStatuses": {
+      "fixture-accounts/newco": "changes",
+      "fixture-access/prod": "no-changes"
+    }
+  },
+  {
+    "name": "a command from someone without write access",
+    "changes": {
+      "site/README.md": "# Site\n"
+    },
+    "comment": "/pulumi-affected preview fixture-site/dev",
+    "expectReply": true,
+    "expected": [],
+    "deployed": []
+  },
+  {
+    "name": "a second push edits the preview comment",
+    "changes": {
+      "org/lib/naming.ts": "export function accountName(alias: string) {\n  return `acme-${alias}`;\n}\n\nexport function zoneName(domain: string) {\n  return `${domain.toLowerCase()}.`;\n}\n"
+    },
+    "expected": ["fixture-dns/prod"],
+    "second": {
+      "site/site/index.html": "<h1>Hello again</h1>\n"
+    },
+    "secondExpected": ["fixture-dns/prod", "fixture-site/dev", "fixture-site/prod"],
+    "deployed": ["fixture-dns/prod", "fixture-site/dev", "fixture-site/prod"]
   }
 ]

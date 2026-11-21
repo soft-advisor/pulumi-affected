@@ -33,6 +33,15 @@ jobs:
           echo "$PULUMI_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/pulumi" >> "$GITHUB_PATH"
+      # The run tests use the random provider; installing it here, with retries, keeps a flaky
+      # download from failing a test
+      - name: Install the random provider
+        run: |
+          for attempt in 1 2 3; do
+            pulumi plugin install resource random v4.21.6 && exit 0
+            sleep $((attempt * 10))
+          done
+          exit 1
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
