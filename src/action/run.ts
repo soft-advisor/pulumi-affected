@@ -5,7 +5,7 @@ import type { Mode, StackRun } from '../run/runner.ts';
 import { splitPatterns } from '../patterns.ts';
 import { repoRootOf } from '../snapshot.ts';
 import { marker, syncComments } from './comments.ts';
-import { eventContext } from './context.ts';
+import { eventContext, pullRequestContext } from './context.ts';
 import {
   appendSummary,
   booleanInput,
@@ -33,7 +33,13 @@ async function main() {
   const api = token ? new GitHubApi(token) : undefined;
   const runUrl = runLink();
 
-  const context = await eventContext(event, repoRoot, api);
+  const pullRequestNumber = Number(input('pull-request'));
+  if (pullRequestNumber && !api)
+    throw new Error('The pull-request input needs the github-token input');
+  const context =
+    pullRequestNumber && api
+      ? await pullRequestContext(api, repoRoot, pullRequestNumber)
+      : await eventContext(event, repoRoot, api);
   if (context === undefined) {
     notice('Not a /pulumi-affected command; nothing to run');
     writeOutputs([]);

@@ -44,6 +44,12 @@ inputs:
     description: Run every stack.
     required: false
     default: 'false'
+  pull-request:
+    description: >-
+      Number of a pull request to use instead of the triggering event: an open one is compared
+      with its merge base, and a merged one is where a deploy reports. For workflow_dispatch and
+      other events without one.
+    required: false
   working-directory:
     description: 'A folder inside the repository. Default: the workspace.'
     required: false

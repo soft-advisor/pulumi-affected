@@ -2,44 +2,62 @@
   {
     "name": "shared function used by one project",
     "changes": {
-      "org/lib/naming.ts": "export function accountName(alias: string) {\n  return `acme-${alias}`;\n}\n\nexport function zoneName(domain: string) {\n  return domain.trim().toLowerCase();\n}\n"
+      "org/lib/naming.ts": "export function accountName(alias: string) {\n  return `acme-${alias}`;\n}\n\nexport function zoneName(domain: string) {\n  return `${domain.toLowerCase()}.`;\n}\n"
     },
-    "expected": ["fixture-dns/prod"]
+    "expected": ["fixture-dns/prod"],
+    "deployed": ["fixture-dns/prod"]
   },
   {
     "name": "shared function used by a multi-stack project",
     "changes": {
       "org/lib/naming.ts": "export function accountName(alias: string) {\n  return `acme-co-${alias}`;\n}\n\nexport function zoneName(domain: string) {\n  return domain.toLowerCase();\n}\n"
     },
-    "expected": ["fixture-accounts/business", "fixture-accounts/shop"]
+    "expected": ["fixture-accounts/business", "fixture-accounts/shop"],
+    "deployed": [
+      "fixture-access/prod",
+      "fixture-accounts/business",
+      "fixture-accounts/shop",
+      "fixture-dns/prod"
+    ]
   },
   {
     "name": "comment-only change",
     "changes": {
       "org/lib/naming.ts": "/** Account names are prefixed with the company */\nexport function accountName(alias: string): string {\n  return `acme-${alias}`;\n}\n\nexport function zoneName(domain: string): string {\n  return domain.toLowerCase();\n}\n"
     },
-    "expected": []
+    "expected": [],
+    "deployed": []
   },
   {
     "name": "one stack's config",
-    "changes": { "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n" },
-    "expected": ["fixture-accounts/shop"]
+    "changes": {
+      "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
+    },
+    "expected": ["fixture-accounts/shop"],
+    "deployed": ["fixture-access/prod", "fixture-accounts/shop"]
   },
   {
     "name": "file read by the program",
-    "changes": { "site/site/index.html": "<h1>Hello, world</h1>\n" },
+    "changes": {
+      "site/site/index.html": "<h1>Hello, world</h1>\n"
+    },
     "expected": ["fixture-site/dev", "fixture-site/prod"],
-    "waves": [["fixture-site/dev"], ["fixture-site/prod"]]
+    "waves": [["fixture-site/dev"], ["fixture-site/prod"]],
+    "deployed": ["fixture-site/dev", "fixture-site/prod"]
   },
   {
     "name": "docs only",
-    "changes": { "site/README.md": "# Site\n" },
-    "expected": []
+    "changes": {
+      "site/README.md": "# Site\n"
+    },
+    "expected": [],
+    "deployed": []
   },
   {
     "name": "requested in the pull request description",
     "changes": {},
     "body": "Checking for drift.\n\nPulumi-Affected-Run: fixture-dns/prod\n",
-    "expected": ["fixture-dns/prod"]
+    "expected": ["fixture-dns/prod"],
+    "deployed": ["fixture-dns/prod"]
   }
 ]

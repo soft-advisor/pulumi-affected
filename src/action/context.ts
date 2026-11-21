@@ -125,6 +125,42 @@ export async function eventContext(
   };
 }
 
+/**
+ * The context of a pull request named explicitly (the `pull-request` input) rather than by the
+ * event: an open one is previewed against its merge base, a merged one is what a deploy reports
+ * on.
+ */
+export async function pullRequestContext(
+  api: GitHubApi,
+  repoRoot: string,
+  number: number,
+): Promise<Context> {
+  const pullRequest = await api.request<PullRequest & { merged_at: string | null }>(
+    'GET',
+    api.repo(`/pulls/${number}`),
+  );
+  const messages = [pullRequest.body ?? ''];
+  const requests = await commandRequests(api, number);
+  if (pullRequest.merged_at) {
+    return {
+      base: undefined,
+      messages,
+      requests,
+      all: false,
+      pullRequest: undefined,
+      mergedPullRequests: [pullRequest],
+    };
+  }
+  return {
+    base: mergeBase(repoRoot, pullRequest.base.sha),
+    messages,
+    requests,
+    all: false,
+    pullRequest,
+    mergedPullRequests: [],
+  };
+}
+
 function mergeBase(repoRoot: string, baseSha: string) {
   try {
     return git(repoRoot, ['merge-base', baseSha, 'HEAD']).trim();
