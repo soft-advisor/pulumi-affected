@@ -90,7 +90,8 @@ const running = new Set<ChildProcess>();
 const cleanups = new Set<() => void>();
 let cancelling = false;
 let handlersInstalled = false;
-const CANCEL_GRACE = 25_000;
+// The runner kills the job about 7.5 seconds after cancelling it
+const CANCEL_GRACE = 7_000;
 
 function installCancelHandlers() {
   if (handlersInstalled) return;

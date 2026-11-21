@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
-import { applyPlans } from '../src/plan/apply.ts';
+import { type ApplyResult, applyPlans } from '../src/plan/apply.ts';
 import { readManifest } from '../src/plan/manifest.ts';
 import { planStacks } from '../src/plan/plan.ts';
-import { commandRunner, DEFAULT_COMMAND } from '../src/pulumi/runner.ts';
+import { commandRunner, DEFAULT_COMMAND, type PulumiRunner } from '../src/pulumi/runner.ts';
 import { commit, createRepo, type Files, run } from './helpers.ts';
 
 /*
@@ -24,7 +24,7 @@ const hasPulumi = (() => {
   }
 })();
 
-const program = (length: number, extra = '') => `name: words
+const program = (length: number, outputs = '') => `name: words
 runtime: yaml
 resources:
   word:
@@ -32,11 +32,11 @@ resources:
     properties:
       length: ${length}
       special: false
-${extra}outputs:
+outputs:
   word: \${word.result}
-`;
+${outputs}`;
 
-const backends: string[] = [];
+const folders: string[] = [];
 const saved = { ...process.env };
 
 before(() => {
@@ -46,35 +46,42 @@ before(() => {
 
 after(() => {
   process.env = saved;
-  for (const backend of backends) rmSync(backend, { recursive: true, force: true });
+  for (const folder of folders) rmSync(folder, { recursive: true, force: true });
 });
 
-/** A repo with the `words` project, and a fresh backend; tests run one at a time */
-function setup(files: Files = {}) {
-  const backend = mkdtempSync(join(tmpdir(), 'pulumi-affected-state-'));
-  backends.push(backend);
-  process.env.PULUMI_BACKEND_URL = `file://${backend}`;
-  const { dir, base } = createRepo({
-    'Pulumi.yaml': program(8),
-    'Pulumi.dev.yaml': 'config: {}\n',
-    ...files,
-  });
-  const runner = commandRunner(DEFAULT_COMMAND, dir);
-  const plans = mkdtempSync(join(tmpdir(), 'pulumi-affected-plans-'));
-  return { dir, base, runner, plans };
+function temporary(name: string) {
+  const folder = mkdtempSync(join(tmpdir(), `pulumi-affected-${name}-`));
+  folders.push(folder);
+  return folder;
+}
+
+/** A repo with `files` (the `words` project by default), and a fresh backend */
+function setup(files: Files = { 'Pulumi.yaml': program(8), 'Pulumi.dev.yaml': 'config: {}\n' }) {
+  process.env.PULUMI_BACKEND_URL = `file://${temporary('state')}`;
+  const { dir, base } = createRepo(files);
+  return { dir, base, runner: commandRunner(DEFAULT_COMMAND, dir), plans: temporary('plans') };
 }
 
 function pulumi(dir: string, args: string[]) {
   return run(dir, 'pulumi', ['--non-interactive', '--stack', 'dev', ...args]);
 }
 
-/** Creates the dev stack, commits the encryption salt Pulumi adds to its config, and deploys */
-function deploy(dir: string) {
-  pulumi(dir, ['stack', 'init']);
+/** Creates the dev stack in `folder`, commits the salt Pulumi adds to its config, and deploys */
+function deploy(dir: string, folder = '.') {
+  pulumi(dir, ['--cwd', folder, 'stack', 'init']);
   commit(dir, {}, 'salt');
-  pulumi(dir, ['up', '--yes', '--skip-preview']);
+  pulumi(dir, ['--cwd', folder, 'up', '--yes', '--skip-preview']);
   assert.equal(run(dir, 'git', ['status', '--porcelain']), '');
 }
+
+const plan = (dir: string, base: string, plans: string, runner: PulumiRunner) =>
+  planStacks({ select: { cwd: dir, base }, directory: plans, runner, concurrency: 2 });
+
+const apply = (dir: string, plans: string, runner: PulumiRunner, allow?: string[]) =>
+  applyPlans({ cwd: dir, directory: plans, runner, concurrency: 2, allow });
+
+const outcomes = (result: ApplyResult) =>
+  Object.fromEntries(result.stacks.map((stack) => [stack.id, stack.outcome]));
 
 describe('plan and apply', { skip: !hasPulumi && 'pulumi is not installed' }, () => {
   test('applies the plan once, and a rerun recognises it as applied', async () => {
@@ -82,27 +89,22 @@ describe('plan and apply', { skip: !hasPulumi && 'pulumi is not installed' }, ()
     deploy(dir);
     commit(dir, { 'Pulumi.yaml': program(12) });
 
-    const manifest = await planStacks({
-      select: { cwd: dir, base },
-      directory: plans,
-      runner,
-      concurrency: 2,
-      createStacks: 'plan',
-    });
+    const manifest = await plan(dir, base, plans, runner);
     assert.deepEqual(manifest.failed, []);
     assert.deepEqual(
-      manifest.stacks.map((stack) => [stack.id, stack.state.kind]),
-      [['words/dev', 'exists']],
+      manifest.stacks.map((stack) => stack.id),
+      ['words/dev'],
     );
     assert.equal(readManifest(plans).stacks.length, 1);
 
-    const first = await applyPlans({ cwd: dir, directory: plans, runner, concurrency: 2 });
-    assert.deepEqual(first.stacks, [{ id: 'words/dev', outcome: 'applied' }]);
-    const word = JSON.parse(pulumi(dir, ['stack', 'output', '--json'])).word;
-    assert.equal(word.length, 12);
+    const first = await apply(dir, plans, runner);
+    assert.deepEqual(outcomes(first), { 'words/dev': 'applied' });
+    assert.equal(JSON.parse(pulumi(dir, ['stack', 'output', '--json'])).word.length, 12);
 
-    const second = await applyPlans({ cwd: dir, directory: plans, runner, concurrency: 2 });
-    assert.deepEqual(second.stacks, [{ id: 'words/dev', outcome: 'already-applied' }]);
+    // A refresh in between doesn't make the plan look unapplied
+    pulumi(dir, ['refresh', '--yes', '--skip-preview']);
+    const second = await apply(dir, plans, runner);
+    assert.deepEqual(outcomes(second), { 'words/dev': 'already-applied' });
     assert.ok(second.ok);
   });
 
@@ -110,13 +112,7 @@ describe('plan and apply', { skip: !hasPulumi && 'pulumi is not installed' }, ()
     const { dir, base, runner, plans } = setup();
     deploy(dir);
     commit(dir, { 'Pulumi.yaml': program(12) });
-    await planStacks({
-      select: { cwd: dir, base },
-      directory: plans,
-      runner,
-      concurrency: 1,
-      createStacks: 'plan',
-    });
+    await plan(dir, base, plans, runner);
 
     // Someone else changes the stack in the meantime
     pulumi(dir, [
@@ -127,106 +123,114 @@ describe('plan and apply', { skip: !hasPulumi && 'pulumi is not installed' }, ()
       'urn:pulumi:dev::words::random:index/randomString:RandomString::word',
     ]);
 
-    const result = await applyPlans({ cwd: dir, directory: plans, runner, concurrency: 1 });
-    assert.equal(result.stacks[0].outcome, 'refused');
+    const result = await apply(dir, plans, runner);
+    assert.deepEqual(outcomes(result), { 'words/dev': 'refused' });
     assert.ok(!result.ok);
   });
 
-  test('drops plans without changes', async () => {
+  test('drops plans without changes, and keeps plans that only change outputs', async () => {
     const { dir, base, runner, plans } = setup();
     deploy(dir);
     commit(dir, { 'Pulumi.yaml': `${program(8)}# a comment\n` });
-
-    const manifest = await planStacks({
-      select: { cwd: dir, base },
-      directory: plans,
-      runner,
-      concurrency: 1,
-      createStacks: 'plan',
-    });
-    assert.deepEqual(manifest.stacks, []);
+    const unchanged = await plan(dir, base, plans, runner);
+    assert.deepEqual(unchanged.stacks, []);
     assert.deepEqual(
-      manifest.unchanged.map((stack) => stack.id),
+      unchanged.unchanged.map((stack) => stack.id),
       ['words/dev'],
     );
-    assert.ok(!existsSync(join(plans, 'words__dev.plan.json')));
+    assert.ok(!existsSync(join(plans, 'words+dev.plan.json')));
+
+    commit(dir, { 'Pulumi.yaml': program(8, '  greeting: hello\n') });
+    const outputs = await plan(dir, base, plans, runner);
+    assert.deepEqual(
+      outputs.stacks.map((stack) => [stack.id, stack.outputs]),
+      [['words/dev', ['greeting']]],
+    );
+    const result = await apply(dir, plans, runner);
+    assert.deepEqual(outcomes(result), { 'words/dev': 'applied' });
+    assert.equal(JSON.parse(pulumi(dir, ['stack', 'output', '--json'])).greeting, 'hello');
   });
 
-  test('creates a new stack when planning', async () => {
-    const { dir, base, runner, plans } = setup();
+  test('creates a new stack with secrets when planning, and applies it from a fresh clone', async () => {
+    const { dir, base, runner, plans } = setup({
+      'Pulumi.yaml': `name: secrets
+runtime: yaml
+resources:
+  password:
+    type: random:RandomPassword
+    properties:
+      length: 16
+outputs:
+  password: \${password.result}
+`,
+    });
     commit(dir, { 'Pulumi.prod.yaml': 'config: {}\n' });
-    const manifest = await planStacks({
-      select: { cwd: dir, base, run: ['words/prod'] },
-      directory: plans,
-      runner,
-      concurrency: 1,
-      createStacks: 'plan',
-    });
-    const prod = manifest.stacks.find((stack) => stack.id === 'words/prod');
+    const manifest = await plan(dir, base, plans, runner);
+    const prod = manifest.stacks.find((stack) => stack.id === 'secrets/prod');
     assert.equal(prod?.created, true);
-    assert.equal(prod?.state.kind, 'exists');
-    // Pulumi wrote an encryption salt into the config file; that doesn't stop applying
-    assert.notEqual(run(dir, 'git', ['status', '--porcelain']), '');
-    const result = await applyPlans({ cwd: dir, directory: plans, runner, concurrency: 1 });
-    assert.deepEqual(
-      result.stacks.filter((stack) => stack.id === 'words/prod'),
-      [{ id: 'words/prod', outcome: 'applied' }],
-    );
+    assert.match(prod?.encryptionSalt ?? '', /^v1:/);
+
+    // The apply job's checkout doesn't have the salt Pulumi wrote while planning
+    const clone = temporary('clone');
+    run(tmpdir(), 'git', ['clone', '-q', dir, clone]);
+    const result = await apply(clone, plans, commandRunner(DEFAULT_COMMAND, clone));
+    assert.deepEqual(outcomes(result), { 'secrets/prod': 'applied' });
   });
 
-  test('creates a new stack only when applying, if asked to', async () => {
-    const { dir, base, runner, plans } = setup();
-    commit(dir, { 'Pulumi.qa.yaml': 'config: {}\n' });
-    const config = readFileSync(join(dir, 'Pulumi.qa.yaml'), 'utf8');
-    const manifest = await planStacks({
-      select: { cwd: dir, base, run: ['words/qa'] },
-      directory: plans,
-      runner,
-      concurrency: 1,
-      createStacks: 'apply',
+  test('skips a stack planned before outputs it reads changed', async () => {
+    const up = (word: string) => `name: up\nruntime: yaml\noutputs:\n  word: ${word}\n`;
+    const down = (suffix: string) => `name: down
+runtime: yaml
+resources:
+  ref:
+    type: pulumi:pulumi:StackReference
+    properties:
+      name: organization/up/dev
+outputs:
+  word: \${ref.outputs["word"]}${suffix}
+`;
+    const { dir, base, runner, plans } = setup({
+      'up/Pulumi.yaml': up('one'),
+      'up/Pulumi.dev.yaml': 'config: {}\n',
+      'down/Pulumi.yaml': down(''),
+      'down/Pulumi.dev.yaml': 'config: {}\n',
+      'pulumi-affected.yaml': 'dependsOn:\n  down/dev: [up/dev]\n',
     });
-    assert.deepEqual(manifest.failed, []);
-    const qa = manifest.stacks.find((stack) => stack.id === 'words/qa');
-    assert.equal(qa?.state.kind, 'created-on-apply');
-    // Nothing reached the real backend, and the config file is as committed
-    assert.doesNotMatch(run(dir, 'pulumi', ['stack', 'ls', '--json']), /"name":\s*"qa"/);
-    assert.equal(readFileSync(join(dir, 'Pulumi.qa.yaml'), 'utf8'), config);
+    deploy(dir, 'up');
+    deploy(dir, 'down');
+    commit(dir, { 'up/Pulumi.yaml': up('two'), 'down/Pulumi.yaml': down('!') });
 
-    const result = await applyPlans({ cwd: dir, directory: plans, runner, concurrency: 1 });
-    assert.deepEqual(
-      result.stacks.filter((stack) => stack.id === 'words/qa'),
-      [{ id: 'words/qa', outcome: 'applied' }],
-    );
-    run(dir, 'git', ['checkout', '-q', '--', '.']);
-    const again = await applyPlans({ cwd: dir, directory: plans, runner, concurrency: 1 });
-    assert.equal(again.stacks.find((stack) => stack.id === 'words/qa')?.outcome, 'already-applied');
+    const manifest = await plan(dir, base, plans, runner);
+    assert.deepEqual(manifest.stacks.map((stack) => stack.id).sort(), ['down/dev', 'up/dev']);
+    const result = await apply(dir, plans, runner);
+    assert.deepEqual(outcomes(result), { 'up/dev': 'applied', 'down/dev': 'skipped' });
+    assert.deepEqual(result.needsPlan, ['down/dev']);
   });
 
-  test('refuses plans for other code, or a tampered plan', async () => {
+  test('refuses tampered plans, other code, extra files and stacks not allowed', async () => {
     const { dir, base, runner, plans } = setup();
     deploy(dir);
     commit(dir, { 'Pulumi.yaml': program(12) });
-    await planStacks({
-      select: { cwd: dir, base },
-      directory: plans,
-      runner,
-      concurrency: 1,
-      createStacks: 'plan',
-    });
+    await plan(dir, base, plans, runner);
 
-    const planFile = join(plans, 'words__dev.plan.json');
+    const planFile = join(plans, 'words+dev.plan.json');
     const original = readFileSync(planFile, 'utf8');
     writeFileSync(planFile, `${original} `);
-    await assert.rejects(
-      applyPlans({ cwd: dir, directory: plans, runner, concurrency: 1 }),
-      /doesn't match its hash/,
-    );
+    await assert.rejects(apply(dir, plans, runner), /doesn't match its hash/);
     writeFileSync(planFile, original);
 
-    commit(dir, { 'Pulumi.yaml': program(16) });
+    await assert.rejects(apply(dir, plans, runner, ['other/*']), /isn't one of the stacks allowed/);
+
+    // A project that isn't in the commit can't be applied, or even sit beside it
+    mkdirSync(join(dir, 'planted'));
+    writeFileSync(join(dir, 'planted', 'Pulumi.yaml'), 'name: planted\nruntime: yaml\n');
     await assert.rejects(
-      applyPlans({ cwd: dir, directory: plans, runner, concurrency: 1 }),
-      /are for tree/,
+      apply(dir, plans, runner),
+      /files the commit doesn't: planted\/Pulumi.yaml/,
     );
+    rmSync(join(dir, 'planted'), { recursive: true });
+
+    commit(dir, { 'Pulumi.yaml': program(16) });
+    await assert.rejects(apply(dir, plans, runner), /are for tree/);
   });
 });

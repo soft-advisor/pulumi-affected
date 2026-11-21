@@ -47,13 +47,19 @@ interface HistoryEntry {
   message?: string;
 }
 
-/** The newest entry in the stack's history, if any */
-export async function latestUpdate(runner: PulumiRunner, stack: StackTarget) {
-  const result = await runner.run(stack, ['stack', 'history', '--json', '--page-size', '1']);
+/** The stack's newest history entries, newest first */
+export async function recentUpdates(runner: PulumiRunner, stack: StackTarget, count = 25) {
+  const result = await runner.run(stack, [
+    'stack',
+    'history',
+    '--json',
+    '--page-size',
+    String(count),
+  ]);
   if (result.code !== 0) throw failure(stack, "can't read the stack's history", result);
   const entries = parseJsonArray<HistoryEntry>(result.stdout);
   if (!entries) throw new StackError(`${stack.id}: the stack history isn't JSON`);
-  return entries[0];
+  return entries;
 }
 
 /** Stack outputs including secrets, compared in memory only and never printed */

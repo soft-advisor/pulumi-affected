@@ -1,20 +1,35 @@
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { join, resolve } from 'node:path';
-import type { DependencyGraph } from '../graph.ts';
-import { dependentsOf } from '../graph.ts';
-import { errorText, type PulumiRunner } from '../pulumi/runner.ts';
-import { latestUpdate, readOutputs, stateFingerprint } from '../pulumi/stack.ts';
+import { parse as parseYaml } from 'yaml';
+import type { IgnoreRule } from '../classify.ts';
+import { loadConfig } from '../config.ts';
+import { CycleError, computeWaves, type DependencyGraph, dependentsOf } from '../graph.ts';
+import { matchesAnyStack } from '../patterns.ts';
+import { errorText, onCancel, type PulumiRunner } from '../pulumi/runner.ts';
+import { recentUpdates, stateFingerprint } from '../pulumi/stack.ts';
 import { readDependencyGraph } from '../select.ts';
-import { git, repoRootOf } from '../snapshot.ts';
+import { GitSnapshot, git, repoRootOf, resolveCommit } from '../snapshot.ts';
 import { mapConcurrently } from './concurrency.ts';
-import { initArgs } from './plan.ts';
-import { type Manifest, type PlannedStack, readManifest } from './manifest.ts';
+import { hashText, type Manifest, type PlannedStack, readManifest } from './manifest.ts';
+import { encryptionSaltOf, pulumiVersion } from './plan.ts';
+import { relaxPlan } from './planfile.ts';
 
 /*
  * Applies the plans `plan` wrote, exactly: `pulumi up --plan` for each, in dependency order, and
- * nothing is previewed again. Before each it checks the stack's state is still the one planned
- * from, since Pulumi itself only checks the plan against the program. Each update is tagged with
- * the plan's hash, so running apply again skips the plans that already went out.
+ * nothing is previewed again. The plans came from a job that ran the pull request's code, so
+ * everything else comes from the checked-out commit: which stacks exist, their order, the config.
+ * Before each stack it checks the state is still the one planned from, since Pulumi itself only
+ * checks the plan against the program. Each update is tagged with the plan's hash, so running
+ * apply again skips the plans that already went out.
  */
 
 export interface ApplyOptions {
@@ -24,6 +39,8 @@ export interface ApplyOptions {
   directory: string;
   runner: PulumiRunner;
   concurrency: number;
+  /** Stack patterns that may be applied; a plan for any other stack is refused */
+  allow?: string[];
   onFinish?: (result: StackApplyResult) => void;
 }
 
@@ -35,22 +52,23 @@ export type ApplyOutcome =
   /** The stack's state changed since the plan; nothing was applied */
   | 'refused'
   | 'failed'
-  /** A stack it depends on wasn't applied */
+  /** A stack it depends on wasn't applied, or changes outputs this plan was made without */
   | 'skipped';
 
 export interface StackApplyResult {
   id: string;
   outcome: ApplyOutcome;
   error?: string;
-  /** Stacks outside the plans that read this one's outputs, which changed */
-  needsPlan?: string[];
+  /** Plan properties left open by ignore rules, as "<URN> <property>" */
+  relaxed?: string[];
 }
 
 export interface ApplyResult {
   manifest: Manifest;
   stacks: StackApplyResult[];
-  /** Stacks that read outputs an apply changed and weren't planned with them */
+  /** Stacks that read outputs the applied plans change, and need planning again */
   needsPlan: string[];
+  warnings: string[];
   ok: boolean;
 }
 
@@ -59,6 +77,8 @@ export class ApplyError extends Error {}
 export function updateMessage(stack: PlannedStack) {
   return `pulumi-affected:${stack.planHash}`;
 }
+
+const DONE = new Set<ApplyOutcome>(['applied', 'already-applied']);
 
 export async function applyPlans(options: ApplyOptions): Promise<ApplyResult> {
   const repoRoot = repoRootOf(options.cwd);
@@ -75,67 +95,153 @@ export async function applyPlans(options: ApplyOptions): Promise<ApplyResult> {
       `The plans are for tree ${manifest.tree}, but the checkout is ${tree}; check out the planned code or plan again`,
     );
   }
-  // The manifest's stacks must be ones this code defines, in the folders it defines them in
-  const { stacks: known } = readDependencyGraph({ cwd: repoRoot });
-  // Pulumi itself writes encryption salts into stack config files, so those may differ
-  const configFiles = new Set(known.map((stack) => stack.configFile));
-  const modified = git(repoRoot, ['diff', '--name-only', '-z', 'HEAD'])
-    .split('\0')
-    .filter((path) => path && !configFiles.has(path));
-  if (modified.length > 0) {
-    throw new ApplyError(
-      `The checkout has changes the plans weren't made from: ${modified.join(', ')}`,
-    );
-  }
+
+  // Stacks, their order and the config come from the commit, never from files beside it
+  const commit = resolveCommit(repoRoot, 'HEAD');
+  const config = loadConfig(new GitSnapshot(repoRoot, commit));
+  const { stacks: known, graph } = readDependencyGraph({ cwd: repoRoot, head: commit, config });
+  checkCheckout(repoRoot, directory, known);
   const byId = new Map(known.map((stack) => [stack.id, stack]));
   for (const stack of manifest.stacks) {
     const match = byId.get(stack.id);
     if (!match || match.dir !== stack.dir || match.stack !== stack.stack) {
-      throw new ApplyError(`${stack.id} in the manifest isn't a stack this checkout defines`);
+      throw new ApplyError(`${stack.id} in the manifest isn't a stack this commit defines`);
+    }
+    if (options.allow && !matchesAnyStack(options.allow, match)) {
+      throw new ApplyError(`${stack.id} has a plan but isn't one of the stacks allowed to apply`);
     }
   }
 
-  const graph: DependencyGraph = new Map(
-    Object.entries(manifest.dependencies).map(([id, deps]) => [id, new Set(deps)]),
-  );
-  const planned = new Set(manifest.stacks.map((stack) => stack.id));
+  const warnings: string[] = [];
+  const version = await pulumiVersion(options.runner);
+  if (version !== manifest.pulumiVersion) {
+    warnings.push(`Planned with Pulumi ${manifest.pulumiVersion}, applying with ${version}`);
+  }
+
+  const planned = new Map(manifest.stacks.map((stack) => [stack.id, stack]));
   const results = new Map<string, StackApplyResult>();
-  const waves = [...new Set(manifest.stacks.map((stack) => stack.wave))].sort((a, b) => a - b);
-  for (const wave of waves) {
-    const stacks = manifest.stacks.filter((stack) => stack.wave === wave);
+  for (const wave of applyWaves(graph, [...planned.keys()])) {
+    const stacks = wave.map((id) => planned.get(id) as PlannedStack);
     await mapConcurrently(stacks, options.concurrency, async (stack) => {
-      const blocked = [...(graph.get(stack.id) ?? [])].filter((dependency) => {
-        const result = results.get(dependency);
-        return result && result.outcome !== 'applied' && result.outcome !== 'already-applied';
-      });
-      const result: StackApplyResult = blocked.length
-        ? { id: stack.id, outcome: 'skipped', error: `not applied: ${blocked.join(', ')}` }
-        : await applyStack(stack, {
-            ...options,
-            directory,
-            configFile: byId.get(stack.id)?.configFile ?? '',
-            repoRoot,
-            dependents: dependentsOf(graph, stack.id).filter((id) => !planned.has(id)),
-          });
+      const result =
+        blockedBy(stack, graph, planned, results) ??
+        (await applyStack(stack, {
+          ...options,
+          directory,
+          repoRoot,
+          configFile: byId.get(stack.id)?.configFile ?? '',
+          ignore: config.classify.ignore,
+        }));
       results.set(stack.id, result);
       options.onFinish?.(result);
     });
   }
+
   const stacks = manifest.stacks.map((stack) => results.get(stack.id) as StackApplyResult);
+  const applied = (id: string) => DONE.has(results.get(id)?.outcome ?? 'failed');
+  // A stack reading outputs that an applied plan changes was planned (or deployed) without them
+  const needsPlan = new Set<string>();
+  for (const stack of manifest.stacks) {
+    if (stack.outputs.length === 0 || !applied(stack.id)) continue;
+    for (const dependent of dependentsOf(graph, stack.id)) {
+      if (!applied(dependent)) needsPlan.add(dependent);
+    }
+  }
   return {
     manifest,
     stacks,
-    needsPlan: [...new Set(stacks.flatMap((stack) => stack.needsPlan ?? []))].sort(),
-    ok: stacks.every((stack) => stack.outcome === 'applied' || stack.outcome === 'already-applied'),
+    needsPlan: [...needsPlan].sort(),
+    warnings,
+    ok: stacks.every((stack) => DONE.has(stack.outcome)),
   };
+}
+
+/** Waves of the planned stacks by the commit's dependencies; one stack at a time if they cycle */
+function applyWaves(graph: DependencyGraph, ids: string[]) {
+  try {
+    return computeWaves(graph, ids);
+  } catch (error) {
+    if (!(error instanceof CycleError)) throw error;
+    return [...ids].sort().map((id) => [id]);
+  }
+}
+
+/** Why a stack can't apply because of a planned stack it depends on */
+function blockedBy(
+  stack: PlannedStack,
+  graph: DependencyGraph,
+  planned: Map<string, PlannedStack>,
+  results: Map<string, StackApplyResult>,
+): StackApplyResult | undefined {
+  const dependencies = [...(graph.get(stack.id) ?? [])].filter((id) => planned.has(id));
+  const notApplied = dependencies.filter((id) => !DONE.has(results.get(id)?.outcome ?? 'failed'));
+  if (notApplied.length > 0) {
+    return { id: stack.id, outcome: 'skipped', error: `not applied: ${notApplied.join(', ')}` };
+  }
+  // Its plan was made with those stacks' outputs as they were before
+  const changed = dependencies.filter((id) => (planned.get(id)?.outputs.length ?? 0) > 0);
+  if (changed.length > 0) {
+    return {
+      id: stack.id,
+      outcome: 'skipped',
+      error: `plan it again: it was planned before ${changed.join(', ')} changed outputs`,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * The checkout must be the commit: nothing modified or added, except the plan directory and the
+ * encryption salts Pulumi writes into stack config files
+ */
+function checkCheckout(repoRoot: string, directory: string, known: { configFile: string }[]) {
+  const planFolder = relative(repoRoot, directory);
+  const insidePlans = (path: string) =>
+    planFolder !== '' &&
+    !planFolder.startsWith('..') &&
+    !isAbsolute(planFolder) &&
+    (path === planFolder || path.startsWith(`${planFolder}/`));
+  const configFiles = new Set(known.map((stack) => stack.configFile));
+  const split = (text: string) => text.split('\0').filter(Boolean);
+  const changed = [
+    ...split(git(repoRoot, ['diff', '--name-only', '-z', 'HEAD'])),
+    ...split(git(repoRoot, ['ls-files', '--others', '--exclude-standard', '-z'])),
+  ].filter(
+    (path) => !insidePlans(path) && !(configFiles.has(path) && onlySaltChanged(repoRoot, path)),
+  );
+  if (changed.length > 0) {
+    throw new ApplyError(
+      `The checkout has files the commit doesn't: ${changed.join(', ')}; apply from a clean checkout`,
+    );
+  }
+}
+
+/** Whether a config file differs from the commit's only in its encryption salt */
+function onlySaltChanged(repoRoot: string, path: string) {
+  const full = join(repoRoot, path);
+  if (!existsSync(full)) return false;
+  let committed = '';
+  try {
+    committed = git(repoRoot, ['show', `HEAD:${path}`]);
+  } catch {
+    // Added since the commit
+  }
+  const withoutSalt = (text: string) => {
+    const { encryptionsalt: _, ...rest } = (parseYaml(text) ?? {}) as Record<string, unknown>;
+    return rest;
+  };
+  try {
+    return isDeepStrictEqual(withoutSalt(committed), withoutSalt(readFileSync(full, 'utf8')));
+  } catch {
+    return false;
+  }
 }
 
 interface StackContext extends ApplyOptions {
   directory: string;
-  configFile: string;
   repoRoot: string;
-  /** Unplanned stacks that read this one's outputs */
-  dependents: string[];
+  configFile: string;
+  ignore: readonly IgnoreRule[];
 }
 
 async function applyStack(stack: PlannedStack, context: StackContext): Promise<StackApplyResult> {
@@ -144,56 +250,64 @@ async function applyStack(stack: PlannedStack, context: StackContext): Promise<S
   const fail = (error: string): StackApplyResult => ({ id: stack.id, outcome: 'failed', error });
   try {
     const current = await stateFingerprint(runner, stack);
-    if (current.kind === 'exists' && (await appliedBefore(stack, runner, message))) {
-      // An earlier run applied this plan; one without changes leaves the state as planned
+    if (current.kind === 'missing') return fail('the stack no longer exists');
+    if (await appliedBefore(stack, runner, message)) {
       return { id: stack.id, outcome: 'already-applied' };
     }
-    if (stack.state.kind === 'exists') {
-      if (current.kind === 'missing') return fail('the stack no longer exists');
-      if (current.fingerprint !== stack.state.fingerprint) return refused(stack);
-    } else if (current.kind === 'exists') {
-      // Created since planning, by someone else
-      return refused(stack);
-    } else {
-      const init = await runner.run(stack, initArgs(context.repoRoot, context.configFile));
-      if (init.code !== 0) return fail(`couldn't create the stack: ${errorText(init)}`);
+    if (current.fingerprint !== stack.fingerprint) {
+      return {
+        id: stack.id,
+        outcome: 'refused',
+        error: "the stack's state changed since it was planned; plan it again",
+      };
     }
+    restoreSalt(stack, join(context.repoRoot, context.configFile));
 
-    const before = context.dependents.length > 0 ? await readOutputs(runner, stack) : undefined;
-    const planPath = join(context.directory, stack.plan);
-    const up = await runner.run(stack, [
-      'up',
-      '--yes',
-      '--non-interactive',
-      '--skip-preview',
-      '--plan',
-      planPath,
-      '--message',
-      message,
-    ]);
-    if (up.code !== 0) return fail(errorText(up));
-    if (before === undefined) return { id: stack.id, outcome: 'applied' };
-    const after = await readOutputs(runner, stack);
-    return {
-      id: stack.id,
-      outcome: 'applied',
-      needsPlan: isDeepStrictEqual(before, after) ? undefined : context.dependents,
-    };
+    // Checked again here: programs and wrappers that ran earlier in this job could change files
+    const text = readFileSync(join(context.directory, stack.plan));
+    if (hashText(text) !== stack.planHash)
+      return fail(`${stack.plan} changed since it was checked`);
+    const { text: plan, relaxed } = relaxPlan(text.toString('utf8'), context.ignore);
+    const folder = mkdtempSync(join(tmpdir(), 'pulumi-affected-apply-'));
+    const cleanup = () => rmSync(folder, { recursive: true, force: true });
+    const unregister = onCancel(cleanup);
+    try {
+      const planPath = join(folder, 'plan.json');
+      writeFileSync(planPath, plan);
+      const up = await runner.run(stack, [
+        'up',
+        '--yes',
+        '--non-interactive',
+        '--skip-preview',
+        '--plan',
+        planPath,
+        '--message',
+        message,
+      ]);
+      if (up.code !== 0) return { ...fail(errorText(up)), relaxed };
+      return { id: stack.id, outcome: 'applied', relaxed };
+    } finally {
+      unregister();
+      cleanup();
+    }
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
   }
 }
 
-/** Whether the stack's latest update applied this plan */
+/** Whether an update in the stack's recent history applied this plan */
 async function appliedBefore(stack: PlannedStack, runner: PulumiRunner, message: string) {
-  const latest = await latestUpdate(runner, stack);
-  return latest?.message === message && latest.result === 'succeeded';
+  const updates = await recentUpdates(runner, stack);
+  return updates.some((update) => update.message === message && update.result === 'succeeded');
 }
 
-function refused(stack: PlannedStack): StackApplyResult {
-  return {
-    id: stack.id,
-    outcome: 'refused',
-    error: "the stack's state changed since it was planned; plan it again",
-  };
+/**
+ * Puts back the encryption salt of a stack `plan` created, which its plan's secrets are encrypted
+ * with, when the checkout's config file doesn't have one
+ */
+function restoreSalt(stack: PlannedStack, configPath: string) {
+  if (!stack.encryptionSalt || encryptionSaltOf(configPath) !== undefined) return;
+  const existing = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
+  const separator = existing === '' || existing.endsWith('\n') ? '' : '\n';
+  appendFileSync(configPath, `${separator}encryptionsalt: ${stack.encryptionSalt}\n`);
 }

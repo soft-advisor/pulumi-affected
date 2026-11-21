@@ -17,6 +17,11 @@ inputs:
   run-id:
     description: 'The workflow run whose artifact to download. Default: the newest run that planned this tree.'
     required: false
+  stacks:
+    description: >-
+      Stack patterns that may be applied, separated by commas or newlines. A plan for any other
+      stack fails the apply before anything is applied. Default: any stack.
+    required: false
   working-directory:
     description: 'A folder inside the repository. Default: the workspace.'
     required: false
@@ -49,7 +54,7 @@ outputs:
     description: Absolute path of the plan directory.
     value: ${{ steps.apply.outputs.directory }}
   result:
-    description: JSON with each stack's outcome (applied, already-applied, refused, failed, skipped) and needsPlan.
+    description: JSON with each stack's outcome (applied, already-applied, refused, failed, skipped), needsPlan and warnings.
     value: ${{ steps.apply.outputs.result }}
   needs-plan:
     description: JSON array of unplanned stacks that read outputs the apply changed.
@@ -63,7 +68,7 @@ runs:
   steps:
     - id: locate
       shell: bash
-      run: node "$GITHUB_ACTION_PATH/dist/index.cjs" locate
+      run: exec node "$GITHUB_ACTION_PATH/dist/index.cjs" locate
       env:
         INPUT_DIRECTORY: ${{ inputs.directory }}
         INPUT_RUN_ID: ${{ inputs.run-id }}
@@ -78,9 +83,11 @@ runs:
         path: ${{ steps.locate.outputs.directory }}
     - id: apply
       shell: bash
-      run: node "$GITHUB_ACTION_PATH/dist/index.cjs" apply
+      # exec, so a cancelled job's signal reaches node, which stops Pulumi cleanly
+      run: exec node "$GITHUB_ACTION_PATH/dist/index.cjs" apply
       env:
         INPUT_PLANS: ${{ steps.locate.outputs.directory }}
+        INPUT_STACKS: ${{ inputs.stacks }}
         INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
         INPUT_COMMAND: ${{ inputs.command }}
         INPUT_CONCURRENCY: ${{ inputs.concurrency }}

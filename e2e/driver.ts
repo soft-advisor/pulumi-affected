@@ -33,12 +33,12 @@ interface Scenario {
   changed: string[];
   /** Stacks whose plan is applied after merge */
   applied: string[];
-  /** The plan action's create-stacks input */
-  createStacks?: 'plan' | 'apply';
   /** A stack to update after planning, so applying its plan is refused */
   changeState?: string;
   /** Stacks whose plan is refused */
   refused?: string[];
+  /** Stacks skipped because a stack they read changed outputs after they were planned */
+  replan?: string[];
   /** A line printed before Pulumi's output, like a wrapper's banner */
   banner?: string;
   /** The package manager the fixtures use; npm when absent */
@@ -211,7 +211,6 @@ function prepare(index: number, dir: string) {
   output('base-sha', baseSha);
   output('head-sha', head);
   output('banner', scenario.banner ?? '');
-  output('create-stacks', scenario.createStacks ?? 'plan');
 }
 
 function writeChanges(dir: string, changes: Record<string, string | null>) {
@@ -261,7 +260,7 @@ function assertSelect(index: number, file: string) {
 }
 
 interface Manifest {
-  stacks: { id: string; state: { kind: string } }[];
+  stacks: { id: string }[];
   failed: { id: string }[];
 }
 
@@ -284,11 +283,6 @@ function assertPlans(index: number, directory: string) {
     scenario.changed,
     'plans',
   );
-  if (scenario.createStacks === 'apply') {
-    for (const stack of manifest.stacks) {
-      check(stack.state.kind === 'created-on-apply', `${stack.id} was created when planning`);
-    }
-  }
 }
 
 function merge(number: string, index: number, dir: string, planned: string) {
@@ -342,8 +336,10 @@ interface ApplyResult {
 function assertApply(index: number) {
   const scenario = scenarios[index];
   const refused = scenario.refused ?? [];
-  // Applying fails when planning failed or a plan is refused
-  const expectedOutcome = scenario.failing?.length || refused.length ? 'failure' : 'success';
+  const replan = scenario.replan ?? [];
+  // Applying fails when planning failed, or a plan is refused or skipped
+  const expectedOutcome =
+    scenario.failing?.length || refused.length || replan.length ? 'failure' : 'success';
   check(
     process.env.APPLY_OUTCOME === expectedOutcome,
     `the apply step was ${process.env.APPLY_OUTCOME}, expected ${expectedOutcome}`,
@@ -353,6 +349,7 @@ function assertApply(index: number) {
     of.stacks.filter((stack) => stack.outcome === outcome).map((stack) => stack.id);
   same(withOutcome('applied', result), scenario.applied, 'applied');
   same(withOutcome('refused', result), refused, 'refused');
+  same(withOutcome('skipped', result), replan, 'skipped to plan again');
   if (expectedOutcome === 'success') {
     // Applying the same plans again finds them all applied already
     const again = JSON.parse(process.env.REAPPLY_RESULT || '{"stacks":[]}') as ApplyResult;

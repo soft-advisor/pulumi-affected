@@ -18,7 +18,7 @@ export function renderPlan(manifest: Manifest, marker: (index: number) => string
   const rows = [
     ...manifest.stacks.map(
       (stack) =>
-        `| ${code(stack.id)} | ${stack.keptForDependents ? 'no changes; kept as other stacks read its outputs' : safeText(countsOf(stack))}${stack.state.kind === 'created-on-apply' ? ', new stack' : stack.created ? ', created' : ''} | ${stack.reasons.map(reasonText).join('<br>')} |`,
+        `| ${code(stack.id)} | ${planSummary(stack, manifest)} | ${stack.reasons.map(reasonText).join('<br>')} |`,
     ),
     ...manifest.failed.map(
       (stack) =>
@@ -63,6 +63,8 @@ export function renderApply(result: ApplyResult, marker: (index: number) => stri
     result.needsPlan.length > 0
       ? `**Plan again:** these stacks read outputs that changed: ${result.needsPlan.map(code).join(', ')}`
       : '',
+    ...result.warnings.map((warning) => `> ${safeText(warning)}`),
+    relaxedNote(result),
   ]
     .filter(Boolean)
     .join('\n\n');
@@ -77,6 +79,27 @@ export function renderApply(result: ApplyResult, marker: (index: number) => stri
   ];
   const bodies = splitComments(heading, intro || 'Nothing to apply.', sections, marker);
   return { summary: [heading, intro, ...sections].join('\n\n'), bodies };
+}
+
+/** Plan properties left open by ignore rules, so reviewers can see what wasn't held to the plan */
+function relaxedNote(result: ApplyResult) {
+  const relaxed = result.stacks.flatMap((stack) => stack.relaxed ?? []);
+  if (relaxed.length === 0) return '';
+  return `<details><summary>${relaxed.length} properties left open by <code>classify.ignore</code></summary>\n\n${relaxed.map((entry) => `- ${code(entry)}`).join('\n')}\n\n</details>`;
+}
+
+function planSummary(stack: PlannedStack, manifest: Manifest) {
+  const parts = [safeText(countsOf(stack))];
+  if (stack.outputs.length > 0) parts.push(`outputs: ${stack.outputs.map(code).join(', ')}`);
+  if (stack.created) parts.push('new stack');
+  // Its plan reads outputs that another plan changes, so applying it waits for a new plan
+  const stale = (manifest.dependencies[stack.id] ?? []).filter((id) =>
+    manifest.stacks.some((other) => other.id === id && other.outputs.length > 0),
+  );
+  if (stale.length > 0) {
+    parts.push(`**plan again after** ${stale.map(code).join(', ')} **is applied**`);
+  }
+  return parts.join('; ');
 }
 
 function planHeadline(manifest: Manifest) {

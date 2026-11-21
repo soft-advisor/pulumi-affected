@@ -5,8 +5,8 @@
       "org/lib/naming.ts": "export function accountName(alias: string) {\n  return `acme-${alias}`;\n}\n\nexport function zoneName(domain: string) {\n  return `${domain.toLowerCase()}.`;\n}\n"
     },
     "expected": ["fixture-dns/prod"],
-    "changed": [],
-    "applied": []
+    "changed": ["fixture-dns/prod"],
+    "applied": ["fixture-dns/prod"]
   },
   {
     "name": "shared function used by a multi-stack project",
@@ -41,9 +41,10 @@
       "site/site/index.html": "<h1>Hello, world</h1>\n"
     },
     "expected": ["fixture-site/dev", "fixture-site/prod"],
-    "changed": ["fixture-site/dev"],
+    "changed": ["fixture-site/dev", "fixture-site/prod"],
     "applied": ["fixture-site/dev"],
-    "waves": [["fixture-site/dev"], ["fixture-site/prod"]]
+    "waves": [["fixture-site/dev"], ["fixture-site/prod"]],
+    "replan": ["fixture-site/prod"]
   },
   {
     "name": "docs only",
@@ -69,7 +70,7 @@
     },
     "expected": ["fixture-accounts/business", "fixture-accounts/shop"],
     "failing": ["fixture-accounts/shop"],
-    "changed": ["fixture-accounts/business"],
+    "changed": [],
     "applied": []
   },
   {
@@ -80,16 +81,6 @@
     "expected": ["fixture-accounts/newco"],
     "changed": ["fixture-accounts/newco"],
     "applied": ["fixture-accounts/newco"]
-  },
-  {
-    "name": "a new stack, created when applied",
-    "changes": {
-      "org/accounts/Pulumi.newco2.yaml": "config:\n  fixture-accounts:alias: newco2\n"
-    },
-    "expected": ["fixture-accounts/newco2"],
-    "changed": ["fixture-accounts/newco2"],
-    "applied": ["fixture-accounts/newco2"],
-    "createStacks": "apply"
   },
   {
     "name": "a stack whose state changed after planning",

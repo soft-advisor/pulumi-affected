@@ -18,6 +18,7 @@ import {
   setOutput,
   warning,
 } from './github.ts';
+import { splitPatterns } from '../patterns.ts';
 import { positiveInteger, pullRequestNumber } from './inputs.ts';
 
 /*
@@ -27,6 +28,15 @@ import { positiveInteger, pullRequestNumber } from './inputs.ts';
  */
 
 const APPLY_COMMENT_FILE = 'apply-comment.md';
+
+/** A run of this repository's own branches; a fork's run could upload any plans */
+function isOwnRun(run: { repository_id?: number; head_repository_id?: number } | undefined) {
+  return (
+    typeof run?.repository_id === 'number' &&
+    typeof run.head_repository_id === 'number' &&
+    run.repository_id === run.head_repository_id
+  );
+}
 
 interface Artifact {
   id: number;
@@ -56,14 +66,10 @@ async function locate() {
       'GET',
       api.repo(`/actions/artifacts?name=${encodeURIComponent(name)}&per_page=100`),
     );
-    // Only artifacts from this repository's own branches: a fork's run could upload any plans
     const usable = artifacts
       .filter(
         (artifact) =>
-          artifact.name === name &&
-          !artifact.expired &&
-          artifact.workflow_run &&
-          artifact.workflow_run.head_repository_id === artifact.workflow_run.repository_id,
+          artifact.name === name && !artifact.expired && isOwnRun(artifact.workflow_run),
       )
       .sort((a, b) => b.created_at.localeCompare(a.created_at));
     if (usable.length === 0) {
@@ -72,6 +78,20 @@ async function locate() {
       );
     }
     runId = String(usable[0].workflow_run?.id);
+  } else {
+    const token = input('github-token');
+    if (!token) throw new Error('No github-token to check run-id');
+    const api = new GitHubApi(token);
+    const run = await api.request<{
+      id: number;
+      repository?: { id?: number };
+      head_repository?: { id?: number };
+    }>('GET', api.repo(`/actions/runs/${encodeURIComponent(runId)}`));
+    if (
+      !isOwnRun({ repository_id: run.repository?.id, head_repository_id: run.head_repository?.id })
+    ) {
+      throw new Error(`Run ${runId} isn't from this repository's own branches`);
+    }
   }
   setOutput('download', 'true');
   setOutput('name', name);
@@ -87,21 +107,30 @@ async function apply() {
     directory,
     runner: commandRunner(input('command') || DEFAULT_COMMAND, repoRootOf(cwd)),
     concurrency: positiveInteger('concurrency', 4),
+    allow: input('stacks') ? splitPatterns(input('stacks')) : undefined,
     onFinish: (stack) => {
       if (stack.error) printUntrusted(`${stack.id}: ${stack.outcome}\n${stack.error}`);
       else console.log(`${stack.id}: ${stack.outcome}`);
     },
   });
+  for (const message of result.warnings) warning(message);
   const report = renderApply(result, (index) => marker('apply', index));
   writeFileSync(join(directory, APPLY_COMMENT_FILE), report.bodies.join('\n\n'));
   appendSummary(report.summary);
   setOutput('directory', directory);
-  setOutput('result', JSON.stringify({ stacks: result.stacks, needsPlan: result.needsPlan }));
+  setOutput(
+    'result',
+    JSON.stringify({
+      stacks: result.stacks,
+      needsPlan: result.needsPlan,
+      warnings: result.warnings,
+    }),
+  );
   setOutput('needs-plan', JSON.stringify(result.needsPlan));
   setOutput('failed', result.ok ? 'false' : 'true');
   if (result.needsPlan.length > 0) {
     warning(
-      `Outputs changed that these unplanned stacks read; plan them: ${result.needsPlan.join(', ')}`,
+      `These stacks read outputs the plans changed; plan them again: ${result.needsPlan.join(', ')}`,
     );
   }
 
@@ -112,7 +141,13 @@ async function apply() {
     if (number === undefined)
       notice('No pull request found for this commit, so the apply isn’t commented');
     else if (!token) warning('No github-token, so the apply isn’t commented');
-    else await syncComments(new GitHubApi(token), number, 'apply', report.bodies);
+    else {
+      try {
+        await syncComments(new GitHubApi(token), number, 'apply', report.bodies);
+      } catch (caught) {
+        warning(`Couldn't comment the apply: ${caught instanceof Error ? caught.message : caught}`);
+      }
+    }
   }
   if (!result.ok) error('Not every plan was applied');
 }

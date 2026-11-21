@@ -1,14 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { type Classification, classify, type IgnoreRule } from '../classify.ts';
 import { loadConfig } from '../config.ts';
-import { type DependencyGraph, dependentsOf } from '../graph.ts';
-import { errorText, onCancel, type PulumiRunner } from '../pulumi/runner.ts';
+import { errorText, type PulumiRunner } from '../pulumi/runner.ts';
 import { secretsProviderOf, stateFingerprint } from '../pulumi/stack.ts';
 import { type SelectedStack, type SelectOptions, select } from '../select.ts';
 import { git, repoRootOf, WorktreeSnapshot } from '../snapshot.ts';
 import { mapConcurrently } from './concurrency.ts';
+import { stackOutputChanges } from './planfile.ts';
 import {
   hashFile,
   type Manifest,
@@ -19,12 +19,10 @@ import {
 
 /*
  * Plans the stacks a change affects: selects them, previews each with --save-plan, keeps the
- * plans that would change something, and writes them with a manifest for `apply`. A stack that
- * doesn't exist yet is created empty first, or, with createStacks: 'apply', previewed in a
- * temporary local backend and created when its plan is applied.
+ * plans that would change a resource or a stack output, and writes them with a manifest for
+ * `apply`. A stack that doesn't exist yet is created, empty, first: Pulumi can only plan for a
+ * stack that exists, with the stacks it references and its secrets provider.
  */
-
-export type CreateStacks = 'plan' | 'apply';
 
 export interface PlanOptions {
   select: Omit<SelectOptions, 'head'>;
@@ -32,7 +30,6 @@ export interface PlanOptions {
   directory: string;
   runner: PulumiRunner;
   concurrency: number;
-  createStacks: CreateStacks;
   onFinish?: (outcome: StackOutcome) => void;
 }
 
@@ -47,9 +44,6 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
   mkdirSync(directory, { recursive: true });
   const config = options.select.config ?? loadConfig(new WorktreeSnapshot(repoRoot));
   const selection = select({ ...options.select, config });
-  const graph: DependencyGraph = new Map(
-    Object.entries(selection.dependencies).map(([id, deps]) => [id, new Set(deps)]),
-  );
 
   const outcomes = await mapConcurrently(selection.stacks, options.concurrency, async (stack) => {
     const outcome = await planStack(stack, {
@@ -57,14 +51,13 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
       directory,
       repoRoot,
       ignore: config.classify.ignore,
-      hasDependents: dependentsOf(graph, stack.id).length > 0,
     });
     options.onFinish?.(outcome);
     return outcome;
   });
 
   const manifest: Manifest = {
-    version: 1,
+    version: 2,
     tree: git(repoRoot, ['rev-parse', 'HEAD^{tree}']).trim(),
     head: git(repoRoot, ['rev-parse', 'HEAD']).trim(),
     base: selection.base,
@@ -90,7 +83,6 @@ interface StackContext extends PlanOptions {
   directory: string;
   repoRoot: string;
   ignore: readonly IgnoreRule[];
-  hasDependents: boolean;
 }
 
 async function planStack(stack: SelectedStack, context: StackContext): Promise<StackOutcome> {
@@ -103,26 +95,20 @@ async function planStack(stack: SelectedStack, context: StackContext): Promise<S
     return { kind: 'failed', id: stack.id, error, reasons: stack.reasons };
   };
 
-  let state: PlannedStack['state'];
+  let fingerprint: string;
   let created = false;
   let preview: { code: number; stdout: string; stderr: string };
   try {
-    const current = await stateFingerprint(context.runner, stack);
-    if (current.kind === 'exists') {
-      state = current;
-      preview = await context.runner.run(stack, previewArgs(planPath));
-    } else if (context.createStacks === 'plan') {
+    let current = await stateFingerprint(context.runner, stack);
+    if (current.kind === 'missing') {
       const init = await context.runner.run(stack, initArgs(context.repoRoot, stack.configFile));
       if (init.code !== 0) return fail(`couldn't create the stack: ${errorText(init)}`);
       created = true;
-      const fresh = await stateFingerprint(context.runner, stack);
-      if (fresh.kind !== 'exists') return fail("the stack still doesn't exist after creating it");
-      state = fresh;
-      preview = await context.runner.run(stack, previewArgs(planPath));
-    } else {
-      state = { kind: 'created-on-apply' };
-      preview = await previewInTemporaryBackend(context, stack, planPath);
+      current = await stateFingerprint(context.runner, stack);
+      if (current.kind !== 'exists') return fail("the stack still doesn't exist after creating it");
     }
+    fingerprint = current.fingerprint;
+    preview = await context.runner.run(stack, previewArgs(planPath));
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
   }
@@ -130,21 +116,21 @@ async function planStack(stack: SelectedStack, context: StackContext): Promise<S
   writeFileSync(previewPath, preview.stdout);
 
   let classification: Classification;
+  let outputs: string[];
   try {
     classification = classify(preview.stdout, context.ignore);
+    if (!existsSync(planPath)) return fail('Pulumi wrote no plan file');
+    // The preview doesn't show stack outputs that would change; the plan does
+    outputs = stackOutputChanges(readFileSync(planPath, 'utf8'));
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
   }
-  // A new stack always has something to apply: creating it. A stack others read keeps its plan,
-  // since a preview usually can't tell whether its outputs change.
-  const isNew = state.kind === 'created-on-apply' || created;
-  const keptForDependents = !classification.changed && !isNew && context.hasDependents;
-  if (!classification.changed && !isNew && !keptForDependents) {
+  // A new stack always has something to apply: creating it
+  if (!classification.changed && outputs.length === 0 && !created) {
     rmSync(planPath, { force: true });
     rmSync(previewPath, { force: true });
     return { kind: 'unchanged', id: stack.id, reasons: stack.reasons };
   }
-  if (!existsSync(planPath)) return fail('Pulumi wrote no plan file');
   return {
     kind: 'planned',
     stack: {
@@ -153,14 +139,17 @@ async function planStack(stack: SelectedStack, context: StackContext): Promise<S
       dir: stack.dir,
       stack: stack.stack,
       wave: stack.wave,
-      state,
+      fingerprint,
       created,
+      encryptionSalt: created
+        ? encryptionSaltOf(join(context.repoRoot, stack.configFile))
+        : undefined,
       plan: files.plan,
       preview: files.preview,
       planHash: hashFile(planPath),
       counts: classification.counts,
       changes: classification.changes,
-      keptForDependents,
+      outputs,
       reasons: stack.reasons,
     },
   };
@@ -182,48 +171,19 @@ export function initArgs(repoRoot: string, configFile: string) {
   ];
 }
 
-/**
- * Previews a stack that doesn't exist yet in a temporary local backend, so nothing is written to
- * the real one before its plan is applied. Pulumi writes an encryption salt into the stack's
- * config file when it creates the stack there; the file is restored afterwards. This runs plain
- * `pulumi`, not the command template, since a wrapper may pick the real backend itself.
- */
-async function previewInTemporaryBackend(
-  context: StackContext,
-  stack: SelectedStack,
-  planPath: string,
-) {
-  const backend = mkdtempSync(join(tmpdir(), 'pulumi-affected-backend-'));
-  const configPath = join(context.repoRoot, stack.configFile);
-  const original = existsSync(configPath) ? readFileSync(configPath, 'utf8') : undefined;
-  const restore = () => {
-    if (original === undefined) rmSync(configPath, { force: true });
-    else writeFileSync(configPath, original);
-    rmSync(backend, { recursive: true, force: true });
-  };
-  const unregister = onCancel(restore);
-  const env: NodeJS.ProcessEnv = {
-    PULUMI_BACKEND_URL: `file://${backend}`,
-    PULUMI_CONFIG_PASSPHRASE: process.env.PULUMI_CONFIG_PASSPHRASE ?? '',
-  };
-  const cwd = stack.dir === '' ? '.' : stack.dir;
+/** The `encryptionsalt` in a stack's config file, if any */
+export function encryptionSaltOf(path: string) {
+  if (!existsSync(path)) return undefined;
   try {
-    const init = await context.runner.runPulumi(
-      ['--cwd', cwd, '--stack', stack.stack, ...initArgs(context.repoRoot, stack.configFile)],
-      env,
-    );
-    if (init.code !== 0) return init;
-    return await context.runner.runPulumi(
-      ['--cwd', cwd, '--stack', stack.stack, ...previewArgs(planPath)],
-      env,
-    );
-  } finally {
-    unregister();
-    restore();
+    const salt = (parseYaml(readFileSync(path, 'utf8')) as { encryptionsalt?: unknown } | null)
+      ?.encryptionsalt;
+    return typeof salt === 'string' ? salt : undefined;
+  } catch {
+    return undefined;
   }
 }
 
-async function pulumiVersion(runner: PulumiRunner) {
+export async function pulumiVersion(runner: PulumiRunner) {
   const result = await runner.runPulumi(['version'], {});
   return result.code === 0 ? result.stdout.trim() : 'unknown';
 }

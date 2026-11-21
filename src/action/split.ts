@@ -20,7 +20,7 @@ export function splitComments(
   const bodies: string[] = [];
   const [first, ...more] = splitTable(intro, limit - heading.length - 400);
   let current = `${heading}\n\n${first}`;
-  for (const section of [...more, ...sections]) {
+  for (const section of [...more, ...sections].map((text) => truncate(text, limit - 1_000))) {
     if (current.length + section.length + 2 > limit - 200) {
       bodies.push(current);
       current = `${heading} (continued)`;
@@ -29,6 +29,18 @@ export function splitComments(
   }
   bodies.push(current);
   return bodies.map((body, index) => `${marker(index)}\n${body}`);
+}
+
+/** A section too long for any comment, cut short; a cut code block or details is closed again */
+function truncate(text: string, limit: number) {
+  if (text.length <= limit) return text;
+  const fences = text.match(/^`{3,}$/gm) ?? [];
+  const open = fences.length > 0 ? fences[0] : undefined;
+  let cut = `${text.slice(0, limit)}\n…cut short; see the job log`;
+  // Inside a fence, close it, so the rest of the comment renders
+  if (open && (cut.match(new RegExp(`^${open}$`, 'gm')) ?? []).length % 2 === 1) cut += `\n${open}`;
+  if (cut.includes('<details>') && !cut.includes('</details>')) cut += '\n\n</details>';
+  return cut;
 }
 
 /** A table too long for one comment, as several, each with the header rows */
