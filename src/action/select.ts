@@ -42,9 +42,15 @@ async function main() {
     return;
   }
 
+  const base = input('base') || context.base;
+  if (!base && !booleanInput('all') && !context.all) {
+    warning(
+      `A ${event.name || 'local'} run has no revision to compare with, so only requested stacks are selected; set the base input`,
+    );
+  }
   const result = select({
     cwd,
-    base: input('base') || context.base || 'HEAD',
+    base: base || 'HEAD',
     head: input('head') || undefined,
     bases: input('bases') ? JSON.parse(input('bases')) : undefined,
     run: splitPatterns(input('run')),

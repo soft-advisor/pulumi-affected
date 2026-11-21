@@ -58,7 +58,10 @@ export function renderStackDetails(run: StackRun, maxLength = COMMENT_LIMIT, run
       (change) =>
         `| ${OP_SYMBOLS[change.op] ?? cell(change.op)} | ${code(change.name)} | ${code(change.type)} | ${change.properties.map(code).join(', ')} |`,
     );
-    const outputs = run.classification?.outputs ?? [];
+    // Outputs the preview saw change, and those a deploy changed
+    const outputs = [
+      ...new Set([...(run.classification?.outputs ?? []), ...(run.changedOutputs ?? [])]),
+    ];
     if (outputs.length > 0) rows.push(`| ~ | outputs | | ${outputs.map(code).join(', ')} |`);
     body = ['| | Resource | Type | Properties |', '| --- | --- | --- | --- |', ...rows].join('\n');
     const ignored = run.classification?.ignored.length ?? 0;
@@ -84,8 +87,9 @@ export function splitComments(
   limit = COMMENT_LIMIT,
 ) {
   const bodies: string[] = [];
-  let current = `${heading}\n\n${intro}`;
-  for (const section of sections) {
+  const [first, ...more] = splitTable(intro, limit - heading.length - 400);
+  let current = `${heading}\n\n${first}`;
+  for (const section of [...more, ...sections]) {
     if (current.length + section.length + 2 > limit - 200) {
       bodies.push(current);
       current = `${heading} (continued)`;
@@ -94,6 +98,23 @@ export function splitComments(
   }
   bodies.push(current);
   return bodies.map((body, index) => `${marker(index)}\n${body}`);
+}
+
+/** A table too long for one comment, as several, each with the header rows */
+function splitTable(table: string, limit: number) {
+  if (table.length <= limit) return [table];
+  const [header, divider, ...rows] = table.split('\n');
+  const parts: string[] = [];
+  let current = `${header}\n${divider}`;
+  for (const row of rows) {
+    if (current.length + row.length + 1 > limit) {
+      parts.push(current);
+      current = `${header}\n${divider}`;
+    }
+    current += `\n${row}`;
+  }
+  parts.push(current);
+  return parts;
 }
 
 /** Text for a table cell: HTML-escaped, so repository content can't inject markup */

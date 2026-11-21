@@ -128,6 +128,12 @@ export async function eventContext(
     };
   }
 
+  if (event.name === 'merge_group') {
+    // A merge queue's group is compared with the branch it merges into
+    const group = payload.merge_group as { base_sha: string };
+    return { ...EMPTY, base: mergeBase(repoRoot, group.base_sha) };
+  }
+
   if (event.name === 'push') {
     const before = String(payload.before ?? '');
     // A new branch has no previous commit to compare with
