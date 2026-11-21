@@ -1,6 +1,6 @@
 {
   "name": "@soft-advisor/pulumi-affected",
-  "version": "0.3.0",
+  "version": "0.1.0",
   "description": "Work out which Pulumi stacks a change affects, down to the functions each stack's program uses, so CI previews and deploys only those",
   "license": "MIT",
   "type": "module",
