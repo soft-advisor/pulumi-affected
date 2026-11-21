@@ -46,13 +46,25 @@ export function renderTable(runs: StackRun[]) {
   return lines.join('\n');
 }
 
-/** A stack's details: its resource changes, or its error */
+/**
+ * A stack's details: its resource changes, or its error. Too long for `maxLength`, the error or
+ * the list of changes is cut short before it's fenced or tabled, so the Markdown stays whole.
+ */
 export function renderStackDetails(run: StackRun, maxLength = COMMENT_LIMIT, runUrl?: string) {
   const title = `<details><summary>${code(run.stack.id)}: ${cell(resultText(run))}</summary>\n\n`;
   const end = '\n\n</details>';
+  const cutNote = `\n\n…cut short; the full output is in the ${runUrl ? `[run](${runUrl})` : 'run log'}.`;
+  const notes = run.notes?.length
+    ? `${run.notes.map((note) => `> [!WARNING]\n> ${reasonText(note)}`).join('\n\n')}\n\n`
+    : '';
+  // Room for the body, keeping space for the fence or table header and the note
+  const room = maxLength - title.length - end.length - notes.length - cutNote.length - 200;
+
   let body: string;
+  let cut = false;
   if (run.error) {
-    body = fence(run.error);
+    cut = run.error.length > room;
+    body = fence(cut ? `${run.error.slice(0, Math.max(room, 0))}\n…` : run.error);
   } else {
     const changes = run.classification?.changes ?? [];
     const rows = changes.map(
@@ -64,16 +76,22 @@ export function renderStackDetails(run: StackRun, maxLength = COMMENT_LIMIT, run
       ...new Set([...(run.classification?.outputs ?? []), ...(run.changedOutputs ?? [])]),
     ];
     if (outputs.length > 0) rows.push(`| ~ | outputs | | ${outputs.map(code).join(', ')} |`);
-    body = ['| | Resource | Type | Properties |', '| --- | --- | --- | --- |', ...rows].join('\n');
+    const kept: string[] = [];
+    let length = 0;
+    for (const row of rows) {
+      if (length + row.length + 1 > room) {
+        cut = true;
+        break;
+      }
+      kept.push(row);
+      length += row.length + 1;
+    }
+    body = ['| | Resource | Type | Properties |', '| --- | --- | --- | --- |', ...kept].join('\n');
     const ignored = run.classification?.ignored.length ?? 0;
-    if (ignored > 0) body += `\n\n${ignored} ignored by \`classify.ignore\` in the config.`;
+    if (ignored > 0)
+      body += `\n\n${ignored} ignored by <code>classify.ignore</code> in the config.`;
   }
-  if (run.notes?.length)
-    body = `${run.notes.map((note) => `> [!WARNING]\n> ${reasonText(note)}`).join('\n\n')}\n\n${body}`;
-  const full = title + body + end;
-  if (full.length <= maxLength) return full;
-  const note = `\n\n…cut short; the full output is in the ${runUrl ? `[run](${runUrl})` : 'run log'}.`;
-  return title + body.slice(0, maxLength - title.length - end.length - note.length) + note + end;
+  return title + notes + body + (cut ? cutNote : '') + end;
 }
 
 /**

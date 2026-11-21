@@ -127,7 +127,7 @@ async function main(argv: string[]) {
       messages: values.message?.map((path) => readFileSync(path, 'utf8')),
       config,
       command: values.command,
-      concurrency: values.concurrency ? Number(values.concurrency) : undefined,
+      concurrency: concurrencyOption(values.concurrency),
       failFast: values['fail-fast'],
       onFinish: (run) => console.error(`${run.stack.id}: ${resultText(run) || run.status}`),
       onWarning: (message) => console.error(`warning: ${message}`),
@@ -145,6 +145,15 @@ async function main(argv: string[]) {
 }
 
 class UsageError extends Error {}
+
+function concurrencyOption(text: string | undefined) {
+  if (text === undefined) return undefined;
+  const value = Number(text);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new UsageError(`--concurrency must be a whole number of at least 1, not "${text}"`);
+  }
+  return value;
+}
 
 main(process.argv.slice(2)).then(
   (code) => {
