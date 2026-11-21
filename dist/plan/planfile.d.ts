@@ -17,3 +17,7 @@ export declare function relaxPlan(text: string, rules: readonly IgnoreRule[]): {
     text: string;
     relaxed: string[];
 };
+/** Whether a plan holds encrypted values, which only the secrets manager it was made with reads */
+export declare function planHasSecrets(text: string): boolean;
+/** Whether a plan creates nothing but the stack itself */
+export declare function createsOnlyTheStack(text: string): boolean;

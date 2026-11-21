@@ -67,7 +67,9 @@ export function readManifest(directory) {
         check(stack.plan === files.plan && stack.preview === files.preview, `unexpected file names for ${stack.id}`);
         check(FILE.test(stack.plan), `bad plan file for ${stack.id}`);
         check(SHA256.test(stack.planHash), `bad plan hash for ${stack.id}`);
-        check(SHA256.test(stack.fingerprint), `bad fingerprint for ${stack.id}`);
+        check(stack.createOnApply === true
+            ? stack.fingerprint === undefined && !stack.created
+            : stack.createOnApply === undefined && SHA256.test(stack.fingerprint ?? ''), `bad fingerprint for ${stack.id}`);
         check(stack.encryptionSalt === undefined || SALT.test(stack.encryptionSalt), `bad encryption salt for ${stack.id}`);
         check(Array.isArray(stack.outputs) && stack.outputs.every((key) => typeof key === 'string'), `bad outputs for ${stack.id}`);
         check(!ids.has(stack.id), `${stack.id} listed twice`);

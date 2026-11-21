@@ -111,3 +111,16 @@ export function relaxPlan(text: string, rules: readonly IgnoreRule[]) {
   }
   return { text: relaxed.length > 0 ? JSON.stringify(plan) : text, relaxed };
 }
+
+/** Whether a plan holds encrypted values, which only the secrets manager it was made with reads */
+export function planHasSecrets(text: string) {
+  return text.includes('"ciphertext"');
+}
+
+/** Whether a plan creates nothing but the stack itself */
+export function createsOnlyTheStack(text: string) {
+  const plan = parse(text);
+  return Object.values(plan.resourcePlans ?? {}).every(
+    (resource) => resource.goal?.type === 'pulumi:pulumi:Stack',
+  );
+}

@@ -299,4 +299,214 @@ outputs:
     const result = await apply(dir, plans, runner);
     assert.deepEqual(outcomes(result), { 'a/dev': 'applied', 'b/dev': 'applied' });
   });
+
+  describe('stacks created on apply', () => {
+    const empty = (name: string, outputs = '  ready: yes\n') =>
+      `name: ${name}\nruntime: yaml\noutputs:\n${outputs}`;
+
+    test('an empty new stack is created by apply, and its resources come in a later change', async () => {
+      const { dir, base, runner, plans } = setup({ 'Pulumi.yaml': empty('fresh') });
+      commit(dir, { 'Pulumi.prod.yaml': 'config: {}\n' });
+      const manifest = await planStacks({
+        select: { cwd: dir, base },
+        directory: plans,
+        runner,
+        concurrency: 1,
+        createStacks: 'apply',
+      });
+      assert.deepEqual(manifest.failed, []);
+      assert.deepEqual(
+        manifest.stacks.map((stack) => [stack.id, stack.createOnApply, stack.fingerprint]),
+        [['fresh/prod', true, undefined]],
+      );
+      // Nothing reached the real backend, and the config file is as committed
+      assert.doesNotMatch(run(dir, 'pulumi', ['stack', 'ls', '--json']), /"name":\s*"prod"/);
+      assert.equal(run(dir, 'git', ['status', '--porcelain']), '');
+
+      // Applied from a fresh clone, as an apply job would
+      const clone = temporary('clone');
+      run(tmpdir(), 'git', ['clone', '-q', dir, clone]);
+      const cloneRunner = commandRunner(DEFAULT_COMMAND, clone);
+      const result = await apply(clone, plans, cloneRunner);
+      assert.deepEqual(outcomes(result), { 'fresh/prod': 'applied' });
+      assert.equal(
+        JSON.parse(run(clone, 'pulumi', ['--stack', 'prod', 'stack', 'output', '--json'])).ready,
+        'yes',
+      );
+      const again = await apply(clone, plans, cloneRunner);
+      assert.deepEqual(outcomes(again), { 'fresh/prod': 'already-applied' });
+
+      // The follow-up adds resources with a secret, planned and applied in fresh clones that
+      // don't have the salt Pulumi wrote when apply created the stack
+      const followUpBase = run(dir, 'git', ['rev-parse', 'HEAD']).trim();
+      commit(dir, {
+        'Pulumi.yaml': `name: fresh\nruntime: yaml\nresources:\n  password:\n    type: random:RandomPassword\n    properties:\n      length: 12\noutputs:\n  ready: yes\n  password: \${password.result}\n`,
+      });
+      const planClone = temporary('plan-clone');
+      run(tmpdir(), 'git', ['clone', '-q', dir, planClone]);
+      const followUpPlans = temporary('plans');
+      const followUp = await planStacks({
+        select: { cwd: planClone, base: followUpBase },
+        directory: followUpPlans,
+        runner: commandRunner(DEFAULT_COMMAND, planClone),
+        concurrency: 1,
+        createStacks: 'apply',
+      });
+      assert.deepEqual(followUp.failed, []);
+      assert.deepEqual(
+        followUp.stacks.map((stack) => stack.id),
+        ['fresh/prod'],
+      );
+      const applyClone = temporary('apply-clone');
+      run(tmpdir(), 'git', ['clone', '-q', dir, applyClone]);
+      const applied = await apply(
+        applyClone,
+        followUpPlans,
+        commandRunner(DEFAULT_COMMAND, applyClone),
+      );
+      assert.deepEqual(applied.stacks, [{ id: 'fresh/prod', outcome: 'applied' }]);
+    });
+
+    test('a new stack with resources fails planning, unless the change creates it when planning', async () => {
+      const { dir, base, runner, plans } = setup();
+      commit(dir, { 'Pulumi.prod.yaml': 'config: {}\n' });
+      const manifest = await planStacks({
+        select: { cwd: dir, base, run: ['words/prod'] },
+        directory: plans,
+        runner,
+        concurrency: 1,
+        createStacks: 'apply',
+      });
+      const prod = manifest.failed.find((stack) => stack.id === 'words/prod');
+      assert.match(
+        prod?.error ?? '',
+        /must give it no resources; this one would create 1: random:index\/randomString:RandomString word/,
+      );
+
+      commit(dir, {}, 'Create it now\n\nPulumi-Affected-Create-Stacks: plan words/prod\n');
+      const overridden = await planStacks({
+        select: { cwd: dir, base, run: ['words/prod'] },
+        directory: plans,
+        runner,
+        concurrency: 1,
+        createStacks: 'apply',
+      });
+      const created = overridden.stacks.find((stack) => stack.id === 'words/prod');
+      assert.equal(created?.created, true);
+    });
+
+    test('a new stack whose plan holds secrets applies with the salt it was planned with', async () => {
+      const secret = 'name: secretive\nruntime: yaml\noutputs:\n  token:\n    fn::secret: hello\n';
+      const { dir, base, runner, plans } = setup({ 'Pulumi.yaml': secret });
+      commit(dir, { 'Pulumi.prod.yaml': 'config: {}\n' });
+      const manifest = await planStacks({
+        select: { cwd: dir, base },
+        directory: plans,
+        runner,
+        concurrency: 1,
+        createStacks: 'apply',
+      });
+      assert.deepEqual(manifest.failed, []);
+      assert.match(manifest.stacks[0]?.encryptionSalt ?? '', /^v1:/);
+      const clone = temporary('clone');
+      run(tmpdir(), 'git', ['clone', '-q', dir, clone]);
+      const result = await apply(clone, plans, commandRunner(DEFAULT_COMMAND, clone));
+      assert.deepEqual(result.stacks, [{ id: 'secretive/prod', outcome: 'applied' }]);
+
+      // Without the passphrase, the secrets couldn't be carried, so planning says so
+      const passphrase = process.env.PULUMI_CONFIG_PASSPHRASE;
+      delete process.env.PULUMI_CONFIG_PASSPHRASE;
+      try {
+        commit(dir, { 'Pulumi.qa.yaml': 'config: {}\n' });
+        const without = await planStacks({
+          select: { cwd: dir, base, run: ['secretive/qa'] },
+          directory: temporary('plans'),
+          runner,
+          concurrency: 1,
+          createStacks: 'apply',
+        });
+        assert.match(
+          without.failed.find((stack) => stack.id === 'secretive/qa')?.error ?? '',
+          /its plan holds secrets/,
+        );
+      } finally {
+        process.env.PULUMI_CONFIG_PASSPHRASE = passphrase;
+      }
+    });
+
+    test('a command template that ignores the temporary backend fails before touching the real one', async () => {
+      const { dir, base, plans } = setup({ 'Pulumi.yaml': empty('fresh') });
+      const real = process.env.PULUMI_BACKEND_URL ?? '';
+      const wrapper = join(temporary('wrapper'), 'pulumi.sh');
+      writeFileSync(wrapper, `#!/bin/sh\nPULUMI_BACKEND_URL='${real}' exec pulumi "$@"\n`);
+      commit(dir, { 'Pulumi.prod.yaml': 'config: {}\n' });
+      const manifest = await planStacks({
+        select: { cwd: dir, base },
+        directory: plans,
+        runner: commandRunner(`sh ${wrapper} --cwd {dir} --stack {stack}`, dir),
+        concurrency: 1,
+        createStacks: 'apply',
+      });
+      assert.match(manifest.failed[0]?.error ?? '', /doesn't use the temporary backend/);
+      assert.doesNotMatch(run(dir, 'pulumi', ['stack', 'ls', '--json']), /"name":\s*"prod"/);
+    });
+
+    test('apply refuses a stack marked as new whose plan has resources', async () => {
+      const { dir, base, runner, plans } = setup();
+      commit(dir, { 'Pulumi.prod.yaml': 'config: {}\n' });
+      await planStacks({
+        select: { cwd: dir, base, run: ['words/prod'] },
+        directory: plans,
+        runner,
+        concurrency: 1,
+      });
+      // As a tampered plan job could write it, for a stack apply would create
+      const path = join(plans, 'manifest.json');
+      const manifest = JSON.parse(readFileSync(path, 'utf8'));
+      for (const stack of manifest.stacks) {
+        stack.createOnApply = true;
+        stack.created = false;
+        delete stack.fingerprint;
+      }
+      writeFileSync(path, JSON.stringify(manifest));
+      run(dir, 'pulumi', [
+        'stack',
+        'rm',
+        '--yes',
+        '--force',
+        '--preserve-config',
+        '--stack',
+        'prod',
+      ]);
+      run(dir, 'git', ['checkout', '-q', '--', '.']);
+      const result = await apply(dir, plans, runner);
+      assert.match(
+        result.stacks.find((stack) => stack.id === 'words/prod')?.error ?? '',
+        /its plan has resources/,
+      );
+      assert.doesNotMatch(run(dir, 'pulumi', ['stack', 'ls', '--json']), /"name":\s*"prod"/);
+    });
+
+    test('a new stack that reads another stack previews with that stack copied in', async () => {
+      const { dir, runner, plans } = setup({
+        'up/Pulumi.yaml': 'name: up\nruntime: yaml\noutputs:\n  zone: example.com\n',
+        'up/Pulumi.dev.yaml': 'config: {}\n',
+        'down/Pulumi.yaml': `name: down\nruntime: yaml\nresources:\n  ref:\n    type: pulumi:pulumi:StackReference\n    properties:\n      name: organization/up/dev\noutputs:\n  zone: \${ref.outputs["zone"]}\n`,
+        'pulumi-affected.yaml': 'dependsOn:\n  down/*: [up/dev]\ncreateStacks:\n  default: apply\n',
+      });
+      deploy(dir, 'up');
+      const base = run(dir, 'git', ['rev-parse', 'HEAD']).trim();
+      commit(dir, { 'down/Pulumi.dev.yaml': 'config: {}\n' });
+      const manifest = await plan(dir, base, plans, runner);
+      // The reference is a resource of its own; reading a stack isn't creating anything
+      assert.deepEqual(
+        manifest.failed.map((stack) => stack.error),
+        [],
+      );
+      assert.deepEqual(
+        manifest.stacks.map((stack) => [stack.id, stack.createOnApply]),
+        [['down/dev', true]],
+      );
+    });
+  });
 });

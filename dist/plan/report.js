@@ -83,6 +83,8 @@ function planSummary(stack) {
         parts.push(`outputs: ${stack.outputs.map(code).join(', ')}`);
     if (stack.created)
         parts.push('new stack');
+    if (stack.createOnApply)
+        parts.push('new stack, created empty when applied');
     return parts.join('; ');
 }
 function planHeadline(manifest) {

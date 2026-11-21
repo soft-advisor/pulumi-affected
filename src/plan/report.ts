@@ -108,6 +108,7 @@ function planSummary(stack: PlannedStack) {
   const parts = [safeText(countsOf(stack))];
   if (stack.outputs.length > 0) parts.push(`outputs: ${stack.outputs.map(code).join(', ')}`);
   if (stack.created) parts.push('new stack');
+  if (stack.createOnApply) parts.push('new stack, created empty when applied');
   return parts.join('; ');
 }
 

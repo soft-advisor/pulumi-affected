@@ -9,7 +9,7 @@ import {
 } from './analysis/program.ts';
 import { ProgramReferences } from './analysis/references.ts';
 import { findUp, parseJson } from './analysis/resolve.ts';
-import { type Config, loadConfig } from './config.ts';
+import { type Config, type CreateStacks, loadConfig } from './config.ts';
 import { addEdge, CycleError, computeWaves, type DependencyGraph } from './graph.ts';
 import {
   findLockfile,
@@ -74,6 +74,8 @@ export interface SelectResult {
   skipped: { id: string; source: string; reasons: string[] }[];
   /** Every stack id to the ids of the stacks it depends on */
   dependencies: Record<string, string[]>;
+  /** Pulumi-Affected-Create-Stacks lines in the change, in the order they were found */
+  createStacks: CreateRequest[];
   /**
    * Stack id → dependency id → the outputs it reads from that dependency, or "all" when that
    * can't be worked out (or the dependency comes from `dependsOn`)
@@ -174,6 +176,7 @@ export function select(options: SelectOptions): SelectResult {
     reasons.delete(id);
   }
   warnings.push(...session.warnings);
+  warnings.push(...requestsFor(defaultBase).malformed);
 
   const graph = session.dependencyGraph(projects, stacks);
   warnings.push(...session.graphWarnings);
@@ -215,6 +218,7 @@ export function select(options: SelectOptions): SelectResult {
     ),
     outputsRead: session.outputsReadRecord(),
     unknownReaders: [...session.unknownReaders].sort(),
+    createStacks: requestsFor(defaultBase).create,
     warnings: [...new Set(warnings)],
   };
 }
@@ -893,12 +897,37 @@ export interface Request {
   source: string;
 }
 
-/** Pulumi-Affected-Run/Skip lines in commit messages between base and head, and in `messages` */
+/** A Pulumi-Affected-Create-Stacks line: when to create stacks, for these patterns (or all) */
+export interface CreateRequest {
+  mode: CreateStacks;
+  patterns: string[];
+  source: string;
+}
+
+/**
+ * Pulumi-Affected-Run/Skip/Create-Stacks lines in commit messages between base and head, and in
+ * `messages`
+ */
 function readRequests(repoRoot: string, base: string, options: SelectOptions) {
   const run: Request[] = [];
   const skip: Request[] = [];
+  const create: CreateRequest[] = [];
+  const malformed: string[] = [];
   const scan = (text: string, source: string) => {
     for (const line of text.split('\n')) {
+      if (/^\s*Pulumi-Affected-Create-Stacks\s*:/i.test(line)) {
+        const creation =
+          /^\s*Pulumi-Affected-Create-Stacks\s*:\s*(plan|apply)(?:\s+(.*))?\s*$/i.exec(line);
+        if (creation) {
+          const mode = creation[1].toLowerCase() as CreateStacks;
+          create.push({ mode, patterns: splitPatterns(creation[2] ?? ''), source });
+        } else {
+          malformed.push(
+            `${source}: "${line.trim()}" isn't "Pulumi-Affected-Create-Stacks: plan|apply [stacks]"`,
+          );
+        }
+        continue;
+      }
       const match = /^\s*(Pulumi-Affected-(?:Run|Skip))\s*:\s*(.+)$/i.exec(line);
       if (!match) continue;
       const list = match[1].toLowerCase() === RUN_TRAILER.toLowerCase() ? run : skip;
@@ -907,7 +936,8 @@ function readRequests(repoRoot: string, base: string, options: SelectOptions) {
   };
 
   const headRev = options.head ?? 'HEAD';
-  const log = git(repoRoot, ['log', '--format=%h%x00%B%x01', `${base}..${headRev}`]);
+  // Oldest first, so later lines (newer commits, then the pull request) take precedence
+  const log = git(repoRoot, ['log', '--reverse', '--format=%h%x00%B%x01', `${base}..${headRev}`]);
   for (const entry of log.split('\u0001')) {
     const [sha, body] = entry.trim().split('\u0000');
     if (body) scan(body, `commit ${sha}`);
@@ -917,7 +947,7 @@ function readRequests(repoRoot: string, base: string, options: SelectOptions) {
   if (options.all) run.push({ pattern: 'all', source: '--all' });
   for (const pattern of options.run ?? []) run.push({ pattern, source: '--run' });
   for (const pattern of options.skip ?? []) skip.push({ pattern, source: '--skip' });
-  return { run, skip };
+  return { run, skip, create, malformed };
 }
 
 /** The stacks in the repo and how they depend on each other, as of `head` */

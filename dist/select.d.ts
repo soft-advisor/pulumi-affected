@@ -1,5 +1,5 @@
 import { type ProjectAnalysis } from './analysis/program.ts';
-import { type Config } from './config.ts';
+import { type Config, type CreateStacks } from './config.ts';
 import { type DependencyGraph } from './graph.ts';
 import { type Project, type Stack } from './projects.ts';
 import { type Snapshot } from './snapshot.ts';
@@ -46,6 +46,8 @@ export interface SelectResult {
     }[];
     /** Every stack id to the ids of the stacks it depends on */
     dependencies: Record<string, string[]>;
+    /** Pulumi-Affected-Create-Stacks lines in the change, in the order they were found */
+    createStacks: CreateRequest[];
     /**
      * Stack id → dependency id → the outputs it reads from that dependency, or "all" when that
      * can't be worked out (or the dependency comes from `dependsOn`)
@@ -116,6 +118,12 @@ export declare function describeFactChanges(before: ProjectAnalysis, after: Proj
 export interface Request {
     pattern: string;
     /** Who or what asked, shown as the reason: "requested by <source>" */
+    source: string;
+}
+/** A Pulumi-Affected-Create-Stacks line: when to create stacks, for these patterns (or all) */
+export interface CreateRequest {
+    mode: CreateStacks;
+    patterns: string[];
     source: string;
 }
 /** The stacks in the repo and how they depend on each other, as of `head` */

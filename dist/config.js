@@ -14,6 +14,7 @@ export function defaultConfig() {
         globalInputs: [...DEFAULT_GLOBAL_INPUTS],
         packages: { ignore: [] },
         classify: { ignore: [] },
+        createStacks: { plan: [], apply: [] },
     };
 }
 const validate = new Ajv({ allErrors: true }).compile(configSchema);
@@ -49,5 +50,10 @@ export function parseConfig(text, path = CONFIG_FILE) {
         globalInputs: parsed.globalInputs ?? defaults.globalInputs,
         packages: { ignore: parsed.packages?.ignore ?? [] },
         classify: { ignore: parsed.classify?.ignore ?? [] },
+        createStacks: {
+            default: parsed.createStacks?.default,
+            plan: parsed.createStacks?.plan ?? [],
+            apply: parsed.createStacks?.apply ?? [],
+        },
     };
 }

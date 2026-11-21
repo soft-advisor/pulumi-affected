@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -7,14 +7,14 @@ import { loadConfig } from "../config.js";
 import { CycleError, computeWaves } from "../graph.js";
 import { matchesAnyStack } from "../patterns.js";
 import { errorText, onCancel } from "../pulumi/runner.js";
-import { recentUpdates, secretsProviderOf, stateFingerprint } from "../pulumi/stack.js";
+import { EMPTY_FINGERPRINT, recentUpdates, secretsProviderOf, stateFingerprint, } from "../pulumi/stack.js";
 import { readDependencyGraph, select } from "../select.js";
 import { GitSnapshot, git, repoRootOf, resolveCommit } from "../snapshot.js";
 import { mapConcurrently } from "./concurrency.js";
 import { hashText, readManifest } from "./manifest.js";
-import { encryptionSaltOf, pulumiVersion, unknownReadersWarning } from "./plan.js";
+import { initArgs, pulumiVersion, unknownReadersWarning, writeSalt } from "./plan.js";
 import { describeRead, staleReads } from "./outputs.js";
-import { relaxPlan, stackOutputChanges, unknownOutputChanges } from "./planfile.js";
+import { createsOnlyTheStack, relaxPlan, stackOutputChanges, unknownOutputChanges, } from "./planfile.js";
 export class ApplyError extends Error {
 }
 /** Tags the update with the plan and the code it's for, so a rerun recognises it */
@@ -175,6 +175,11 @@ function onlySaltChanged(repoRoot, path) {
     }
     const withoutSalt = (text) => {
         const { encryptionsalt: _, ...rest } = (parseYaml(text) ?? {});
+        // Pulumi drops an empty `config: {}` when it writes the salt
+        const config = rest.config;
+        if (config === null || (typeof config === 'object' && Object.keys(config).length === 0)) {
+            delete rest.config;
+        }
         return rest;
     };
     try {
@@ -189,20 +194,56 @@ async function applyStack(stack, context) {
     const message = updateMessage(stack, context.tree);
     const fail = (error) => ({ id: stack.id, outcome: 'failed', error });
     try {
-        const current = await stateFingerprint(runner, stack);
-        if (current.kind === 'missing')
-            return fail('the stack no longer exists');
-        if (await appliedBefore(stack, runner, message)) {
-            return { id: stack.id, outcome: 'already-applied' };
+        let current = await stateFingerprint(runner, stack);
+        const refused = {
+            id: stack.id,
+            outcome: 'refused',
+            error: "the stack's state changed since it was planned; plan it again",
+        };
+        if (stack.createOnApply) {
+            // The manifest comes from the plan job; that the plan creates nothing is checked here
+            const plan = readFileSync(join(context.directory, stack.plan), 'utf8');
+            if (!createsOnlyTheStack(plan)) {
+                return fail("it's created when applying, but its plan has resources; plan it again");
+            }
+            const configPath = join(context.repoRoot, context.configFile);
+            if (current.kind === 'missing') {
+                // With the salt the plan's secrets were encrypted with, if it carries any
+                writeSalt(configPath, stack.encryptionSalt);
+                const init = await runner.run(stack, initArgs(context.repoRoot, context.configFile));
+                if (init.code !== 0)
+                    return fail(`couldn't create the stack: ${errorText(init)}`);
+                current = await stateFingerprint(runner, stack);
+                if (current.kind === 'missing')
+                    return fail("the stack still doesn't exist after creating it");
+            }
+            else if (await appliedBefore(stack, runner, message)) {
+                return { id: stack.id, outcome: 'already-applied' };
+            }
+            else if (
+            // Created by an earlier run that stopped before applying: still empty, never updated
+            current.fingerprint !== EMPTY_FINGERPRINT ||
+                (await recentUpdates(runner, stack)).length > 0) {
+                return {
+                    ...refused,
+                    error: "it was created since it was planned, and isn't empty; plan it again",
+                };
+            }
+            else {
+                // Created by an earlier run of this plan: its salt is the one to use
+                writeSalt(configPath, current.salt ?? stack.encryptionSalt);
+            }
         }
-        if (current.fingerprint !== stack.fingerprint) {
-            return {
-                id: stack.id,
-                outcome: 'refused',
-                error: "the stack's state changed since it was planned; plan it again",
-            };
+        else {
+            if (current.kind === 'missing')
+                return fail('the stack no longer exists');
+            if (await appliedBefore(stack, runner, message)) {
+                return { id: stack.id, outcome: 'already-applied' };
+            }
+            if (current.fingerprint !== stack.fingerprint)
+                return refused;
+            restoreSalt(stack, current.salt, join(context.repoRoot, context.configFile));
         }
-        restoreSalt(stack, current.salt, join(context.repoRoot, context.configFile));
         // Checked again here: programs and wrappers that ran earlier in this job could change files
         const text = readFileSync(join(context.directory, stack.plan));
         if (hashText(text) !== stack.planHash)
@@ -224,9 +265,10 @@ async function applyStack(stack, context) {
                 '--message',
                 message,
             ]);
+            const open = relaxed.length > 0 ? { relaxed } : {};
             if (up.code !== 0)
-                return { ...fail(errorText(up)), relaxed };
-            return { id: stack.id, outcome: 'applied', relaxed };
+                return { ...fail(errorText(up)), ...open };
+            return { id: stack.id, outcome: 'applied', ...open };
         }
         finally {
             unregister();
@@ -243,21 +285,12 @@ async function appliedBefore(stack, runner, message) {
     return updates.some((update) => update.message === message && update.result === 'succeeded');
 }
 /**
- * Puts back the passphrase encryption salt of a stack `plan` created, which its plan's secrets are
- * encrypted with, when the checkout's config file doesn't have one. The backend's own record of
- * it is used when there is one; the manifest's only for a stack that doesn't have one yet.
+ * Puts the stack's passphrase encryption salt into a checkout whose config file has none, as
+ * Pulumi needs it there to decrypt the plan's secrets. The backend's own record of it is used;
+ * the manifest's only for a stack `plan` created, whose state may not record one yet.
  */
 function restoreSalt(stack, backendSalt, configPath) {
-    if (!stack.created || encryptionSaltOf(configPath) !== undefined)
-        return;
-    const config = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
-    if (secretsProviderOf(config) !== undefined)
-        return;
-    const salt = backendSalt ?? stack.encryptionSalt;
-    if (!salt)
-        return;
-    const separator = config === '' || config.endsWith('\n') ? '' : '\n';
-    appendFileSync(configPath, `${separator}encryptionsalt: ${salt}\n`);
+    writeSalt(configPath, backendSalt ?? (stack.created ? stack.encryptionSalt : undefined));
 }
 function outputChanges(plan) {
     return { outputs: stackOutputChanges(plan), unknownOutputs: unknownOutputChanges(plan) };
