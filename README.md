@@ -9,7 +9,7 @@ Works out which Pulumi stacks a change affects, so CI plans only those. It follo
 
 It works with TypeScript and JavaScript Pulumi programs, and npm, yarn (classic and berry) and pnpm. It needs no Pulumi Cloud features and works with any backend.
 
-**It selects; it doesn't deploy.** The tool answers two questions: which stacks does this change affect (`select`), and, given their previews, which would actually change (`classify`). Running Pulumi, storing plans, commenting on pull requests and deciding when to apply stay in your own workflow, where you control credentials and approvals. [Example workflows](#example-workflows) show the usual patterns: plan on the pull request, apply exactly those plans after merge, or apply from a comment.
+It comes as a CLI and four GitHub Actions: `select` (which stacks a change affects), `classify` (which previews would change anything), and the optional `plan` and `apply`, which preview the selected stacks with `--save-plan` on the pull request and later apply exactly those plans, without previewing again. When to apply, approvals and credentials stay in your workflow. See [Example workflows](#example-workflows).
 
 ## How detection works
 
@@ -130,22 +130,75 @@ The comparison base comes from the event: a pull request's merge base with its t
 
 **Outputs:** `changed` and `unchanged` (JSON arrays of the preview files), `any`. A preview counts as changed when a resource would be created, updated, replaced or deleted. Reads and unchanged resources don't count, and neither does known noise listed under `classify.ignore`, such as a provider whose `assumeRole` differs because previews use a read-only role. Output that a wrapper script prints before Pulumi's JSON is skipped.
 
-A preview usually can't tell whether **stack outputs alone** will change, so a stack whose only change is its outputs counts as unchanged. If other stacks read those outputs, keep its plan anyway.
+A preview usually can't tell whether **stack outputs alone** will change, so a stack whose only change is its outputs counts as unchanged. If other stacks read those outputs, keep its plan anyway (`plan` does).
+
+### `plan` (optional)
+
+Selects like `select`, then previews each selected stack in parallel with `--save-plan`, keeps the plans that would change something, and writes them with a `manifest.json` to `directory`. Sign in to Pulumi and your cloud before it.
+
+```yaml
+- id: plan
+  uses: soft-advisor/pulumi-affected/plan@<commit sha>
+```
+
+| Input                                                              | Default                                     |                                                                                                                                                                                         |
+| ------------------------------------------------------------------ | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base`, `head`, `bases`, `run`, `skip`, `all`, `working-directory` |                                             | As for `select`                                                                                                                                                                         |
+| `directory`                                                        | `pulumi-plans`                              | Where plans, previews, `manifest.json` and `comment.md` go                                                                                                                              |
+| `command`                                                          | `pulumi --cwd {dir} --stack {stack}`        | How to run Pulumi for a stack; placeholders `{dir}`, `{stack}`, `{project}`, `{id}`. Run without a shell, so a wrapper script that picks credentials per stack goes here                |
+| `concurrency`                                                      | `4`                                         | Previews at once                                                                                                                                                                        |
+| `create-stacks`                                                    | `plan`                                      | A selected stack that doesn't exist yet: `plan` creates it, empty, before previewing; `apply` previews it in a temporary local backend, so nothing is created until its plan is applied |
+| `upload`                                                           | `true`                                      | Upload `directory` as the artifact `pulumi-plans-<git tree SHA>`. Turn off to store the plans yourself                                                                                  |
+| `retention-days`                                                   | repository setting                          | For the artifact                                                                                                                                                                        |
+| `comment`                                                          | `true`                                      | Post the report on the pull request, updated in place on later runs. `comment.md` is written either way, for posting elsewhere                                                          |
+| `pull-request`, `github-token`                                     | the triggering pull request, `github.token` | Where and as whom to comment                                                                                                                                                            |
+
+**Outputs:** `directory`, `artifact`, `tree`, `any`, `ids`, `failed`.
+
+- A stack is kept when its preview would change a resource, when it's new, or when other stacks read its outputs.
+- A stack that fails to preview fails the action, after uploading and commenting. `apply` refuses a manifest with failures.
+- For each plan, the manifest records the stack's **state fingerprint** (a hash of its exported resources) at planning time.
+
+**What the artifact holds:** Pulumi's plan files and previews, which contain resource inputs and outputs (secrets stay encrypted). Anyone who can read the repository's artifacts can read them; set `upload: false` and store them yourself if that's too wide.
+
+### `apply` (optional)
+
+Applies the plans for **exactly the checked-out code**: `pulumi up --plan` per stack, in dependency order, with no new preview.
+
+```yaml
+- uses: actions/checkout@v4 # the merged commit
+- uses: soft-advisor/pulumi-affected/apply@<commit sha>
+```
+
+- **Where the plans come from:** `directory`, if it already holds a `manifest.json` (you fetched them yourself); otherwise the artifact `pulumi-plans-<tree SHA of the checkout>`, from `run-id` or else the newest run of this repository (not a fork) that uploaded it. No plans for this tree means failure: plan this exact code first.
+- **Checks before applying anything:** the manifest and every plan file's hash are valid, planning had no failures, the checkout's tree is the one planned, and each stack is one this code defines.
+- **Per stack:** the state fingerprint must still match the one planned from. If it doesn't, the stack's plan is **refused** (plan again) and stacks depending on it are **skipped**; unrelated stacks still apply. Pulumi's own stack lock keeps two updates from running at once.
+- **Reruns are safe:** each update is tagged `pulumi-affected:<plan hash>`, so a plan already applied is reported as `already-applied` and not applied twice.
+- **New stacks** with `create-stacks: apply` are created here, with the secrets provider their config file names.
+- If an apply changes outputs that **stacks outside the plans** read, they're listed in `needs-plan` and the report: plan them next.
+
+**Inputs:** `directory`, `run-id`, `working-directory`, `command`, `concurrency`, `comment` (default `true`: on the triggering pull request, `pull-request`, or the pull request the pushed commit came from), `pull-request`, `github-token` (needs `actions: read` to find the artifact, `pull-requests: write` to comment).
+**Outputs:** `directory`, `result` (each stack's outcome: `applied`, `already-applied`, `refused`, `failed` or `skipped`), `needs-plan`, `failed`.
+
+Whether a change may be applied (approvals, who may trigger it, required checks) is for your workflow and repository rules to decide before this step runs; see [Guardrails](#guardrails-and-limitations).
 
 ## Example workflows
 
-These are starting points: the tool's part is `select` and `classify`; everything else is yours to change. Both keep previews and applies apart: previews run the pull request's code with read-only credentials, applies run only reviewed code.
+These are starting points; everything around the actions is yours to change. Previews run the pull request's code with read-only credentials; applies run only merged code.
 
 ### Plan on the pull request, apply exactly those plans after merge
 
 ```yaml
 # .github/workflows/plan.yml
-on: pull_request
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited] # edited: Pulumi-Affected-Run lines in the description
 concurrency:
   group: plan-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 permissions:
   contents: read
+  pull-requests: write # the plan comment
   id-token: write # read-only cloud role for previews; see Guardrails
 jobs:
   plan:
@@ -154,34 +207,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0, persist-credentials: false }
       # your read-only Pulumi and cloud sign-in, and dependency install
-      - id: select
-        uses: soft-advisor/pulumi-affected/select@<commit sha>
-        with: { output-file: selection.json }
-      - name: Preview the selected stacks, saving plans
-        run: |
-          mkdir -p plans
-          while read -r stack; do
-            id=$(jq -r .id <<<"$stack"); name=$(jq -r .stack <<<"$stack")
-            dir=$(jq -r '.dir | if . == "" then "." else . end' <<<"$stack")
-            file="plans/${id//\//__}"
-            pulumi --cwd "$dir" stack select --create "$name"
-            pulumi --cwd "$dir" --stack "$name" preview --json --save-plan "$PWD/$file.plan.json" > "$file.preview.json"
-          done < <(jq -c '.stacks[]' selection.json)
-      - id: classify
-        uses: soft-advisor/pulumi-affected/classify@<commit sha>
-        with: { previews: plans/*.preview.json }
-      - name: Keep only the plans with changes
-        env: { UNCHANGED: '${{ steps.classify.outputs.unchanged }}' }
-        run: |
-          jq -r '.[]' <<<"$UNCHANGED" | while read -r preview; do
-            rm -f "$preview" "${preview%.preview.json}.plan.json"
-          done
-      - uses: actions/upload-artifact@v4
-        with:
-          name: plans-${{ github.event.pull_request.head.sha }}
-          path: |
-            selection.json
-            plans/
+      - uses: soft-advisor/pulumi-affected/plan@<commit sha>
 ```
 
 ```yaml
@@ -194,8 +220,8 @@ concurrency:
   cancel-in-progress: false
 permissions:
   contents: read
-  actions: read # to download the pull request's plans
-  pull-requests: read
+  actions: read # to find and download the pull request's plans
+  pull-requests: write # the apply comment
   id-token: write # deploy role
 jobs:
   apply:
@@ -203,58 +229,66 @@ jobs:
     environment: production # optional: a required reviewer, or branch restrictions
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0, persist-credentials: false }
-      - id: pr
-        name: Find the merged pull request and its plan run
-        env: { GH_TOKEN: '${{ github.token }}' }
-        run: |
-          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[0]')
-          head=$(jq -r .head.sha <<<"$pr")
-          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/plan.yml/runs?head_sha=$head&status=success" --jq '.workflow_runs[0].id')
-          echo "head=$head" >> "$GITHUB_OUTPUT"; echo "run=$run" >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@v4
-        with:
-          name: plans-${{ steps.pr.outputs.head }}
-          run-id: ${{ steps.pr.outputs.run }}
-          github-token: ${{ github.token }}
-      - name: Refuse plans made from other code
-        run: |
-          git fetch --quiet origin "${{ steps.pr.outputs.head }}"
-          [ "$(git rev-parse HEAD^{tree})" = "$(git rev-parse '${{ steps.pr.outputs.head }}^{tree}')" ]
-      # your deploy-role cloud sign-in
-      - name: Apply exactly the plans, in dependency order
-        run: |
-          for id in $(jq -r '.waves[][]' selection.json); do
-            plan="plans/${id//\//__}.plan.json"
-            [ -f "$plan" ] || continue
-            stack=$(jq -c --arg id "$id" '.stacks[] | select(.id == $id)' selection.json)
-            dir=$(jq -r '.dir | if . == "" then "." else . end' <<<"$stack")
-            pulumi --cwd "$dir" --stack "$(jq -r .stack <<<"$stack")" up --yes --plan "$PWD/$plan"
-          done
+        with: { persist-credentials: false }
+      # your deploy-role Pulumi and cloud sign-in, and dependency install
+      - uses: soft-advisor/pulumi-affected/apply@<commit sha>
 ```
 
-The tree check is what makes "apply exactly what was planned" hold: a squash merge of a branch that was up to date with `main` has the same tree as the pull request's head. If it doesn't (the branch wasn't up to date, or the plans are missing), the apply stops instead of planning again.
+A squash merge of a branch that was up to date with `main` has the same tree as the pull request's head, so `apply` finds that pull request's plans by the tree. If the branch wasn't up to date, there are no plans for the merged tree and `apply` fails instead of planning again.
 
-### Apply from a pull request comment (Atlantis-style)
+To plan more stacks on a pull request, add `Pulumi-Affected-Run: <patterns>` to its description (the `edited` trigger re-plans) or touch a force file.
 
-A comment workflow runs from the default branch, with that branch's permissions, so it should run no code. Let it check what you require (the commenter's write access, an approval, passing checks) and then start a `workflow_dispatch` of an apply workflow **on the pull request's branch**, so the apply runs as that branch, not as `main`. The apply workflow downloads that pull request's latest plans and applies them as above; merge afterwards. Your cloud trust policy for the deploy role decides which branches and events may assume it.
+### Recovering from a refused or failed apply
 
-To add stacks to a pull request's plans from a comment, the same comment workflow can dispatch the plan workflow on the pull request's branch with a `run` input, which the plan workflow passes to `select`.
+`apply` never plans again by itself. Open a new pull request that forces the stacks concerned (touch `Pulumi.<stack>.force`, or a `Pulumi-Affected-Run` line in its description), review its plans, and merge it.
+
+### Scheduled drift check
+
+Plans only guard against **Pulumi state** changing between planning and applying. Changes made directly in the cloud (drift) aren't in the state until a refresh, so a plan can't see them. Run a scheduled check, daily or weekly:
+
+```yaml
+# .github/workflows/drift.yml
+on:
+  schedule: [{ cron: '0 6 * * 1-5' }]
+  workflow_dispatch:
+jobs:
+  drift:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      # your read-only Pulumi and cloud sign-in, and dependency install
+      - id: select
+        uses: soft-advisor/pulumi-affected/select@<commit sha>
+        with: { all: true, base: HEAD }
+      - name: Fail on drift or undeployed changes
+        env: { STACKS: '${{ steps.select.outputs.stacks }}' }
+        run: |
+          status=0
+          while read -r stack; do
+            dir=$(jq -r '.dir | if . == "" then "." else . end' <<<"$stack")
+            pulumi --cwd "$dir" --stack "$(jq -r .stack <<<"$stack")" preview --refresh --expect-no-changes || status=1
+          done < <(jq -c '.[]' <<<"$STACKS")
+          exit $status
+```
+
+It also catches anything selection missed. Fix drift through a pull request, or with `pulumi refresh` where the cloud is right.
 
 ## Guardrails and limitations
 
-The tool selects; your repository's rules make plans safe to apply:
+The actions plan and apply; your repository's rules decide what may be applied:
 
 - **Applies only run reviewed code.** Require an approval to merge into the default branch, and dismiss approvals when new commits are pushed, so the approved plan is the applied plan.
-- **Plans must not go stale.** Require branches to be up to date with the default branch before merging (or use a merge queue). Otherwise the plan was made against older code or state than what's merged, and the tree check above refuses it. Pulumi also refuses a plan whose resources no longer match it.
+- **Plans must not go stale.** Require branches to be up to date with the default branch before merging (or use a merge queue). Otherwise the merged tree differs from the planned one and `apply` finds no plans.
 - **Make the plan a required check**, so a pull request can't merge with a failing preview.
-- **One apply at a time**: a `concurrency` group that isn't cancelled midway. On self-managed backends, set `PULUMI_SELF_MANAGED_STATE_LOCKING`.
+- **One apply workflow at a time**: a `concurrency` group that isn't cancelled midway. On self-managed backends, set `PULUMI_SELF_MANAGED_STATE_LOCKING`.
 - **Credentials by event.** Previews run the pull request's code, so they get read-only roles. Give the deploy role a trust policy that only accepts the default branch's push (or the branches you apply from), and never give a job that runs a pull request's code a way to obtain it. Hiding variables from a step isn't isolation: code running in a job can read anything the job can.
-- **Stacks that read a planned stack's outputs** are planned against its current outputs. If applying it changes them, the dependent's plan is rejected by Pulumi rather than applied; plan it again.
+- **Applying from a pull request (before merge) isn't covered.** The actions apply after merge, or wherever your workflow calls `apply` with the planned code checked out; checks such as approvals belong in that workflow.
+- **Drift in the cloud isn't guarded against**; see [the scheduled drift check](#scheduled-drift-check).
 - **Type-only changes** select nothing, since they don't change what's deployed; run `tsc --noEmit` in CI to catch type errors before the next plan does.
 - **ESC environments** change outside the repository; stacks importing them get a warning, and can be selected with `always`, a rule or `Pulumi-Affected-Run`.
 - **Stacks that only exist in the backend** (no `Pulumi.<stack>.yaml`) need listing under `stacks`.
-- **A safety net:** a scheduled run with `all: true` and `pulumi preview --expect-no-changes` catches drift and anything selection missed.
 
 ## CLI
 

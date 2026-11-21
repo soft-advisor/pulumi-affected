@@ -1,0 +1,81 @@
+import { writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { type CreateStacks, planStacks } from '../plan/plan.ts';
+import { COMMENT_FILE } from '../plan/manifest.ts';
+import { renderPlan } from '../plan/report.ts';
+import { commandRunner, DEFAULT_COMMAND } from '../pulumi/runner.ts';
+import { repoRootOf } from '../snapshot.ts';
+import { marker, syncComments } from './comments.ts';
+import {
+  appendSummary,
+  booleanInput,
+  error,
+  GitHubApi,
+  input,
+  notice,
+  printUntrusted,
+  setOutput,
+  warning,
+} from './github.ts';
+import { positiveInteger, pullRequestNumber, selectOptionsFromInputs } from './inputs.ts';
+
+/*
+ * The `plan` action's Node step: selects, previews each selected stack with --save-plan and
+ * writes the plans, their manifest and a report. The composite action around it uploads the
+ * directory and fails the job when a stack failed, after the upload and comment.
+ */
+
+async function main() {
+  const { options, event } = selectOptionsFromInputs();
+  const createStacks = input('create-stacks') || 'plan';
+  if (createStacks !== 'plan' && createStacks !== 'apply') {
+    throw new Error(`create-stacks must be plan or apply, not "${createStacks}"`);
+  }
+  const directory = resolve(input('directory') || 'pulumi-plans');
+  const repoRoot = repoRootOf(options.cwd);
+  const runner = commandRunner(input('command') || DEFAULT_COMMAND, repoRoot);
+
+  const manifest = await planStacks({
+    select: options,
+    directory,
+    runner,
+    concurrency: positiveInteger('concurrency', 4),
+    createStacks: createStacks as CreateStacks,
+    onFinish: (outcome) => {
+      if (outcome.kind === 'failed') printUntrusted(`${outcome.id}: failed\n${outcome.error}`);
+      else
+        console.log(
+          `${outcome.kind === 'planned' ? outcome.stack.id : outcome.id}: ${outcome.kind}`,
+        );
+    },
+  });
+  for (const message of manifest.warnings) warning(message);
+
+  const report = renderPlan(manifest, (index) => marker('plan', index));
+  writeFileSync(join(directory, COMMENT_FILE), report.bodies.join('\n\n'));
+  appendSummary(report.summary);
+
+  setOutput('directory', directory);
+  setOutput('artifact', `pulumi-plans-${manifest.tree}`);
+  setOutput('tree', manifest.tree);
+  setOutput('any', manifest.stacks.length > 0 ? 'true' : 'false');
+  setOutput('ids', JSON.stringify(manifest.stacks.map((stack) => stack.id)));
+  setOutput('failed', manifest.failed.length > 0 ? 'true' : 'false');
+
+  if (booleanInput('comment')) {
+    const number = pullRequestNumber(event);
+    const token = input('github-token');
+    if (number === undefined)
+      notice('Not a pull request run, so the plan isn’t commented; set pull-request');
+    else if (!token) warning('No github-token, so the plan isn’t commented');
+    else await syncComments(new GitHubApi(token), number, 'plan', report.bodies);
+  }
+  if (manifest.failed.length > 0) {
+    error(`Planning failed for ${manifest.failed.map((stack) => stack.id).join(', ')}`);
+  }
+}
+
+main().catch((caught) => {
+  error(caught instanceof Error ? caught.message : String(caught));
+  process.exitCode = 1;
+});

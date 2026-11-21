@@ -48,7 +48,7 @@ jobs:
       - run: pnpm build
       # The action runs the committed bundle, so it must match the source
       - name: Check the action bundle and schema.json are up to date
-        run: git diff --exit-code -- select/dist classify/dist schema.json
+        run: git diff --exit-code -- select/dist classify/dist plan/dist apply/dist schema.json
       - name: Show what would be published
         run: npm pack --dry-run
 

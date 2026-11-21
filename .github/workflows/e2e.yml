@@ -1,8 +1,8 @@
 name: E2E
 
 # Each scenario in e2e/scenarios.json runs the whole lifecycle for real in this repository:
-# deploy the fixtures, open a pull request with the scenario's change, preview it with the run
-# action from this commit, merge it, deploy it, and check the results and comments. State lives
+# deploy the fixtures, open a pull request with the scenario's change, plan it with the plan
+# action from this commit, merge it, apply it with the apply action, and check the results. State lives
 # in a file backend on the runner; nothing outside GitHub is touched.
 on:
   pull_request:
@@ -44,6 +44,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
+      actions: read # finding and downloading the plans' artifact
       contents: write # throwaway branches
       pull-requests: write # throwaway pull requests and their comments
     strategy:
@@ -89,81 +90,64 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node tool/e2e/driver.ts prepare "$INDEX" "$FIXTURE"
 
-      # From here on, the steps are the README's example workflow: select, plan, keep the plans
-      # with changes, and after merge apply exactly those
+      # From here on, the steps are the README's example workflow: plan on the pull request, and
+      # after merge apply exactly those plans. Select runs too, to check the selection alone.
       - id: select
         uses: ./tool/select
         with:
           base: ${{ steps.prepare.outputs.base-sha }}
           working-directory: ${{ env.FIXTURE }}
-          output-file: ${{ env.FIXTURE }}/selection.json
+          output-file: ${{ runner.temp }}/selection.json
       - name: Check the selection
-        run: node tool/e2e/driver.ts assert-select "$INDEX" "$FIXTURE/selection.json"
+        run: node tool/e2e/driver.ts assert-select "$INDEX" "$RUNNER_TEMP/selection.json"
 
       - id: plan
-        name: Preview the selected stacks, saving plans
+        uses: ./tool/plan
         continue-on-error: true # one scenario fails a stack on purpose
-        working-directory: ${{ env.FIXTURE }}
         env:
           BANNER: ${{ steps.prepare.outputs.banner }}
-        run: |
-          mkdir -p plans
-          failed=()
-          while read -r stack; do
-            id=$(jq -r .id <<<"$stack")
-            dir=$(jq -r '.dir | if . == "" then "." else . end' <<<"$stack")
-            name=$(jq -r .stack <<<"$stack")
-            file="plans/${id//\//__}"
-            pulumi --cwd "$dir" stack select --create "$name" --non-interactive
-            # BANNER stands in for a wrapper script that prints before Pulumi does
-            if ! { if [ -n "$BANNER" ]; then echo "$BANNER"; fi
-                   pulumi --cwd "$dir" --stack "$name" preview --json --non-interactive \
-                     --save-plan "$PWD/$file.plan.json"; } > "$file.preview.json"; then
-              failed+=("$file.preview.json")
-              rm -f "$file.preview.json" "$file.plan.json"
-            fi
-          done < <(jq -c '.stacks[]' selection.json)
-          printf '%s\n' "${failed[@]}" | jq -Rcs 'split("\n") | map(select(. != ""))' > failed.json
-          echo "failed=$(cat failed.json)" >> "$GITHUB_OUTPUT"
-          [ "${#failed[@]}" -eq 0 ]
-      - id: classify
-        uses: ./tool/classify
         with:
-          previews: plans/*.preview.json
+          base: ${{ steps.prepare.outputs.base-sha }}
           working-directory: ${{ env.FIXTURE }}
-      - name: Keep only the plans with changes
-        working-directory: ${{ env.FIXTURE }}
-        env:
-          UNCHANGED: ${{ steps.classify.outputs.unchanged }}
-        run: |
-          jq -r '.[]' <<<"$UNCHANGED" | while read -r preview; do
-            rm -f "$preview" "${preview%.preview.json}.plan.json"
-          done
+          directory: ${{ runner.temp }}/plans
+          # The wrapper prints BANNER first, as scripts that assume a role often do
+          command: sh ${{ github.workspace }}/tool/e2e/wrapper.sh --cwd {dir} --stack {stack}
+          create-stacks: ${{ steps.prepare.outputs.create-stacks }}
+          pull-request: ${{ steps.prepare.outputs.pull-request }}
+          retention-days: 1
       - name: Check the plans
         env:
           PLAN_OUTCOME: ${{ steps.plan.outcome }}
-          FAILED: ${{ steps.plan.outputs.failed }}
-          CHANGED: ${{ steps.classify.outputs.changed }}
-        run: node tool/e2e/driver.ts assert-plans "$INDEX"
+        run: node tool/e2e/driver.ts assert-plans "$INDEX" "$RUNNER_TEMP/plans"
 
       - name: Merge the pull request
         env:
           GH_TOKEN: ${{ github.token }}
         run: node tool/e2e/driver.ts merge "$INDEX" "${{ steps.prepare.outputs.pull-request }}" "$FIXTURE" "${{ steps.prepare.outputs.head-sha }}"
-      - name: Apply exactly the plans, in dependency order
-        working-directory: ${{ env.FIXTURE }}
-        run: |
-          : > "$GITHUB_WORKSPACE/applied.txt"
-          for id in $(jq -r '.waves[][]' selection.json); do
-            plan="plans/${id//\//__}.plan.json"
-            [ -f "$plan" ] || continue
-            stack=$(jq -c --arg id "$id" '.stacks[] | select(.id == $id)' selection.json)
-            dir=$(jq -r '.dir | if . == "" then "." else . end' <<<"$stack")
-            name=$(jq -r .stack <<<"$stack")
-            pulumi --cwd "$dir" --stack "$name" up --yes --non-interactive --plan "$PWD/$plan"
-            echo "$id" >> "$GITHUB_WORKSPACE/applied.txt"
-          done
+      - name: Change a stack after planning
+        run: node tool/e2e/driver.ts change-state "$INDEX" "$FIXTURE"
+      # No directory: the plans come from the artifact for the merged tree, as after a merge
+      - id: apply
+        uses: ./tool/apply
+        continue-on-error: true # planning failed, or a plan is refused, on purpose
+        env:
+          BANNER: ${{ steps.prepare.outputs.banner }}
+        with:
+          working-directory: ${{ env.FIXTURE }}
+          command: sh ${{ github.workspace }}/tool/e2e/wrapper.sh --cwd {dir} --stack {stack}
+          pull-request: ${{ steps.prepare.outputs.pull-request }}
+      - id: reapply
+        if: steps.apply.outcome == 'success'
+        uses: ./tool/apply
+        with:
+          directory: ${{ steps.apply.outputs.directory }}
+          working-directory: ${{ env.FIXTURE }}
+          comment: false
       - name: Check what was applied
+        env:
+          APPLY_OUTCOME: ${{ steps.apply.outcome }}
+          APPLY_RESULT: ${{ steps.apply.outputs.result }}
+          REAPPLY_RESULT: ${{ steps.reapply.outputs.result }}
         run: node tool/e2e/driver.ts assert-apply "$INDEX"
 
       - name: Clean up

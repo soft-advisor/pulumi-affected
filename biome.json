@@ -45,6 +45,13 @@
     }
   ],
   "files": {
-    "includes": ["**", "!select/dist", "!classify/dist", "!schema.json"]
+    "includes": [
+      "**",
+      "!select/dist",
+      "!classify/dist",
+      "!plan/dist",
+      "!apply/dist",
+      "!schema.json"
+    ]
   }
 }

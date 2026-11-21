@@ -4,13 +4,14 @@ import { configSchema } from '../src/schema.ts';
 
 // The actions run these bundles straight from the repository, with no install step, so they're
 // committed; CI checks they match the source.
-for (const action of ['select', 'classify']) {
+for (const action of ['select', 'classify', 'plan', 'apply']) {
   await build({
     entryPoints: [`src/action/${action}.ts`],
     outfile: `${action}/dist/index.cjs`,
     bundle: true,
     platform: 'node',
-    target: 'node22',
+    // plan and apply run on the runner's own Node, which may be older than the actions' node24
+    target: 'node20',
     format: 'cjs',
     legalComments: 'none',
     // About a third of the size; the source is in the repository for reading
