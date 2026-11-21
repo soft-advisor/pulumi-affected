@@ -48,20 +48,10 @@ export interface SelectOptions {
   run?: string[];
   /** Stack patterns to leave out unless also named in `run` */
   skip?: string[];
-  /**
-   * Honour Pulumi-Affected-Skip only from `skip`, not from commit messages or `messages`, which
-   * anyone opening a pull request writes. Deploys use this: a skip there would hold a change back
-   * until someone noticed.
-   */
-  trustedSkipsOnly?: boolean;
   /** Select every stack */
   all?: boolean;
-  /** A reason to select a stack whatever changed, e.g. "its last deploy was from a dirty tree" */
-  reasons?: Record<string, string>;
   /** Text that may carry Pulumi-Affected-Run/Skip lines, e.g. a pull request description */
   messages?: string[];
-  /** Stack patterns to select, with who asked for them, e.g. a pull request comment command */
-  requests?: Request[];
   config?: Config;
 }
 
@@ -131,8 +121,6 @@ export function select(options: SelectOptions): SelectResult {
 
   for (const project of projects) {
     for (const stack of project.stacks) {
-      const extra = options.reasons?.[stack.id];
-      if (extra) addReason(stack, extra);
       const base = stackBase(options, stack, defaultBase, repoRoot);
       if (base === null) {
         addReason(stack, 'never deployed');
@@ -157,10 +145,7 @@ export function select(options: SelectOptions): SelectResult {
         addReason(stack, `requested by ${source}`);
         forced.add(stack.id);
       }
-      const skip = requests.skip.find(
-        ({ pattern, source }) =>
-          matchesStack(pattern, stack) && (!options.trustedSkipsOnly || source === '--skip'),
-      );
+      const skip = requests.skip.find(({ pattern }) => matchesStack(pattern, stack));
       if (skip) skipped.set(stack.id, skip.source);
     }
   }
@@ -814,7 +799,6 @@ function readRequests(repoRoot: string, base: string, options: SelectOptions) {
     if (body) scan(body, `commit ${sha}`);
   }
   for (const message of options.messages ?? []) scan(message, 'the pull request');
-  run.push(...(options.requests ?? []));
 
   if (options.all) run.push({ pattern: 'all', source: '--all' });
   for (const pattern of options.run ?? []) run.push({ pattern, source: '--run' });

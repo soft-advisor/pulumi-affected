@@ -48,7 +48,7 @@ jobs:
       - run: pnpm build
       # The action runs the committed bundle, so it must match the source
       - name: Check the action bundle and schema.json are up to date
-        run: git diff --exit-code -- select/dist run/dist schema.json
+        run: git diff --exit-code -- select/dist classify/dist schema.json
       - name: Show what would be published
         run: npm pack --dry-run
 
@@ -59,7 +59,6 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      pull-requests: write # replies to /pulumi-affected commands from people without write access
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

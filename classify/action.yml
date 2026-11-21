@@ -1,0 +1,28 @@
+name: pulumi-affected classify
+description: Tell which Pulumi previews would change anything, so only those plans are kept and applied
+author: soft-advisor
+branding:
+  icon: check-circle
+  color: purple
+
+inputs:
+  previews:
+    description: >-
+      Files holding the JSON printed by `pulumi preview --json`, as paths or globs separated by
+      commas or newlines, e.g. plans/*.preview.json.
+    required: true
+  working-directory:
+    description: 'The folder the paths are relative to, inside the repository. Default: the workspace.'
+    required: false
+
+outputs:
+  changed:
+    description: JSON array of the preview files that would change something.
+  unchanged:
+    description: JSON array of the preview files that would change nothing.
+  any:
+    description: "'true' when at least one preview would change something."
+
+runs:
+  using: node24
+  main: dist/index.cjs

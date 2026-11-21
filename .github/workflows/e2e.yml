@@ -87,66 +87,99 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node tool/e2e/driver.ts prepare "$INDEX" "$FIXTURE"
 
-      # Some scenarios fail a stack on purpose; the checks below decide whether the run is right
-      - id: preview
-        uses: ./tool/run
-        continue-on-error: true
+      # From here on, the steps are the README's example workflow: select, plan, keep the plans
+      # with changes, and after merge apply exactly those
+      - id: select
+        uses: ./tool/select
         with:
-          mode: preview
-          pull-request: ${{ steps.prepare.outputs.pull-request }}
+          base: ${{ steps.prepare.outputs.base-sha }}
           working-directory: ${{ env.FIXTURE }}
-          command: ${{ matrix.scenario.command }}
-      - name: Check the preview
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RESULTS: ${{ steps.preview.outputs.results }}
-          OUTCOME: ${{ steps.preview.outcome }}
-        run: node tool/e2e/driver.ts assert-preview "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
+          output-file: ${{ env.FIXTURE }}/selection.json
+      - name: Check the selection
+        run: node tool/e2e/driver.ts assert-select "$INDEX" "$FIXTURE/selection.json"
 
-      - name: Push a second change
-        if: matrix.scenario.second
+      - id: plan
+        name: Preview the selected stacks, saving plans
+        continue-on-error: true # one scenario fails a stack on purpose
+        working-directory: ${{ env.FIXTURE }}
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: node tool/e2e/driver.ts push-second "$INDEX" "${{ steps.prepare.outputs.pull-request }}" "$FIXTURE"
-      - id: second-preview
-        if: matrix.scenario.second
-        uses: ./tool/run
-        continue-on-error: true
+          BANNER: ${{ steps.prepare.outputs.banner }}
+        run: |
+          mkdir -p plans
+          failed=()
+          while read -r stack; do
+            id=$(jq -r .id <<<"$stack")
+            dir=$(jq -r '.dir | if . == "" then "." else . end' <<<"$stack")
+            name=$(jq -r .stack <<<"$stack")
+            file="plans/${id//\//__}"
+            pulumi --cwd "$dir" stack select --create "$name" --non-interactive
+            # BANNER stands in for a wrapper script that prints before Pulumi does
+            if ! { if [ -n "$BANNER" ]; then echo "$BANNER"; fi
+                   pulumi --cwd "$dir" --stack "$name" preview --json --non-interactive \
+                     --save-plan "$PWD/$file.plan.json"; } > "$file.preview.json"; then
+              failed+=("$file.preview.json")
+              rm -f "$file.preview.json" "$file.plan.json"
+            fi
+          done < <(jq -c '.stacks[]' selection.json)
+          printf '%s\n' "${failed[@]}" | jq -Rcs 'split("\n") | map(select(. != ""))' > failed.json
+          echo "failed=$(cat failed.json)" >> "$GITHUB_OUTPUT"
+          [ "${#failed[@]}" -eq 0 ]
+      - id: classify
+        uses: ./tool/classify
         with:
-          mode: preview
-          pull-request: ${{ steps.prepare.outputs.pull-request }}
+          previews: plans/*.preview.json
           working-directory: ${{ env.FIXTURE }}
-          command: ${{ matrix.scenario.command }}
-      - name: Check the second preview
-        if: matrix.scenario.second
+      - name: Keep only the plans with changes
+        working-directory: ${{ env.FIXTURE }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          RESULTS: ${{ steps.second-preview.outputs.results }}
-          OUTCOME: ${{ steps.second-preview.outcome }}
-        run: node tool/e2e/driver.ts assert-second-preview "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
+          UNCHANGED: ${{ steps.classify.outputs.unchanged }}
+        run: |
+          jq -r '.[]' <<<"$UNCHANGED" | while read -r preview; do
+            rm -f "$preview" "${preview%.preview.json}.plan.json"
+          done
+      - name: Check the plans
+        env:
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          FAILED: ${{ steps.plan.outputs.failed }}
+          CHANGED: ${{ steps.classify.outputs.changed }}
+        run: node tool/e2e/driver.ts assert-plans "$INDEX"
 
       - name: Merge the pull request
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node tool/e2e/driver.ts merge "$INDEX" "${{ steps.prepare.outputs.pull-request }}" "$FIXTURE"
-      - id: deploy
-        uses: ./tool/run
-        continue-on-error: true
-        with:
-          mode: up
-          pull-request: ${{ steps.prepare.outputs.pull-request }}
-          base: ${{ steps.prepare.outputs.base-sha }}
-          working-directory: ${{ env.FIXTURE }}
-          command: ${{ matrix.scenario.command }}
-      - name: Check the deploy
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RESULTS: ${{ steps.deploy.outputs.results }}
-          OUTCOME: ${{ steps.deploy.outcome }}
-        run: node tool/e2e/driver.ts assert-deploy "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
+        run: node tool/e2e/driver.ts merge "$INDEX" "${{ steps.prepare.outputs.pull-request }}" "$FIXTURE" "${{ steps.prepare.outputs.head-sha }}"
+      - name: Apply exactly the plans, in dependency order
+        working-directory: ${{ env.FIXTURE }}
+        run: |
+          : > "$GITHUB_WORKSPACE/applied.txt"
+          for id in $(jq -r '.waves[][]' selection.json); do
+            plan="plans/${id//\//__}.plan.json"
+            [ -f "$plan" ] || continue
+            stack=$(jq -c --arg id "$id" '.stacks[] | select(.id == $id)' selection.json)
+            dir=$(jq -r '.dir | if . == "" then "." else . end' <<<"$stack")
+            name=$(jq -r .stack <<<"$stack")
+            pulumi --cwd "$dir" --stack "$name" up --yes --non-interactive --plan "$PWD/$plan"
+            echo "$id" >> "$GITHUB_WORKSPACE/applied.txt"
+          done
+      - name: Check what was applied
+        run: node tool/e2e/driver.ts assert-apply "$INDEX"
 
       - name: Clean up
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: node tool/e2e/driver.ts cleanup "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
+
+  # One check to require in branch rules, whatever the scenarios are called
+  e2e:
+    if: always()
+    needs: scenario
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: All scenarios passed
+        env:
+          RESULT: ${{ needs.scenario.result }}
+        run: |
+          echo "Scenarios: $RESULT"
+          [ "$RESULT" = success ]

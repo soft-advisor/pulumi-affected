@@ -1,127 +1,41 @@
-import type { Request } from '../select.ts';
 import { ensureCommit, git, isSha } from '../snapshot.ts';
-import { splitPatterns } from '../patterns.ts';
-import type { Author, GitHubApi, GitHubEvent } from './github.ts';
+import type { GitHubEvent } from './github.ts';
 
 /*
- * What the triggering event means for selection: the revision to compare with, and stacks
- * requested by pull request descriptions and /pulumi-affected comments.
- *
- * Commands run code with whatever credentials the job holds, so they only ever come from people
- * with write access, and pull requests from forks never run through a comment.
+ * What the triggering event means for selection: the revision to compare with, and the text
+ * (a pull request description) whose Pulumi-Affected-Run/Skip lines count. Selection only reads
+ * files and never runs the repository's code, so no event needs special care here; what runs the
+ * code afterwards is the workflow's business.
  */
-
-/** `/pulumi-affected preview <patterns>` at the start of a line in a pull request comment */
-const COMMAND = /^\/pulumi-affected\s+preview\b(.*)$/im;
-const COMMANDS = new RegExp(COMMAND.source, 'gim');
-
-/** Base permissions that can run commands: the ones that can push anyway */
-const WRITE_PERMISSIONS = new Set(['admin', 'write']);
-
-const ZERO_SHA = /^0+$/;
-
-/** Comments the action wrote itself start with a marker; they never count as commands */
-const OWN_COMMENT = /^<!-- pulumi-affected:/;
-
-export interface PullRequest {
-  number: number;
-  body: string | null;
-  base: { sha: string; ref?: string; repo?: { full_name: string } | null };
-  head: { sha: string; repo?: { full_name: string } | null };
-  merged_at?: string | null;
-}
-
-export interface Comment {
-  id: number;
-  body?: string;
-  user: Author | null;
-}
 
 export interface Context {
   base: string | undefined;
   messages: string[];
-  requests: Request[];
+  /** Select every stack: a new branch, with nothing to compare to */
   all: boolean;
-  pullRequest: PullRequest | undefined;
-  /** On a push: the pull requests it merged */
-  mergedPullRequests: PullRequest[];
   warnings: string[];
 }
 
-const EMPTY: Context = {
-  base: undefined,
-  messages: [],
-  requests: [],
-  all: false,
-  pullRequest: undefined,
-  mergedPullRequests: [],
-  warnings: [],
-};
+interface PullRequest {
+  body: string | null;
+  base: { sha: string };
+}
+
+const ZERO_SHA = /^0+$/;
+
+const EMPTY: Context = { base: undefined, messages: [], all: false, warnings: [] };
 
 export class EventError extends Error {}
 
-/** The base revision and extra requests implied by the event; undefined means do nothing */
-export async function eventContext(
-  event: GitHubEvent,
-  repoRoot: string,
-  api: GitHubApi | undefined,
-): Promise<Context | undefined> {
+export function eventContext(event: GitHubEvent, repoRoot: string): Context {
   const payload = event.payload as Record<string, unknown>;
 
   if (event.name === 'pull_request' || event.name === 'pull_request_target') {
     const pullRequest = payload.pull_request as PullRequest;
-    // pull_request_target runs with the base repository's secrets; running a fork's code there
-    // is the classic way to hand them over, whichever ref is checked out (the head, or the merge
-    // commit that contains it), so forks are refused outright
-    if (event.name === 'pull_request_target' && isFork(pullRequest)) {
-      throw new EventError(
-        "pull_request_target doesn't run for pull requests from forks: their code would run with this repository's secrets; use pull_request",
-      );
-    }
-    const warnings: string[] = [];
     return {
       ...EMPTY,
       base: mergeBase(repoRoot, pullRequest.base.sha),
       messages: [pullRequest.body ?? ''],
-      requests: api ? await commandRequests(api, pullRequest.number, warnings) : [],
-      pullRequest,
-      warnings,
-    };
-  }
-
-  if (event.name === 'issue_comment') {
-    const issue = payload.issue as { number: number; pull_request?: unknown };
-    const comment = payload.comment as Comment;
-    // Edited and deleted comments trigger workflows too; only a new comment is a command
-    if (payload.action !== 'created' || !issue.pull_request || !COMMAND.test(comment.body ?? '')) {
-      return undefined;
-    }
-    if (!api) throw new EventError('issue_comment events need the github-token input');
-    const login = comment.user?.login ?? '';
-    if (!(await canWrite(api, login))) {
-      return undefined; // commandRequests replies to it when the pull request next runs
-    }
-    const pullRequest = await api.request<PullRequest>('GET', api.repo(`/pulls/${issue.number}`));
-    if (isFork(pullRequest)) {
-      throw new EventError(
-        "Commands don't run on pull requests from forks: their code would run with this workflow's credentials",
-      );
-    }
-    if (!headIs(repoRoot, pullRequest)) {
-      const head = git(repoRoot, ['rev-parse', 'HEAD']).trim();
-      throw new EventError(
-        `The checkout is at ${head}, not the pull request's head ${pullRequest.head.sha}. ` +
-          'Check out refs/pull/<number>/head before this action on issue_comment events.',
-      );
-    }
-    const warnings: string[] = [];
-    return {
-      ...EMPTY,
-      base: mergeBase(repoRoot, pullRequest.base.sha),
-      messages: [pullRequest.body ?? ''],
-      requests: await commandRequests(api, pullRequest.number, warnings),
-      pullRequest,
-      warnings,
     };
   }
 
@@ -135,107 +49,17 @@ export async function eventContext(
     const before = String(payload.before ?? '');
     // A new branch has no previous commit to compare with
     if (!before || ZERO_SHA.test(before)) return { ...EMPTY, all: true };
-    const warnings: string[] = [];
     if (!ensureCommit(repoRoot, before)) {
-      // A force push: the previous commit is gone. Deploys still compare each stack with its
-      // last deploy; anything else has nothing to compare with.
-      warnings.push(`The push's previous commit ${before} isn't available (a force push?)`);
-      return { ...EMPTY, warnings };
+      // A force push: the previous commit is gone
+      return {
+        ...EMPTY,
+        warnings: [`The push's previous commit ${before} isn't available (a force push?)`],
+      };
     }
-    const branch = String(payload.ref ?? '').replace(/^refs\/heads\//, '');
-    // Stacks forced in a merged pull request (description lines and commands) still apply
-    // The deploy matters more than its comments: an API failure here only costs those
-    let merged: PullRequest[] = [];
-    if (api) {
-      try {
-        merged = await mergedPullRequests(api, repoRoot, before, branch);
-      } catch (error) {
-        warnings.push(
-          `Couldn't find the pull requests this push merged, so their requests and comments are skipped: ${error instanceof Error ? error.message : error}`,
-        );
-      }
-    }
-    const messages: string[] = [];
-    const requests: Request[] = [];
-    for (const pullRequest of merged) {
-      messages.push(pullRequest.body ?? '');
-      try {
-        if (api) requests.push(...(await commandRequests(api, pullRequest.number, warnings)));
-      } catch (error) {
-        warnings.push(
-          `Couldn't read the commands on #${pullRequest.number}: ${error instanceof Error ? error.message : error}`,
-        );
-      }
-    }
-    return { ...EMPTY, base: before, messages, requests, mergedPullRequests: merged, warnings };
+    return { ...EMPTY, base: before };
   }
 
   return { ...EMPTY };
-}
-
-/**
- * Whether the event may run at all. Comment and pull_request_target events keep their gates
- * even when the `pull-request` input names the pull request: false means do nothing.
- */
-export async function eventAllowsRun(
-  event: GitHubEvent,
-  repoRoot: string,
-  api: GitHubApi | undefined,
-) {
-  if (event.name !== 'issue_comment' && event.name !== 'pull_request_target') return true;
-  return (await eventContext(event, repoRoot, api)) !== undefined;
-}
-
-/**
- * The context of a pull request named explicitly (the `pull-request` input) rather than by the
- * event: an open one is previewed against its merge base, a merged one is what a deploy reports
- * on.
- */
-export async function pullRequestContext(
-  api: GitHubApi,
-  repoRoot: string,
-  number: number,
-): Promise<Context> {
-  const pullRequest = await api.request<PullRequest>('GET', api.repo(`/pulls/${number}`));
-  if (!pullRequest.merged_at) {
-    // The same rules as a comment command: an open pull request's code only runs from this
-    // repository, and only as the commit the pull request is at
-    if (isFork(pullRequest)) {
-      throw new EventError(
-        "The pull-request input doesn't run pull requests from forks: their code would run with this workflow's credentials",
-      );
-    }
-    if (!headIs(repoRoot, pullRequest)) {
-      throw new EventError(
-        `The checkout isn't pull request #${number}'s head ${pullRequest.head.sha}; check it out first`,
-      );
-    }
-  }
-  const warnings: string[] = [];
-  const messages = [pullRequest.body ?? ''];
-  const requests = await commandRequests(api, number, warnings);
-  if (pullRequest.merged_at) {
-    return { ...EMPTY, messages, requests, mergedPullRequests: [pullRequest], warnings };
-  }
-  return {
-    ...EMPTY,
-    base: mergeBase(repoRoot, pullRequest.base.sha),
-    messages,
-    requests,
-    pullRequest,
-    warnings,
-  };
-}
-
-function isFork(pullRequest: PullRequest) {
-  const head = pullRequest.head.repo?.full_name;
-  const base = pullRequest.base.repo?.full_name;
-  // A deleted fork has no repository; treat it as a fork
-  return !head || !base || head !== base;
-}
-
-function headIs(repoRoot: string, pullRequest: PullRequest) {
-  return git(repoRoot, ['rev-parse', 'HEAD']).trim() === pullRequest.head.sha;
 }
 
 function mergeBase(repoRoot: string, baseSha: string) {
@@ -247,104 +71,4 @@ function mergeBase(repoRoot: string, baseSha: string) {
       `Can't find the merge base with ${baseSha}. Check out with fetch-depth: 0 so history is available.`,
     );
   }
-}
-
-/**
- * Stack patterns from /pulumi-affected commands on a pull request. Commands count only from
- * people with write access; others get one reply explaining why theirs was ignored.
- */
-async function commandRequests(api: GitHubApi, number: number, warnings: string[]) {
-  const comments = await api.list<Comment>(api.repo(`/issues/${number}/comments`));
-  const access = new Map<string, boolean>();
-  const requests: Request[] = [];
-  for (const comment of comments) {
-    const body = comment.body ?? '';
-    if (OWN_COMMENT.test(body)) continue;
-    const lines = [...body.matchAll(COMMANDS)].map((match) => match[1]);
-    const login = comment.user?.login;
-    if (lines.length === 0 || !login) continue;
-
-    let allowed = access.get(login);
-    if (allowed === undefined) {
-      allowed = await canWrite(api, login);
-      access.set(login, allowed);
-    }
-    if (!allowed) {
-      await replyIgnored(api, number, comment, comments, warnings);
-      continue;
-    }
-    const source = `/pulumi-affected preview from @${login} on #${number}`;
-    for (const line of lines) {
-      for (const pattern of splitPatterns(line)) requests.push({ pattern, source });
-    }
-  }
-  return requests;
-}
-
-/**
- * Whether the user can push to the repository. The base `permission` is used rather than the
- * role name, so custom roles built on write count; GitHub answers 404 for non-collaborators.
- */
-async function canWrite(api: GitHubApi, login: string) {
-  if (!login) return false;
-  try {
-    const result = await api.request<{ permission: string }>(
-      'GET',
-      api.repo(`/collaborators/${encodeURIComponent(login)}/permission`),
-    );
-    return WRITE_PERMISSIONS.has(result.permission);
-  } catch {
-    return false;
-  }
-}
-
-async function replyIgnored(
-  api: GitHubApi,
-  number: number,
-  comment: Comment,
-  comments: Comment[],
-  warnings: string[],
-) {
-  const marker = `<!-- pulumi-affected:ignored:${comment.id} -->`;
-  const isOwn = await api.ownComments();
-  const replied = comments.some(
-    (existing) => isOwn(existing.user) && existing.body?.startsWith(marker),
-  );
-  if (replied) return;
-  try {
-    await api.request('POST', api.repo(`/issues/${number}/comments`), {
-      body: `${marker}\n@${comment.user?.login} only people with write access to this repository can run \`/pulumi-affected\` commands, so this one was ignored.`,
-    });
-  } catch (error) {
-    // Pull requests from forks get a read-only token
-    warnings.push(
-      `Couldn't reply to an ignored command: ${error instanceof Error ? error.message : error}`,
-    );
-  }
-}
-
-/**
- * Pull requests merged into `branch` by a push. Following first parents visits each merge once
- * instead of every commit of every merged branch.
- */
-async function mergedPullRequests(
-  api: GitHubApi,
-  repoRoot: string,
-  before: string,
-  branch: string,
-) {
-  const commits = git(repoRoot, ['rev-list', '--first-parent', `${before}..HEAD`])
-    .split('\n')
-    .filter(Boolean);
-  const pullRequests = new Map<number, PullRequest>();
-  for (const sha of commits) {
-    const found = await api.request<PullRequest[]>('GET', api.repo(`/commits/${sha}/pulls`));
-    for (const pullRequest of found) {
-      // The endpoint also returns open pull requests containing the commit
-      if (pullRequest.merged_at && (!branch || pullRequest.base.ref === branch)) {
-        pullRequests.set(pullRequest.number, pullRequest);
-      }
-    }
-  }
-  return [...pullRequests.values()];
 }

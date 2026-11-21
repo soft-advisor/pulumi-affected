@@ -29,21 +29,15 @@ inputs:
     description: Select every stack.
     required: false
     default: 'false'
-  pull-request:
-    description: >-
-      Number of a pull request to use instead of the triggering event: an open one is compared
-      with its merge base, and a merged one is where a deploy reports. For workflow_dispatch and
-      other events without one.
-    required: false
   working-directory:
     description: 'A folder inside the repository. Default: the workspace.'
     required: false
-  github-token:
+
+  output-file:
     description: >-
-      Token for reading /pulumi-affected commands on pull requests and replying to ignored ones.
-      Needs pull-requests: write. Leave empty to skip commands.
+      Also write the whole selection as JSON to this file, e.g. for an artifact that later jobs or
+      a workflow after merge read.
     required: false
-    default: ${{ github.token }}
 
 outputs:
   stacks:

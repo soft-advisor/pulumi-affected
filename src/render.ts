@@ -1,4 +1,3 @@
-import { code, reasonText, safeText } from './run/report.ts';
 import type { SelectResult } from './select.ts';
 
 /** A Markdown summary of a selection, for job summaries and pull request comments */
@@ -48,4 +47,35 @@ export function renderMarkdown(result: SelectResult) {
 
 function shortLabel(label: string) {
   return /^[0-9a-f]{40}$/.test(label) ? label.slice(0, 7) : label;
+}
+
+/**
+ * Text from outside the tool, for a table cell or code span: HTML-escaped, with the characters
+ * Markdown acts on as entities too, so repository content can't add links, images, mentions or
+ * formatting
+ */
+export function safeText(text: string) {
+  return escapeHtml(text)
+    .replace(/[|[\]()!@#*_~`:\\<>]/g, (character) => `&#${character.charCodeAt(0)};`)
+    .replace(/\n/g, ' ');
+}
+
+/** A name in code style; <code> rather than backticks, so a backtick in it can't break out */
+export function code(text: string) {
+  return `<code>${safeText(text)}</code>`;
+}
+
+/**
+ * A reason, which is the tool's own text with names from the repository in backticks: the names
+ * become code, and everything is escaped
+ */
+export function reasonText(text: string) {
+  return text
+    .split('`')
+    .map((part, index) => (index % 2 === 1 ? code(part) : safeText(part)))
+    .join('');
+}
+
+function escapeHtml(text: string) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
