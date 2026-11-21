@@ -7,7 +7,7 @@ Guidance for anyone changing this repo, human or agent. See [README.md](README.m
 - **Public, reusable package.** No organization-specific names, URLs or IDs in `src/`; take them as config with sensible defaults.
 - **Analysis runs against snapshots, not the disk.** Read files through `Snapshot` (`src/snapshot.ts`), so the base revision is analysed exactly as it was.
 - **Every reason is user-facing.** It appears in job summaries and PR comments; keep it short and specific, naming the file and the function or package.
-- **The action runs the committed bundle.** Run `pnpm build` and commit `select/dist`, `classify/dist`, `plan/dist`, `apply/dist` and `schema.json` with any change to `src/`; CI fails otherwise.
+- **The actions and npm get the committed build.** Run `pnpm build` and commit `dist`, `select/dist`, `classify/dist`, `plan/dist`, `apply/dist` and `schema.json` with any change to `src/`; CI fails otherwise. npm gets exactly the committed `dist`.
 - **Scenarios first.** A new detection rule gets a case in `test/` and, when it's about a realistic layout, a scenario in `e2e/scenarios.json` with fixtures in `e2e/fixtures`.
 - **Readable code.** One statement per line, named checks with specific errors, descriptive names, named constants, and comments that explain why.
 - **CI uses GitHub-hosted runners and GitHub's own actions,** pinned to commit SHAs.

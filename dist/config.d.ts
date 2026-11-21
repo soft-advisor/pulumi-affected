@@ -1,0 +1,30 @@
+import type { IgnoreRule } from './classify.ts';
+import type { Snapshot } from './snapshot.ts';
+export declare const CONFIG_FILE = "pulumi-affected.yaml";
+export interface Config {
+    projects: {
+        include: string[];
+        exclude: string[];
+    };
+    stacks: string[];
+    dependsOn: Record<string, string[]>;
+    rules: {
+        when: string[];
+        run: string[];
+    }[];
+    always: string[];
+    inputs: Record<string, string[]>;
+    globalInputs: string[];
+    packages: {
+        ignore: string[];
+    };
+    classify: {
+        ignore: IgnoreRule[];
+    };
+}
+export declare function defaultConfig(): Config;
+export declare class ConfigError extends Error {
+}
+/** Reads pulumi-affected.yaml from the snapshot's repo root; a missing file means defaults */
+export declare function loadConfig(snapshot: Snapshot, path?: string): Config;
+export declare function parseConfig(text: string, path?: string): Config;
