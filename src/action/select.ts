@@ -4,7 +4,7 @@ import { renderMarkdown } from '../render.ts';
 import { select } from '../select.ts';
 import { repoRootOf } from '../snapshot.ts';
 import { splitPatterns } from '../patterns.ts';
-import { eventContext } from './context.ts';
+import { type Context, eventContext } from './context.ts';
 import {
   appendSummary,
   booleanInput,
@@ -25,7 +25,11 @@ function main() {
   const cwd = input('working-directory') || process.cwd();
   const repoRoot = repoRootOf(cwd);
   const event = readEvent();
-  const context = eventContext(event, repoRoot);
+  // An explicit base replaces what the event would say, so the event isn't read at all: it may
+  // belong to another repository, as when a workflow selects in a checkout of its own
+  const context: Context = input('base')
+    ? { base: undefined, messages: [], all: false, warnings: [] }
+    : eventContext(event, repoRoot);
   for (const message of context.warnings) warning(message);
 
   const base = input('base') || context.base;

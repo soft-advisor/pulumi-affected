@@ -93,6 +93,19 @@ test('select on a push compares with the previous commit, and a new branch selec
   assert.deepEqual(JSON.parse(branch.outputs.ids), ['alpha/dev', 'beta/dev']);
 });
 
+test('an explicit base replaces the event, which may not even be about this repository', async () => {
+  const { dir, base } = createRepo(PROJECTS);
+  commit(dir, { 'beta/index.ts': 'export const b = 2;\n' });
+  const { outputs } = await runAction(
+    SELECT,
+    dir,
+    'pull_request',
+    { pull_request: { body: '', base: { sha: 'f'.repeat(40) } } },
+    { base },
+  );
+  assert.deepEqual(JSON.parse(outputs.ids), ['beta/dev']);
+});
+
 test('without history for the merge base, the error says to fetch it', async () => {
   const { dir } = createRepo(PROJECTS);
   const { stdout } = await runAction(SELECT, dir, 'pull_request', {
