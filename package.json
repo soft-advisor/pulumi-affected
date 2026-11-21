@@ -38,8 +38,7 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json && node scripts/build-action.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test 'test/**/*.test.ts'",
-    "lint": "biome check",
-    "prepublishOnly": "pnpm build"
+    "lint": "biome check"
   },
   "dependencies": {
     "@yarnpkg/parsers": "3.0.3",
