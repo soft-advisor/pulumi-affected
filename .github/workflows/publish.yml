@@ -73,7 +73,8 @@ jobs:
         run: |
           gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/v$VERSION" -f sha="$GITHUB_SHA"
           major="v${VERSION%%.*}"
-          if gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" >/dev/null 2>&1; then
+          # git/ref (singular) matches exactly; git/refs would also match v0.1.0 for v0
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$major" >/dev/null 2>&1; then
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" -f sha="$GITHUB_SHA" -F force=true
           else
             gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$major" -f sha="$GITHUB_SHA"
