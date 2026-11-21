@@ -39,6 +39,8 @@ export interface ProjectAnalysis {
   programDir: string;
   /** Finds constants in this snapshot's modules, for evaluating stack reference names */
   lookup: EvaluationContext['lookup'];
+  /** Resolves an import to a repository file, as this analysis does */
+  resolveFile(specifier: string, from: string): string | undefined;
 }
 
 export interface Gap {
@@ -120,6 +122,10 @@ export function analyzeProject(
     entry: findEntry(snapshot, project, programDir, resolver),
     programDir,
     lookup: () => undefined,
+    resolveFile: (specifier, from) => {
+      const resolution = resolver.resolve(specifier, from);
+      return resolution.kind === 'file' ? resolution.path : undefined;
+    },
   };
   const addGap = (message: string, dir: string) => analysis.gaps.push({ message, dir });
   for (const extendsPackage of resolver.configPackages) {

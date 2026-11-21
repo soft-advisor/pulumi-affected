@@ -75,6 +75,11 @@ test('ignore rules drop known noise, but only updates of the listed properties',
   const noise = classify(preview(steps(['assumeRole'])), rules);
   assert.equal(noise.changed, false);
   assert.equal(noise.ignored.length, 1);
+  // @pulumi/aws v6 reports the nested path as a reason too
+  assert.equal(
+    classify(preview(steps(['assumeRole', 'assumeRole.roleArn'])), rules).changed,
+    false,
+  );
   const real = classify(preview(steps(['assumeRole', 'region'])), rules);
   assert.equal(real.changed, true);
   const unknownProperties = classify(preview(steps([])), rules);

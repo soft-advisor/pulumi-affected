@@ -79,6 +79,11 @@ export interface SelectResult {
    * can't be worked out (or the dependency comes from `dependsOn`)
    */
   outputsRead: OutputsRead;
+  /**
+   * Stacks that may read other stacks' outputs in ways analysis can't see (programs that aren't
+   * JavaScript or TypeScript, stack names that can't be worked out) and have no `dependsOn`
+   */
+  unknownReaders: string[];
   warnings: string[];
 }
 
@@ -209,6 +214,7 @@ export function select(options: SelectOptions): SelectResult {
       [...graph].map(([id, dependencies]) => [id, [...dependencies].sort()]),
     ),
     outputsRead: session.outputsReadRecord(),
+    unknownReaders: [...session.unknownReaders].sort(),
     warnings: [...new Set(warnings)],
   };
 }
@@ -226,6 +232,8 @@ function stackBase(options: SelectOptions, stack: Stack, defaultBase: string, re
 export class Session {
   readonly warnings: string[] = [];
   readonly graphWarnings: string[] = [];
+  /** Stacks that may read other stacks' outputs in ways analysis can't see */
+  readonly unknownReaders = new Set<string>();
   /** Stack id → dependency id → outputs read, filled in by dependencyGraph */
   private readonly outputsRead = new Map<string, Map<string, Set<string> | 'all'>>();
 
@@ -307,7 +315,7 @@ export class Session {
         const text = this.head.read(path);
         if (text !== undefined) files.set(path, text);
       }
-      references = new ProgramReferences(files, analysis.entry);
+      references = new ProgramReferences(files, analysis.entry, analysis.resolveFile);
       this.references.set(project.file, references);
     }
     return references;
@@ -583,7 +591,14 @@ export class Session {
   dependencyGraph(projects: Project[], stacks: Stack[]): DependencyGraph {
     const graph: DependencyGraph = new Map();
     for (const project of projects) {
-      if (!isNodeRuntime(project)) continue;
+      if (!isNodeRuntime(project)) {
+        // Their stack references aren't analysed; a YAML program shows whether it has any
+        const text = project.runtime === 'yaml' ? (this.head.read(project.file) ?? '') : undefined;
+        if (text === undefined || text.includes('StackReference')) {
+          for (const stack of project.stacks) this.unknownReaders.add(stack.id);
+        }
+        continue;
+      }
       const analysis = this.analysis(this.head, project);
       for (const stack of project.stacks) {
         const stackConfig = parseYamlFile(this.head, stack.configFile) as
@@ -605,6 +620,7 @@ export class Session {
             unknown: WILDCARD,
           });
           const targets = stacksNamed(name ?? WILDCARD, project, stacks);
+          if (targets.length === 0) this.unknownReaders.add(stack.id);
           if (name === undefined || name === WILDCARD) {
             this.graphWarnings.push(
               `${stack.id}: a StackReference in ${module.path} has a name that can't be worked out; add it to dependsOn`,
@@ -652,6 +668,7 @@ export class Session {
           addEdge(graph, stack.id, dependency.id);
           // What a stack reads from a dependency the analysis can't see is unknown
           this.recordReads(stack.id, dependency.id, 'all');
+          this.unknownReaders.delete(stack.id);
         }
       }
     }
@@ -918,6 +935,7 @@ export function readDependencyGraph(options: { cwd: string; head?: string; confi
     stacks,
     graph,
     outputsRead: session.outputsReadRecord(),
+    unknownReaders: [...session.unknownReaders].sort(),
     warnings: session.graphWarnings,
   };
 }

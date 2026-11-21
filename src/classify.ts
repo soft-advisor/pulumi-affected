@@ -122,8 +122,9 @@ function isStackStep(step: Step) {
 function toChange(step: Step): ResourceChange {
   const urnParts = step.urn.split('::');
   const type = step.newState?.type ?? step.oldState?.type ?? urnParts[2]?.split('$').pop() ?? '';
-  const properties = new Set(step.diffReasons ?? []);
-  for (const path of Object.keys(step.detailedDiff ?? {})) {
+  // Top-level properties: providers report nested paths too (`assumeRole.roleArn`)
+  const properties = new Set<string>();
+  for (const path of [...(step.diffReasons ?? []), ...Object.keys(step.detailedDiff ?? {})]) {
     properties.add(path.split(/[.[]/)[0]);
   }
   return {

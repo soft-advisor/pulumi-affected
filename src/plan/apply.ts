@@ -15,14 +15,14 @@ import { loadConfig } from '../config.ts';
 import { CycleError, computeWaves, type DependencyGraph } from '../graph.ts';
 import { matchesAnyStack } from '../patterns.ts';
 import { errorText, onCancel, type PulumiRunner } from '../pulumi/runner.ts';
-import { recentUpdates, stateFingerprint } from '../pulumi/stack.ts';
-import { readDependencyGraph } from '../select.ts';
+import { recentUpdates, secretsProviderOf, stateFingerprint } from '../pulumi/stack.ts';
+import { readDependencyGraph, type SelectOptions, select } from '../select.ts';
 import { GitSnapshot, git, repoRootOf, resolveCommit } from '../snapshot.ts';
 import { mapConcurrently } from './concurrency.ts';
 import { hashText, type Manifest, type PlannedStack, readManifest } from './manifest.ts';
-import { encryptionSaltOf, pulumiVersion } from './plan.ts';
+import { encryptionSaltOf, pulumiVersion, unknownReadersWarning } from './plan.ts';
 import { describeRead, type StaleRead, staleReads } from './outputs.ts';
-import { relaxPlan } from './planfile.ts';
+import { relaxPlan, stackOutputChanges, unknownOutputChanges } from './planfile.ts';
 
 /*
  * Applies the plans `plan` wrote, exactly: `pulumi up --plan` for each, in dependency order, and
@@ -42,6 +42,13 @@ export interface ApplyOptions {
   concurrency: number;
   /** Stack patterns that may be applied; a plan for any other stack is refused */
   allow?: string[];
+  /**
+   * How the change was selected (its base, Pulumi-Affected-Run lines and so on). The selection
+   * is worked out again from the commit, and a plan for a stack it doesn't select is refused.
+   */
+  select?: Omit<SelectOptions, 'cwd' | 'head' | 'config'>;
+  /** Stop at the first stack that isn't applied, instead of applying every other one */
+  failFast?: boolean;
   onFinish?: (result: StackApplyResult) => void;
 }
 
@@ -77,8 +84,9 @@ export interface ApplyResult {
 
 export class ApplyError extends Error {}
 
-export function updateMessage(stack: PlannedStack) {
-  return `pulumi-affected:${stack.planHash}`;
+/** Tags the update with the plan and the code it's for, so a rerun recognises it */
+export function updateMessage(stack: PlannedStack, tree: string) {
+  return `pulumi-affected:${stack.planHash}:${tree}`;
 }
 
 const DONE = new Set<ApplyOutcome>(['applied', 'already-applied']);
@@ -106,13 +114,24 @@ export async function applyPlans(options: ApplyOptions): Promise<ApplyResult> {
     stacks: known,
     graph,
     outputsRead,
+    unknownReaders,
   } = readDependencyGraph({ cwd: repoRoot, head: commit, config });
   checkCheckout(repoRoot, directory, known);
   const byId = new Map(known.map((stack) => [stack.id, stack]));
+  const selected = options.select
+    ? new Set(
+        select({ ...options.select, cwd: repoRoot, head: commit, config }).stacks.map(
+          (stack) => stack.id,
+        ),
+      )
+    : undefined;
   for (const stack of manifest.stacks) {
     const match = byId.get(stack.id);
     if (!match || match.dir !== stack.dir || match.stack !== stack.stack) {
       throw new ApplyError(`${stack.id} in the manifest isn't a stack this commit defines`);
+    }
+    if (selected && !selected.has(stack.id)) {
+      throw new ApplyError(`${stack.id} has a plan, but this change doesn't select it`);
     }
     if (options.allow && !matchesAnyStack(options.allow, match)) {
       throw new ApplyError(`${stack.id} has a plan but isn't one of the stacks allowed to apply`);
@@ -125,9 +144,14 @@ export async function applyPlans(options: ApplyOptions): Promise<ApplyResult> {
     warnings.push(`Planned with Pulumi ${manifest.pulumiVersion}, applying with ${version}`);
   }
 
+  // The outputs each plan changes, from the plan files themselves (their hashes were checked)
+  const changes = manifest.stacks.map((stack) => ({
+    id: stack.id,
+    ...outputChanges(readFileSync(join(directory, stack.plan), 'utf8')),
+  }));
   const planned = new Map(manifest.stacks.map((stack) => [stack.id, stack]));
   const stale = staleReads(
-    manifest.stacks,
+    changes,
     Object.fromEntries([...graph].map(([id, dependencies]) => [id, [...dependencies]])),
     outputsRead,
   );
@@ -135,15 +159,23 @@ export async function applyPlans(options: ApplyOptions): Promise<ApplyResult> {
   for (const wave of applyWaves(graph, [...planned.keys()])) {
     const stacks = wave.map((id) => planned.get(id) as PlannedStack);
     await mapConcurrently(stacks, options.concurrency, async (stack) => {
-      const result =
-        blockedBy(stack, graph, planned, stale, results) ??
-        (await applyStack(stack, {
-          ...options,
-          directory,
-          repoRoot,
-          configFile: byId.get(stack.id)?.configFile ?? '',
-          ignore: config.classify.ignore,
-        }));
+      const stopped =
+        options.failFast && [...results.values()].some((done) => !DONE.has(done.outcome));
+      const result: StackApplyResult = stopped
+        ? {
+            id: stack.id,
+            outcome: 'skipped',
+            error: 'not tried: an earlier stack failed (fail-fast)',
+          }
+        : (blockedBy(stack, graph, planned, stale, results) ??
+          (await applyStack(stack, {
+            ...options,
+            directory,
+            repoRoot,
+            configFile: byId.get(stack.id)?.configFile ?? '',
+            ignore: config.classify.ignore,
+            tree,
+          })));
       results.set(stack.id, result);
       options.onFinish?.(result);
     });
@@ -151,6 +183,12 @@ export async function applyPlans(options: ApplyOptions): Promise<ApplyResult> {
 
   const stacks = manifest.stacks.map((stack) => results.get(stack.id) as StackApplyResult);
   const applied = (id: string) => DONE.has(results.get(id)?.outcome ?? 'failed');
+  const changedOutputs = changes.filter(
+    (change) => change.outputs.length > 0 && applied(change.id),
+  );
+  if (changedOutputs.length > 0 && unknownReaders.length > 0) {
+    warnings.push(unknownReadersWarning(changedOutputs, unknownReaders));
+  }
   // A stack reading outputs that an applied plan changed was planned (or deployed) without them
   const followUps = stale.filter((read) => applied(read.dependency) && !applied(read.id));
   return {
@@ -182,7 +220,11 @@ function blockedBy(
   results: Map<string, StackApplyResult>,
 ): StackApplyResult | undefined {
   const dependencies = [...(graph.get(stack.id) ?? [])].filter((id) => planned.has(id));
-  const notApplied = dependencies.filter((id) => !DONE.has(results.get(id)?.outcome ?? 'failed'));
+  // Only stacks already tried count: in a cycle, the other stacks come later
+  const notApplied = dependencies.filter((id) => {
+    const outcome = results.get(id)?.outcome;
+    return outcome !== undefined && !DONE.has(outcome);
+  });
   if (notApplied.length > 0) {
     return { id: stack.id, outcome: 'skipped', error: `not applied: ${notApplied.join(', ')}` };
   }
@@ -211,12 +253,15 @@ function checkCheckout(repoRoot: string, directory: string, known: { configFile:
     (path === planFolder || path.startsWith(`${planFolder}/`));
   const configFiles = new Set(known.map((stack) => stack.configFile));
   const split = (text: string) => text.split('\0').filter(Boolean);
+  // Only new files may sit in the plan directory; it never covers files of the commit
   const changed = [
-    ...split(git(repoRoot, ['diff', '--name-only', '-z', 'HEAD'])),
-    ...split(git(repoRoot, ['ls-files', '--others', '--exclude-standard', '-z'])),
-  ].filter(
-    (path) => !insidePlans(path) && !(configFiles.has(path) && onlySaltChanged(repoRoot, path)),
-  );
+    ...split(git(repoRoot, ['diff', '--name-only', '-z', 'HEAD'])).filter(
+      (path) => !(configFiles.has(path) && onlySaltChanged(repoRoot, path)),
+    ),
+    ...split(git(repoRoot, ['ls-files', '--others', '--exclude-standard', '-z'])).filter(
+      (path) => !insidePlans(path),
+    ),
+  ];
   if (changed.length > 0) {
     throw new ApplyError(
       `The checkout has files the commit doesn't: ${changed.join(', ')}; apply from a clean checkout`,
@@ -250,11 +295,13 @@ interface StackContext extends ApplyOptions {
   repoRoot: string;
   configFile: string;
   ignore: readonly IgnoreRule[];
+  /** The planned tree, which update messages name */
+  tree: string;
 }
 
 async function applyStack(stack: PlannedStack, context: StackContext): Promise<StackApplyResult> {
   const { runner } = context;
-  const message = updateMessage(stack);
+  const message = updateMessage(stack, context.tree);
   const fail = (error: string): StackApplyResult => ({ id: stack.id, outcome: 'failed', error });
   try {
     const current = await stateFingerprint(runner, stack);
@@ -269,7 +316,7 @@ async function applyStack(stack: PlannedStack, context: StackContext): Promise<S
         error: "the stack's state changed since it was planned; plan it again",
       };
     }
-    restoreSalt(stack, join(context.repoRoot, context.configFile));
+    restoreSalt(stack, current.salt, join(context.repoRoot, context.configFile));
 
     // Checked again here: programs and wrappers that ran earlier in this job could change files
     const text = readFileSync(join(context.directory, stack.plan));
@@ -310,12 +357,20 @@ async function appliedBefore(stack: PlannedStack, runner: PulumiRunner, message:
 }
 
 /**
- * Puts back the encryption salt of a stack `plan` created, which its plan's secrets are encrypted
- * with, when the checkout's config file doesn't have one
+ * Puts back the passphrase encryption salt of a stack `plan` created, which its plan's secrets are
+ * encrypted with, when the checkout's config file doesn't have one. The backend's own record of
+ * it is used when there is one; the manifest's only for a stack that doesn't have one yet.
  */
-function restoreSalt(stack: PlannedStack, configPath: string) {
-  if (!stack.encryptionSalt || encryptionSaltOf(configPath) !== undefined) return;
-  const existing = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
-  const separator = existing === '' || existing.endsWith('\n') ? '' : '\n';
-  appendFileSync(configPath, `${separator}encryptionsalt: ${stack.encryptionSalt}\n`);
+function restoreSalt(stack: PlannedStack, backendSalt: string | undefined, configPath: string) {
+  if (!stack.created || encryptionSaltOf(configPath) !== undefined) return;
+  const config = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
+  if (secretsProviderOf(config) !== undefined) return;
+  const salt = backendSalt ?? stack.encryptionSalt;
+  if (!salt) return;
+  const separator = config === '' || config.endsWith('\n') ? '' : '\n';
+  appendFileSync(configPath, `${separator}encryptionsalt: ${salt}\n`);
+}
+
+function outputChanges(plan: string) {
+  return { outputs: stackOutputChanges(plan), unknownOutputs: unknownOutputChanges(plan) };
 }

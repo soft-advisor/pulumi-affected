@@ -75,7 +75,7 @@ test('followed across files: a reference exported and imported, by name or names
   );
 });
 
-test('followed into helpers: names passed as arguments, or typed as a union', () => {
+test('followed into helpers: the names every call passes', () => {
   assert.deepEqual(
     readsOf(
       `${header}const net = ${NET};\n` +
@@ -88,7 +88,8 @@ test('followed into helpers: names passed as arguments, or typed as a union', ()
     readsOf(`${header}import { output } from './helpers';\nexport const a = output('cidr');\n`, {
       'helpers.ts': `${header}const net = ${NET};\nexport function output(name: 'cidr' | 'subnets') {\n  return net.getOutput(name);\n}\n`,
     }),
-    ['cidr', 'subnets'],
+    // Typed as a union, but only ever called with one of them
+    ['cidr'],
   );
 });
 
@@ -107,6 +108,72 @@ test('still all when a helper is called with a name that cannot be known', () =>
       `${header}const net = ${NET};\n` +
         'const out = (name: string) => net.getOutput(name);\n' +
         "export const a = out('vpcId');\nexport const b = out(process.env.NAME!);\n",
+    ),
+    'all',
+  );
+});
+
+const REFS = { 'refs.ts': `${header}export const network = ${NET};\n` };
+
+test('imports resolve as the analysis resolves them: tsconfig paths and #imports', () => {
+  assert.deepEqual(
+    readsOf(
+      `${header}import { network } from '@lib/refs';\nexport const a = network.getOutput('secret');\n`,
+      {
+        'tsconfig.json': JSON.stringify({
+          compilerOptions: { baseUrl: '.', paths: { '@lib/*': ['lib/*'] } },
+        }),
+        'lib/refs.ts': `${header}export const network = ${NET};\n`,
+      },
+    ),
+    ['secret'],
+  );
+  assert.deepEqual(
+    readsOf(
+      `${header}import { network } from '#refs';\nexport const a = network.getOutput('secret');\n`,
+      {
+        'package.json': JSON.stringify({ name: 'app', imports: { '#refs': './refs.ts' } }),
+        ...REFS,
+      },
+    ),
+    ['secret'],
+  );
+});
+
+test('references exported from a module loaded with require() or import() read all', () => {
+  for (const code of [
+    "const refs = require('./refs');\nexport const a = refs.network.getOutput('secret');\n",
+    "export const a = import('./refs').then((m) => m.network.getOutput('secret'));\n",
+  ]) {
+    assert.equal(
+      readsOf(
+        `${header}import { network } from './refs';\nnetwork.getOutput('vpcId');\n${code}`,
+        REFS,
+      ),
+      'all',
+      code,
+    );
+  }
+});
+
+test('overloads, arguments and casts are never trusted', () => {
+  const overloaded =
+    `${header}import { network } from './refs';\n` +
+    'function read(ref: pulumi.StackReference): pulumi.Output<any>;\n' +
+    'function read(ref: pulumi.StackReference, name?: string) { return ref.getOutput(name ?? "secret"); }\n' +
+    'export const a = read(network);\n';
+  assert.equal(readsOf(overloaded, REFS), 'all');
+  assert.equal(
+    readsOf(
+      `${header}import { network } from './refs';\nfunction read(ref: any) { return arguments[0].getOutput('secret'); }\nexport const a = read(network);\n`,
+      REFS,
+    ),
+    'all',
+  );
+  assert.equal(
+    readsOf(
+      `${header}import { network } from './refs';\nexport const a = network.getOutput(process.env.X as 'vpcId');\n`,
+      REFS,
     ),
     'all',
   );

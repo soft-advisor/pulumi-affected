@@ -54,6 +54,22 @@ export function stackOutputChanges(text: string) {
   return [...changed].sort();
 }
 
+/** Of the changed stack outputs, those whose new value isn't known until applying */
+export function unknownOutputChanges(text: string) {
+  const plan = parse(text);
+  const unknown = new Set<string>();
+  for (const resource of Object.values(plan.resourcePlans ?? {})) {
+    if (resource.goal?.type !== 'pulumi:pulumi:Stack') continue;
+    const diff = resource.goal.outputDiff;
+    for (const part of [diff?.adds, diff?.updates]) {
+      for (const [key, value] of Object.entries(part ?? {})) {
+        if (JSON.stringify(value).includes(UNKNOWN)) unknown.add(key);
+      }
+    }
+  }
+  return [...unknown].sort();
+}
+
 /**
  * The plan with the properties that ignore rules name left open: any value is accepted for them.
  * This is what lets plans made with a read-only role apply with the deploy role, when the role
@@ -73,7 +89,7 @@ export function relaxPlan(text: string, rules: readonly IgnoreRule[]) {
       for (const property of rule.properties ?? []) {
         let touched = false;
         for (const part of [diff.adds, diff.updates]) {
-          if (part && property in part) {
+          if (part && Object.hasOwn(part, property)) {
             part[property] = UNKNOWN;
             touched = true;
           }
@@ -81,7 +97,11 @@ export function relaxPlan(text: string, rules: readonly IgnoreRule[]) {
         if (Array.isArray(diff.deletes) && diff.deletes.includes(property)) {
           diff.deletes = diff.deletes.filter((key) => key !== property);
           touched = true;
-        } else if (diff.deletes && !Array.isArray(diff.deletes) && property in diff.deletes) {
+        } else if (
+          diff.deletes &&
+          !Array.isArray(diff.deletes) &&
+          Object.hasOwn(diff.deletes, property)
+        ) {
           delete diff.deletes[property];
           touched = true;
         }

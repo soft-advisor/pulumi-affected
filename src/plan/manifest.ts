@@ -41,6 +41,8 @@ export interface PlannedStack {
   changes: ResourceChange[];
   /** Stack outputs the plan adds, changes or removes */
   outputs: string[];
+  /** Of those, the ones whose new value is only known once applied */
+  unknownOutputs?: string[];
   reasons: string[];
 }
 

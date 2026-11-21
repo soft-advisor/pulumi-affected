@@ -16,24 +16,35 @@ export interface StaleRead {
   outputs: string[];
   /** Whether the code shows it reads these outputs, rather than it being assumed */
   certain: boolean;
+  /** Whether these outputs' new values are only known once applied: they may not change */
+  maybe?: boolean;
 }
 
 export function staleReads(
-  planned: readonly { id: string; outputs: string[] }[],
+  planned: readonly { id: string; outputs: string[]; unknownOutputs?: string[] }[],
   dependencies: Record<string, readonly string[]>,
   outputsRead: OutputsRead,
 ): StaleRead[] {
   const changed = new Map(
-    planned.filter((stack) => stack.outputs.length > 0).map((stack) => [stack.id, stack.outputs]),
+    planned.filter((stack) => stack.outputs.length > 0).map((stack) => [stack.id, stack]),
   );
   const stale: StaleRead[] = [];
   for (const [id, stackDependencies] of Object.entries(dependencies)) {
     for (const dependency of stackDependencies) {
-      const outputs = changed.get(dependency);
-      if (!outputs) continue;
+      const plan = changed.get(dependency);
+      if (!plan) continue;
+      const outputs = plan.outputs;
       const reads = outputsRead[id]?.[dependency] ?? 'all';
       const read = reads === 'all' ? outputs : outputs.filter((output) => reads.includes(output));
-      if (read.length > 0) stale.push({ id, dependency, outputs: read, certain: reads !== 'all' });
+      if (read.length === 0) continue;
+      const maybe = read.every((output) => plan.unknownOutputs?.includes(output));
+      stale.push({
+        id,
+        dependency,
+        outputs: read,
+        certain: reads !== 'all',
+        ...(maybe ? { maybe } : {}),
+      });
     }
   }
   return stale.sort((a, b) => a.id.localeCompare(b.id) || a.dependency.localeCompare(b.dependency));
@@ -42,7 +53,10 @@ export function staleReads(
 /** "`site/dev` outputs `pageLength`, `url`" style text for reports */
 export function describeRead(read: StaleRead) {
   const outputs = read.outputs.map((output) => `\`${output}\``).join(', ');
+  const change = read.maybe
+    ? 'which this change may alter (their new values are only known once applied)'
+    : 'which this change alters';
   return read.certain
-    ? `reads ${outputs} from \`${read.dependency}\`, which this change alters`
-    : `may read ${outputs} from \`${read.dependency}\` (which outputs it reads can't be worked out), which this change alters`;
+    ? `reads ${outputs} from \`${read.dependency}\`, ${change}`
+    : `may read ${outputs} from \`${read.dependency}\` (which outputs it reads can't be worked out), ${change}`;
 }
