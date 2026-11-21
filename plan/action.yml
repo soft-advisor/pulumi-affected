@@ -48,6 +48,16 @@ inputs:
     description: How many stacks to preview at once.
     required: false
     default: '4'
+  create-stacks:
+    description: >-
+      When a selected stack that doesn't exist yet is created. plan: now, empty, in the real
+      backend, then planned like any other (needs a plan job that may create stacks). apply: by
+      the apply action; the change that adds it must give it no resources (checked with a
+      preview in a temporary local backend), so the plan job can be read-only. The config's
+      createStacks and a Pulumi-Affected-Create-Stacks line in the pull request override this;
+      see docs/new-stacks.md.
+    required: false
+    default: plan
   fail-fast:
     description: Stop at the first stack that fails to plan, instead of planning every other one.
     required: false
@@ -109,6 +119,7 @@ runs:
         INPUT_COMMAND: ${{ inputs.command }}
         INPUT_CONCURRENCY: ${{ inputs.concurrency }}
         INPUT_FAIL_FAST: ${{ inputs.fail-fast }}
+        INPUT_CREATE_STACKS: ${{ inputs.create-stacks }}
         INPUT_COMMENT: ${{ inputs.comment }}
         INPUT_PULL_REQUEST: ${{ inputs.pull-request }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}

@@ -27,6 +27,7 @@ async function main() {
         runner,
         concurrency: positiveInteger('concurrency', 4),
         failFast: booleanInput('fail-fast'),
+        createStacks: createStacksInput(),
         onFinish: (outcome) => {
             if (outcome.kind === 'failed')
                 printUntrusted(`${outcome.id}: failed\n${outcome.error}`);
@@ -68,6 +69,13 @@ async function main() {
     if (manifest.failed.length > 0) {
         error(`Planning failed for ${manifest.failed.map((stack) => stack.id).join(', ')}`);
     }
+}
+function createStacksInput() {
+    const value = input('create-stacks') || 'plan';
+    if (value !== 'plan' && value !== 'apply') {
+        throw new Error(`create-stacks must be plan or apply, not "${value}"`);
+    }
+    return value;
 }
 main().catch((caught) => {
     error(caught instanceof Error ? caught.message : String(caught));

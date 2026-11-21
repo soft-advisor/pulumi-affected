@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 
 /*
  * Drives the end-to-end test of one scenario in this repository, as the e2e workflow's steps.
- * The workflow between them is the example from the README: the plan action on the pull request,
+ * The workflow between them is the example in docs/workflows.md: the plan action on the pull request,
  * and after merge the apply action, which finds the plans' artifact by the merged tree.
  *
  *   prepare        copies e2e/fixtures into a repository of its own, deploys every stack, pushes
@@ -35,6 +35,8 @@ interface Scenario {
   applied: string[];
   /** A stack to update after planning, so applying its plan is refused */
   changeState?: string;
+  /** The plan action's create-stacks input */
+  createStacks?: 'plan' | 'apply';
   /** Stacks whose plan is refused */
   refused?: string[];
   /** Stacks to plan again after the apply, as they read outputs it changed */
@@ -211,6 +213,7 @@ function prepare(index: number, dir: string) {
   output('base-sha', baseSha);
   output('head-sha', head);
   output('banner', scenario.banner ?? '');
+  output('create-stacks', scenario.createStacks ?? 'plan');
 }
 
 function writeChanges(dir: string, changes: Record<string, string | null>) {

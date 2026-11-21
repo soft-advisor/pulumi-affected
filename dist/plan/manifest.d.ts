@@ -10,10 +10,18 @@ export interface PlannedStack {
     dir: string;
     stack: string;
     wave: number;
-    /** A hash of the stack's state when planned; applying refuses any other state */
-    fingerprint: string;
+    /**
+     * A hash of the stack's state when planned; applying refuses any other state. Absent for a
+     * stack created on apply, which didn't exist when planned.
+     */
+    fingerprint?: string;
     /** Whether `plan` created the stack, empty, to plan it */
     created: boolean;
+    /**
+     * The stack didn't exist and is created when applying (`create-stacks: apply`). It was planned
+     * in a temporary backend, and its plan creates no resources.
+     */
+    createOnApply?: boolean;
     /**
      * The passphrase encryption salt Pulumi wrote into the config file of a stack `plan` created.
      * The plan's secrets are encrypted with it, so `apply` restores it in a checkout without one.

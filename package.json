@@ -26,7 +26,8 @@
   "files": [
     "dist",
     "schema.json",
-    "README.md"
+    "README.md",
+    "docs"
   ],
   "exports": {
     ".": {

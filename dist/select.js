@@ -136,6 +136,7 @@ export function select(options) {
         dependencies: Object.fromEntries([...graph].map(([id, dependencies]) => [id, [...dependencies].sort()])),
         outputsRead: session.outputsReadRecord(),
         unknownReaders: [...session.unknownReaders].sort(),
+        createStacks: requestsFor(defaultBase).create,
         warnings: [...new Set(warnings)],
     };
 }
@@ -756,12 +757,22 @@ export function describeFactChanges(before, after) {
     }
     return reasons;
 }
-/** Pulumi-Affected-Run/Skip lines in commit messages between base and head, and in `messages` */
+/**
+ * Pulumi-Affected-Run/Skip/Create-Stacks lines in commit messages between base and head, and in
+ * `messages`
+ */
 function readRequests(repoRoot, base, options) {
     const run = [];
     const skip = [];
+    const create = [];
     const scan = (text, source) => {
         for (const line of text.split('\n')) {
+            const creation = /^\s*Pulumi-Affected-Create-Stacks\s*:\s*(plan|apply)\b(.*)$/i.exec(line);
+            if (creation) {
+                const mode = creation[1].toLowerCase();
+                create.push({ mode, patterns: splitPatterns(creation[2]), source });
+                continue;
+            }
             const match = /^\s*(Pulumi-Affected-(?:Run|Skip))\s*:\s*(.+)$/i.exec(line);
             if (!match)
                 continue;
@@ -785,7 +796,7 @@ function readRequests(repoRoot, base, options) {
         run.push({ pattern, source: '--run' });
     for (const pattern of options.skip ?? [])
         skip.push({ pattern, source: '--skip' });
-    return { run, skip };
+    return { run, skip, create };
 }
 /** The stacks in the repo and how they depend on each other, as of `head` */
 export function readDependencyGraph(options) {

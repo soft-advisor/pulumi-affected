@@ -16,6 +16,16 @@ export interface Config {
   globalInputs: string[];
   packages: { ignore: string[] };
   classify: { ignore: IgnoreRule[] };
+  createStacks: CreateStacksConfig;
+}
+
+export type CreateStacks = 'plan' | 'apply';
+
+/** When stacks that don't exist yet are created: a default, and stack patterns that differ */
+export interface CreateStacksConfig {
+  default?: CreateStacks;
+  plan: string[];
+  apply: string[];
 }
 
 const DEFAULT_GLOBAL_INPUTS = ['.nvmrc', '.node-version'];
@@ -31,6 +41,7 @@ export function defaultConfig(): Config {
     globalInputs: [...DEFAULT_GLOBAL_INPUTS],
     packages: { ignore: [] },
     classify: { ignore: [] },
+    createStacks: { plan: [], apply: [] },
   };
 }
 
@@ -68,5 +79,10 @@ export function parseConfig(text: string, path = CONFIG_FILE): Config {
     globalInputs: parsed.globalInputs ?? defaults.globalInputs,
     packages: { ignore: parsed.packages?.ignore ?? [] },
     classify: { ignore: parsed.classify?.ignore ?? [] },
+    createStacks: {
+      default: parsed.createStacks?.default,
+      plan: parsed.createStacks?.plan ?? [],
+      apply: parsed.createStacks?.apply ?? [],
+    },
   };
 }

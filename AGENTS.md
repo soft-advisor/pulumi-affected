@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidance for anyone changing this repo, human or agent. See [README.md](README.md).
+Guidance for anyone changing this repo, human or agent. See [README.md](README.md) and [docs](docs/); keep the README lean and put details in docs.
 
 - **Select the fewest stacks that are provably enough.** Over-selection is the noise this tool exists to remove, so every rule that adds a stack needs a reason; but a missed change is never acceptable, so every rule that skips one needs a test showing it's safe, and where analysis can't be sure it falls back to selecting, with a warning.
 - **Select, plan and apply; never orchestrate.** The tool says which stacks a change affects and, given previews, which would change. The optional `plan` and `apply` actions make plans and apply exactly those, refusing anything they can't prove is what was planned (another tree, changed state, a tampered manifest). When to apply, approvals, triggers and credentials belong to each user's workflow; make behaviour configurable rather than deciding policy.

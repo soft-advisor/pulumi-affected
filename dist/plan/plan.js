@@ -1,11 +1,13 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { classify } from "../classify.js";
 import { loadConfig } from "../config.js";
-import { errorText } from "../pulumi/runner.js";
+import { matchesAnyStack, matchesStack } from "../patterns.js";
+import { errorText, onCancel } from "../pulumi/runner.js";
 import { secretsProviderOf, stateFingerprint } from "../pulumi/stack.js";
-import { select } from "../select.js";
+import { readDependencyGraph, select, } from "../select.js";
 import { git, repoRootOf, WorktreeSnapshot } from "../snapshot.js";
 import { mapConcurrently } from "./concurrency.js";
 import { describeRead, staleReads } from "./outputs.js";
@@ -35,6 +37,8 @@ export async function planStacks(options) {
                     directory,
                     repoRoot,
                     ignore: config.classify.ignore,
+                    createMode: createModeFor(stack, selection.createStacks, config, options),
+                    references: () => referencedStacks(stack.id, repoRoot, config, selection.dependencies),
                 });
             if (outcome.kind === 'failed')
                 failed = true;
@@ -100,6 +104,29 @@ export async function planStacks(options) {
     writeManifest(directory, manifest);
     return manifest;
 }
+/**
+ * When a stack that doesn't exist yet is created: a Pulumi-Affected-Create-Stacks line in the
+ * change (the last one naming it), else the config's patterns (plan's first), else the
+ * config's default, else the action's input, else when planning
+ */
+export function createModeFor(stack, requests, config, options) {
+    const requested = requests.filter((request) => request.patterns.length === 0 ||
+        request.patterns.some((pattern) => matchesStack(pattern, stack)));
+    const last = requested.at(-1);
+    if (last)
+        return last.mode;
+    if (matchesAnyStack(config.createStacks.plan, stack))
+        return 'plan';
+    if (matchesAnyStack(config.createStacks.apply, stack))
+        return 'apply';
+    return config.createStacks.default ?? options.createStacks ?? 'plan';
+}
+function referencedStacks(id, repoRoot, config, dependencies) {
+    const wanted = new Set(dependencies[id] ?? []);
+    if (wanted.size === 0)
+        return [];
+    return readDependencyGraph({ cwd: repoRoot, config }).stacks.filter((stack) => wanted.has(stack.id));
+}
 async function planStack(stack, context) {
     const files = planFileNames(stack.id);
     const planPath = join(context.directory, files.plan);
@@ -111,20 +138,29 @@ async function planStack(stack, context) {
     };
     let fingerprint;
     let created = false;
+    let createOnApply = false;
     let preview;
     try {
         let current = await stateFingerprint(context.runner, stack);
-        if (current.kind === 'missing') {
-            const init = await context.runner.run(stack, initArgs(context.repoRoot, stack.configFile));
-            if (init.code !== 0)
-                return fail(`couldn't create the stack: ${errorText(init)}`);
-            created = true;
-            current = await stateFingerprint(context.runner, stack);
-            if (current.kind !== 'exists')
-                return fail("the stack still doesn't exist after creating it");
+        if (current.kind === 'missing' && context.createMode === 'apply') {
+            createOnApply = true;
+            preview = await previewInTemporaryBackend(context, stack, planPath);
         }
-        fingerprint = current.fingerprint;
-        preview = await context.runner.run(stack, previewArgs(planPath));
+        else {
+            if (current.kind === 'missing') {
+                const init = await context.runner.run(stack, initArgs(context.repoRoot, stack.configFile));
+                if (init.code !== 0)
+                    return fail(`couldn't create the stack: ${errorText(init)}`);
+                created = true;
+                current = await stateFingerprint(context.runner, stack);
+                if (current.kind !== 'exists') {
+                    return fail("the stack still doesn't exist after creating it");
+                }
+            }
+            fingerprint = current.fingerprint;
+            writeSalt(join(context.repoRoot, stack.configFile), current.salt);
+            preview = await context.runner.run(stack, previewArgs(planPath));
+        }
     }
     catch (error) {
         return fail(error instanceof Error ? error.message : String(error));
@@ -147,8 +183,12 @@ async function planStack(stack, context) {
     catch (error) {
         return fail(error instanceof Error ? error.message : String(error));
     }
+    if (createOnApply && classification.changes.length > 0) {
+        const resources = classification.changes.map((change) => `${change.type} ${change.name}`);
+        return fail(`It doesn't exist yet, and it's created when applying (create-stacks: apply), so the change that adds it must give it no resources; this one would create ${resources.length}: ${resources.slice(0, 10).join(', ')}${resources.length > 10 ? ', …' : ''}. Add the stack first, empty, and its resources in a later pull request; or create it when planning with Pulumi-Affected-Create-Stacks: plan ${stack.id}`);
+    }
     // A new stack always has something to apply: creating it
-    if (!classification.changed && outputs.length === 0 && !created) {
+    if (!classification.changed && outputs.length === 0 && !created && !createOnApply) {
         rmSync(planPath, { force: true });
         rmSync(previewPath, { force: true });
         return { kind: 'unchanged', id: stack.id, reasons: stack.reasons };
@@ -161,7 +201,7 @@ async function planStack(stack, context) {
             dir: stack.dir,
             stack: stack.stack,
             wave: stack.wave,
-            fingerprint,
+            ...(createOnApply ? { createOnApply } : { fingerprint }),
             created,
             encryptionSalt: created
                 ? encryptionSaltOf(join(context.repoRoot, stack.configFile))
@@ -190,6 +230,92 @@ export function initArgs(repoRoot, configFile) {
         '--non-interactive',
         ...(provider ? ['--secrets-provider', provider] : []),
     ];
+}
+/**
+ * Previews a stack that doesn't exist yet in a temporary local backend, so nothing is written to
+ * the real one. The stacks it references are copied in from the real backend first, so a
+ * program that reads them previews as it will run. Creating stacks there writes encryption
+ * salts into their config files; those are restored afterwards. The command template runs with
+ * PULUMI_BACKEND_URL pointing at the temporary backend, and the stack is checked to have been
+ * created there, so a wrapper that picks its own backend fails instead of touching the real one.
+ */
+async function previewInTemporaryBackend(context, stack, planPath) {
+    const backend = mkdtempSync(join(tmpdir(), 'pulumi-affected-backend-'));
+    const references = context.references();
+    const configs = new Map();
+    for (const target of [stack, ...references]) {
+        const path = join(context.repoRoot, target.configFile);
+        configs.set(path, existsSync(path) ? readFileSync(path, 'utf8') : undefined);
+    }
+    const restore = () => {
+        for (const [path, original] of configs) {
+            if (original === undefined)
+                rmSync(path, { force: true });
+            else
+                writeFileSync(path, original);
+        }
+        rmSync(backend, { recursive: true, force: true });
+    };
+    const unregister = onCancel(restore);
+    const env = { PULUMI_BACKEND_URL: `file://${backend}` };
+    const temporary = (target, args) => context.runner.run(target, args, env);
+    try {
+        for (const reference of references) {
+            const exported = await context.runner.run(reference, ['stack', 'export']);
+            if (exported.code !== 0)
+                continue; // Doesn't exist yet either
+            const file = join(backend, `${reference.id.replace('/', '+')}.export.json`);
+            writeFileSync(file, exported.stdout);
+            const init = await temporary(reference, initArgs(context.repoRoot, reference.configFile));
+            if (init.code !== 0)
+                return init;
+            const imported = await temporary(reference, ['stack', 'import', '--file', file]);
+            if (imported.code !== 0)
+                return imported;
+        }
+        const init = await temporary(stack, initArgs(context.repoRoot, stack.configFile));
+        if (init.code !== 0)
+            return init;
+        if (!hasStackFile(join(backend, '.pulumi'), stack.stack)) {
+            return {
+                code: 1,
+                stdout: '',
+                stderr: `the stack wasn't created in the temporary backend: the command template must leave PULUMI_BACKEND_URL as it's given`,
+            };
+        }
+        return await temporary(stack, previewArgs(planPath));
+    }
+    finally {
+        unregister();
+        restore();
+    }
+}
+/** Whether a file backend holds a stack of this name */
+function hasStackFile(folder, name) {
+    if (!existsSync(folder))
+        return false;
+    for (const entry of readdirSync(folder, { withFileTypes: true })) {
+        if (entry.isDirectory() && hasStackFile(join(folder, entry.name), name))
+            return true;
+        if (entry.isFile() && (entry.name === `${name}.json` || entry.name === `${name}.json.gz`)) {
+            return true;
+        }
+    }
+    return false;
+}
+/**
+ * Writes a passphrase stack's encryption salt into its config file when the file has none.
+ * Pulumi only reads the salt from there, and makes a new one when it's missing, so a checkout
+ * without the salt (one Pulumi wrote on another runner) couldn't decrypt the stack's secrets.
+ */
+export function writeSalt(configPath, salt) {
+    if (!salt || encryptionSaltOf(configPath) !== undefined)
+        return;
+    const config = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
+    if (secretsProviderOf(config) !== undefined)
+        return;
+    const separator = config === '' || config.endsWith('\n') ? '' : '\n';
+    writeFileSync(configPath, `${config}${separator}encryptionsalt: ${salt}\n`);
 }
 /** The `encryptionsalt` in a stack's config file, if any */
 export function encryptionSaltOf(path) {

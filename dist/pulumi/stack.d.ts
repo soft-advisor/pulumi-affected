@@ -9,6 +9,8 @@ export type StateFingerprint = {
 };
 export declare class StackError extends Error {
 }
+/** The fingerprint of a stack that holds nothing, as `stack init` leaves it */
+export declare const EMPTY_FINGERPRINT: string;
 export declare function stateFingerprint(runner: PulumiRunner, stack: StackTarget): Promise<StateFingerprint>;
 interface HistoryEntry {
     kind?: string;

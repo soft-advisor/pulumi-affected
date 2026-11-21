@@ -95,6 +95,29 @@
     "needsPlan": ["fixture-access/prod"]
   },
   {
+    "name": "a new empty stack, created when applied",
+    "createStacks": "apply",
+    "changes": {
+      "empty/Pulumi.yaml": "name: fixture-empty\nruntime: nodejs\n",
+      "empty/Pulumi.dev.yaml": "config: {}\n",
+      "empty/index.ts": "// Resources come in a later change, planned against the stack apply creates\nexport const ready = true;\n"
+    },
+    "expected": ["fixture-empty/dev"],
+    "changed": ["fixture-empty/dev"],
+    "applied": ["fixture-empty/dev"]
+  },
+  {
+    "name": "a new stack with resources, created when applied",
+    "createStacks": "apply",
+    "changes": {
+      "org/accounts/Pulumi.newco.yaml": "config:\n  fixture-accounts:alias: newco\n"
+    },
+    "expected": ["fixture-accounts/newco"],
+    "failing": ["fixture-accounts/newco"],
+    "changed": [],
+    "applied": []
+  },
+  {
     "name": "a stack whose state changed after planning",
     "changes": {
       "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"

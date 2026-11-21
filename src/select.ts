@@ -9,7 +9,7 @@ import {
 } from './analysis/program.ts';
 import { ProgramReferences } from './analysis/references.ts';
 import { findUp, parseJson } from './analysis/resolve.ts';
-import { type Config, loadConfig } from './config.ts';
+import { type Config, type CreateStacks, loadConfig } from './config.ts';
 import { addEdge, CycleError, computeWaves, type DependencyGraph } from './graph.ts';
 import {
   findLockfile,
@@ -74,6 +74,8 @@ export interface SelectResult {
   skipped: { id: string; source: string; reasons: string[] }[];
   /** Every stack id to the ids of the stacks it depends on */
   dependencies: Record<string, string[]>;
+  /** Pulumi-Affected-Create-Stacks lines in the change, in the order they were found */
+  createStacks: CreateRequest[];
   /**
    * Stack id → dependency id → the outputs it reads from that dependency, or "all" when that
    * can't be worked out (or the dependency comes from `dependsOn`)
@@ -215,6 +217,7 @@ export function select(options: SelectOptions): SelectResult {
     ),
     outputsRead: session.outputsReadRecord(),
     unknownReaders: [...session.unknownReaders].sort(),
+    createStacks: requestsFor(defaultBase).create,
     warnings: [...new Set(warnings)],
   };
 }
@@ -893,12 +896,29 @@ export interface Request {
   source: string;
 }
 
-/** Pulumi-Affected-Run/Skip lines in commit messages between base and head, and in `messages` */
+/** A Pulumi-Affected-Create-Stacks line: when to create stacks, for these patterns (or all) */
+export interface CreateRequest {
+  mode: CreateStacks;
+  patterns: string[];
+  source: string;
+}
+
+/**
+ * Pulumi-Affected-Run/Skip/Create-Stacks lines in commit messages between base and head, and in
+ * `messages`
+ */
 function readRequests(repoRoot: string, base: string, options: SelectOptions) {
   const run: Request[] = [];
   const skip: Request[] = [];
+  const create: CreateRequest[] = [];
   const scan = (text: string, source: string) => {
     for (const line of text.split('\n')) {
+      const creation = /^\s*Pulumi-Affected-Create-Stacks\s*:\s*(plan|apply)\b(.*)$/i.exec(line);
+      if (creation) {
+        const mode = creation[1].toLowerCase() as CreateStacks;
+        create.push({ mode, patterns: splitPatterns(creation[2]), source });
+        continue;
+      }
       const match = /^\s*(Pulumi-Affected-(?:Run|Skip))\s*:\s*(.+)$/i.exec(line);
       if (!match) continue;
       const list = match[1].toLowerCase() === RUN_TRAILER.toLowerCase() ? run : skip;
@@ -917,7 +937,7 @@ function readRequests(repoRoot: string, base: string, options: SelectOptions) {
   if (options.all) run.push({ pattern: 'all', source: '--all' });
   for (const pattern of options.run ?? []) run.push({ pattern, source: '--run' });
   for (const pattern of options.skip ?? []) skip.push({ pattern, source: '--skip' });
-  return { run, skip };
+  return { run, skip, create };
 }
 
 /** The stacks in the repo and how they depend on each other, as of `head` */

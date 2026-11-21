@@ -29,6 +29,15 @@ export type StateFingerprint =
 
 export class StackError extends Error {}
 
+function fingerprintOf(resources: unknown, pendingOperations: unknown) {
+  return createHash('sha256')
+    .update(JSON.stringify([resources ?? [], pendingOperations ?? []]))
+    .digest('hex');
+}
+
+/** The fingerprint of a stack that holds nothing, as `stack init` leaves it */
+export const EMPTY_FINGERPRINT = fingerprintOf([], []);
+
 export async function stateFingerprint(
   runner: PulumiRunner,
   stack: StackTarget,
@@ -47,15 +56,15 @@ export async function stateFingerprint(
     | undefined;
   if (!exported) throw new StackError(`${stack.id}: the stack export isn't JSON`);
   // Resources and pending operations are the state; the export's own timestamps aren't
-  const state = JSON.stringify([
-    exported?.deployment?.resources ?? [],
-    exported?.deployment?.pending_operations ?? [],
-  ]);
+
   const providers = exported?.deployment?.secrets_providers;
   const salt = providers?.type === 'passphrase' ? providers.state?.salt : undefined;
   return {
     kind: 'exists',
-    fingerprint: createHash('sha256').update(state).digest('hex'),
+    fingerprint: fingerprintOf(
+      exported?.deployment?.resources,
+      exported?.deployment?.pending_operations,
+    ),
     ...(typeof salt === 'string' ? { salt } : {}),
   };
 }

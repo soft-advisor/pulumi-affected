@@ -90,7 +90,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node tool/e2e/driver.ts prepare "$INDEX" "$FIXTURE"
 
-      # From here on, the steps are the README's example workflow: plan on the pull request, and
+      # From here on, the steps are the example workflow in docs/workflows.md: plan on the pull request, and
       # after merge apply exactly those plans. Select runs too, to check the selection alone.
       - id: select
         uses: ./tool/select
@@ -112,6 +112,7 @@ jobs:
           directory: ${{ runner.temp }}/plans
           # The wrapper prints BANNER first, as scripts that assume a role often do
           command: sh ${{ github.workspace }}/tool/e2e/wrapper.sh --cwd {dir} --stack {stack}
+          create-stacks: ${{ steps.prepare.outputs.create-stacks }}
           pull-request: ${{ steps.prepare.outputs.pull-request }}
           retention-days: 1
       - name: Check the plans

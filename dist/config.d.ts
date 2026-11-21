@@ -21,6 +21,14 @@ export interface Config {
     classify: {
         ignore: IgnoreRule[];
     };
+    createStacks: CreateStacksConfig;
+}
+export type CreateStacks = 'plan' | 'apply';
+/** When stacks that don't exist yet are created: a default, and stack patterns that differ */
+export interface CreateStacksConfig {
+    default?: CreateStacks;
+    plan: string[];
+    apply: string[];
 }
 export declare function defaultConfig(): Config;
 export declare class ConfigError extends Error {
