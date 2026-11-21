@@ -1,5 +1,5 @@
 export function accountName(alias: string) {
-  return `acme-${alias}`;
+  return `acme-co-${alias}`;
 }
 
 export function zoneName(domain: string) {
