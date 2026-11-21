@@ -71,6 +71,23 @@ export function readEvent(): GitHubEvent {
   };
 }
 
+export interface Author {
+  login: string;
+  type?: string;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+const MAX_ATTEMPTS = 3;
+const RETRY_DELAY = 2_000;
+const MAX_RETRY_DELAY = 30_000;
+
 export class GitHubApi {
   private readonly token: string;
   private readonly baseUrl: string;
@@ -82,24 +99,40 @@ export class GitHubApi {
     this.repository = repository;
   }
 
+  /**
+   * Calls the API, retrying server errors and rate limits a few times with backoff, since one
+   * transient failure shouldn't fail a deploy
+   */
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        accept: 'application/vnd.github+json',
-        'x-github-api-version': '2022-11-28',
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    if (!response.ok) {
+    for (let attempt = 1; ; attempt++) {
+      const response = await fetch(`${this.baseUrl}${path}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${this.token}`,
+          accept: 'application/vnd.github+json',
+          'x-github-api-version': '2022-11-28',
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
       const text = await response.text();
-      throw new Error(`GitHub API ${method} ${path} failed with ${response.status}: ${text}`);
+      if (response.ok) {
+        // DELETE and some other calls answer 204 with no body
+        return (text ? JSON.parse(text) : undefined) as T;
+      }
+      const limited =
+        response.status === 429 || (response.status === 403 && /rate limit/i.test(text));
+      const transient = response.status >= 500 || limited;
+      if (!transient || attempt === MAX_ATTEMPTS) {
+        throw new ApiError(
+          response.status,
+          `GitHub API ${method} ${path} failed with ${response.status}: ${text}`,
+        );
+      }
+      const retryAfter = Number(response.headers.get('retry-after'));
+      const wait = retryAfter > 0 ? retryAfter * 1000 : attempt * RETRY_DELAY;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(wait, MAX_RETRY_DELAY)));
     }
-    // DELETE and some other calls answer 204 with no body
-    const text = await response.text();
-    return (text ? JSON.parse(text) : undefined) as T;
   }
 
   /** Every page of a list endpoint */
@@ -113,18 +146,25 @@ export class GitHubApi {
     }
   }
 
-  private login: Promise<string> | undefined;
+  private ownership: Promise<(author: Author | null) => boolean> | undefined;
 
   /**
-   * Who comments with this token: the user behind a personal token, or github-actions[bot] for
-   * the workflow's own token (which can't read /user)
+   * How to tell the action's own comments: by the login behind a personal token, or, for
+   * the workflow's token and GitHub App tokens (which can't read /user and post as
+   * <name>[bot]), by being a bot. Only installed apps can be bots, and only people with write
+   * access can install apps.
    */
-  identity() {
-    this.login ??= this.request<{ login: string }>('GET', '/user').then(
-      (user) => user.login,
-      () => 'github-actions[bot]',
+  ownComments() {
+    this.ownership ??= this.request<{ login: string }>('GET', '/user').then(
+      (user) => (author: Author | null) => author?.login === user.login,
+      (error: unknown) => {
+        if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+          return (author: Author | null) => author?.type === 'Bot';
+        }
+        throw error;
+      },
     );
-    return this.login;
+    return this.ownership;
   }
 
   repo(path: string) {

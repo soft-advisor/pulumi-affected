@@ -17,7 +17,9 @@ export async function fakeApi(routes: Record<string, unknown>) {
     const page = Number(/[?&]page=(\d+)/.exec(request.url ?? '')?.[1] ?? '1');
     const key = `${request.method} ${path}`;
     if (!(key in routes)) {
-      response.writeHead(404).end('{}');
+      // Like GitHub for a workflow token, which can't read the user it acts as
+      const status = key === 'GET /user' ? 403 : 404;
+      response.writeHead(status).end('{}');
       return;
     }
     response.writeHead(200, { 'content-type': 'application/json' });

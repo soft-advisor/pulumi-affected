@@ -50,14 +50,18 @@ const PRIVATE_VARIABLES = [
 ];
 const OIDC_VARIABLES = /^ACTIONS_ID_TOKEN_REQUEST_/;
 
-export function childEnvironment(options: RunnerOptions, extra: NodeJS.ProcessEnv = {}) {
+export function childEnvironment(
+  options: RunnerOptions,
+  extra: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(process.env)) {
     if (PRIVATE_VARIABLES.some((pattern) => pattern.test(name))) continue;
     if (!options.passOidc && OIDC_VARIABLES.test(name)) continue;
     env[name] = value;
   }
-  return { ...env, ...extra };
+  // Plain text: colour codes would end up in comments
+  return { ...env, NO_COLOR: '1', FORCE_COLOR: '0', ...extra };
 }
 
 /** The stack, also as variables, so wrapper scripts can quote them safely: "$PULUMI_AFFECTED_STACK" */
@@ -290,10 +294,17 @@ async function readOutputs(runner: PulumiRunner, stack: Stack) {
   if (isMissingStack(result)) return 'missing' as const;
   if (result.code !== 0) return 'failed' as const;
   // A wrapper script may print lines of its own before Pulumi's JSON
-  const parsed = parseFirstJson(result.stdout || '{}');
+  // A wrapper may print its own JSON first (e.g. the caller identity); outputs are the last object
+  const parsed = parseLastJsonObject(result.stdout || '{}');
   return parsed && typeof parsed === 'object'
     ? (parsed as Record<string, unknown>)
     : ('failed' as const);
+}
+
+/** The last top-level JSON object in output, after anything a wrapper printed */
+function parseLastJsonObject(text: string) {
+  const start = text.lastIndexOf('\n{');
+  return parseFirstJson(start === -1 ? text : text.slice(start + 1));
 }
 
 export type DeployHistory =
@@ -383,9 +394,10 @@ function parseJsonArray(text: string): HistoryEntry[] | undefined {
  */
 export function errorText(result: CommandResult) {
   const messages: string[] = [];
-  const json = parseFirstJson(result.stdout) as
-    | { diagnostics?: { message?: string; severity?: string }[] }
-    | undefined;
+  const json = parseFirstJson(
+    result.stdout,
+    (value) => 'diagnostics' in value || 'steps' in value,
+  ) as { diagnostics?: { message?: string; severity?: string }[] } | undefined;
   for (const diagnostic of json?.diagnostics ?? []) {
     if (diagnostic.severity === undefined || diagnostic.severity === 'error') {
       if (diagnostic.message?.trim()) messages.push(diagnostic.message.trim());
@@ -405,10 +417,18 @@ export function errorText(result: CommandResult) {
       // Not an event line
     }
   }
-  if (messages.length > 0) return [...new Set(messages)].join('\n');
+  if (messages.length > 0) return stripColour([...new Set(messages)].join('\n'));
 
   const plainOutput = json === undefined ? result.stdout : '';
-  const lines = `${result.stderr}\n${plainOutput}`.trim().split('\n');
+  const lines = stripColour(`${result.stderr}\n${plainOutput}`).trim().split('\n');
   const errors = lines.filter((line) => /^\s*error:/i.test(line));
   return (errors.length > 0 ? errors : lines.slice(-20)).join('\n');
+}
+
+/** Terminal colour codes, raw or in the caret form some tools print */
+const ESCAPE = String.fromCharCode(27);
+const COLOUR_CODES = new RegExp(`(?:${ESCAPE}|\\^\\[)\\[[0-9;]*m`, 'g');
+
+function stripColour(text: string) {
+  return text.replace(COLOUR_CODES, '');
 }

@@ -113,7 +113,7 @@ Pin the actions to a commit SHA: jobs that preview and deploy usually hold crede
 A preview runs the pull request's Pulumi program, so whoever can open a pull request can run code in a preview job. Plan credentials with that in mind:
 
 - **Previews get read-only credentials; deploys get the rest.** Deploy only on pushes to protected branches, in a separate job or workflow, ideally behind a GitHub environment.
-- **Forks.** `pull_request` runs from forks get no secrets, so their previews can't sign in. `pull_request_target` with a fork's code checked out is refused.
+- **Forks.** `pull_request` runs from forks get no secrets, so their previews can't sign in. `pull_request_target` refuses pull requests from forks whatever is checked out, and so does the `pull-request` input; comment commands never run them either.
 - **Comment commands** run only for people with write access, only on pull requests from this repository, and only for new comments. The action checks this itself, but also gate the job, so it doesn't even start for others:
 
   ```yaml
@@ -131,13 +131,18 @@ A preview runs the pull request's Pulumi program, so whoever can open a pull req
           with:
             ref: refs/pull/${{ github.event.issue.number }}/head
             fetch-depth: 0
+            persist-credentials: false
         # read-only sign-in, then the run action with mode: preview
   ```
 
   A comment-triggered run's OIDC token says `ref: refs/heads/<default branch>`, so cloud trust policies for deploy roles should also check `event_name` or the workflow, not only the branch.
-- **What Pulumi sees.** Pulumi runs without the job token, the runner's internal tokens and the files that set later steps' environment. It also can't request GitHub OIDC tokens unless `pass-oidc: true`.
+- **What Pulumi sees, and its limits.** Pulumi runs without the job token, the runner's internal tokens, the files that set later steps' environment and, unless `pass-oidc: true`, the variables for requesting GitHub OIDC tokens. That keeps them out of logs and out of honest code, but it isn't isolation: the code under preview runs as the same user as the action and can read the runner process's environment. So:
+  - Don't give a job that previews untrusted changes `id-token: write`, or credentials you wouldn't hand to the pull request's author. The action warns when it could request OIDC tokens.
+  - Check out with `persist-credentials: false`, or the job's token stays in `.git/config`; the action warns about that too.
+  - New stacks are previewed with plain `pulumi` in a temporary backend, not through `run.command`, so a wrapper that narrows credentials per stack doesn't apply to them; set `run.newStacks: skip` if that matters.
 - **Names.** Project and stack names that Pulumi wouldn't accept, and folders whose names contain quotes, `$`, backticks or newlines, are skipped with a warning. Wrapper scripts should still quote their arguments, or use the `PULUMI_AFFECTED_DIR`, `PULUMI_AFFECTED_STACK`, `PULUMI_AFFECTED_PROJECT` and `PULUMI_AFFECTED_ID` variables the command gets.
-- **Comments and logs** show resource types, names and changed property names, never values. A failed stack shows Pulumi's error diagnostics.
+- **Skipping.** `Pulumi-Affected-Skip` lines in commit messages and pull request descriptions are honoured in previews, which list what they skipped and who asked. Deploys ignore them, so no pull request can hold a change back; only the `skip` input counts there.
+- **Comments and logs** show resource types, names and changed property names, never values, with anything from the repository escaped so it can't add links, images or mentions. A failed stack shows Pulumi's error diagnostics. With a GitHub App token, the action recognises its own comments as a bot's.
 
 **Concurrency.** Two deploys of the same stacks at once fight over stack locks, or apply out of order. Previews of the same pull request duplicate comments. Use concurrency groups:
 
@@ -174,6 +179,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # history for the merge base and each stack's last deploy
+          persist-credentials: false # keep the job's token out of reach of the code under preview
       # your own Pulumi and cloud sign-in
       - uses: soft-advisor/pulumi-affected/run@<commit sha>
         with:
@@ -210,6 +216,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: select
         uses: soft-advisor/pulumi-affected/select@<commit sha>
 

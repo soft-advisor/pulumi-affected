@@ -72,7 +72,9 @@ export class ClassifyError extends Error {}
 
 /** Classifies the output of `pulumi preview --json` (or the first document of `up --json`) */
 export function classify(output: string, ignore: readonly IgnoreRule[] = []): Classification {
-  const preview = parseFirstJson(output) as { steps?: Step[] } | undefined;
+  const preview = parseFirstJson(output, (value) => Array.isArray(value.steps)) as
+    | { steps?: Step[] }
+    | undefined;
   if (!preview || !Array.isArray(preview.steps)) {
     throw new ClassifyError("Not the JSON of `pulumi preview --json`: there's no steps list");
   }
@@ -159,12 +161,36 @@ function isIgnored(change: ResourceChange, rules: readonly IgnoreRule[]) {
 }
 
 /**
- * `pulumi up --json` prints the plan as one JSON document followed by streamed events, so only
- * the first complete JSON value is read.
+ * The first JSON object in output that may have other lines around it: a wrapper script's banner
+ * (even one containing braces) before Pulumi's JSON, and `pulumi up --json`'s event stream after.
+ * `accept` picks the object that's wanted, e.g. one with a `steps` list; anything else is skipped.
  */
-export function parseFirstJson(text: string): unknown {
-  const start = text.indexOf('{');
-  if (start === -1) return undefined;
+export function parseFirstJson(
+  text: string,
+  accept: (value: Record<string, unknown>) => boolean = () => true,
+): unknown {
+  let from = 0;
+  for (let attempts = 0; attempts < MAX_JSON_ATTEMPTS; attempts++) {
+    const start = text.indexOf('{', from);
+    if (start === -1) return undefined;
+    const end = matchingBrace(text, start);
+    if (end !== -1) {
+      try {
+        const value = JSON.parse(text.slice(start, end + 1));
+        if (value && typeof value === 'object' && accept(value)) return value;
+      } catch {
+        // Not JSON after all, e.g. "Assuming role {deploy}"
+      }
+    }
+    from = start + 1;
+  }
+  return undefined;
+}
+
+const MAX_JSON_ATTEMPTS = 200;
+
+/** Where the object starting at `start` ends, honouring strings; -1 if it never does */
+function matchingBrace(text: string, start: number) {
   let depth = 0;
   let inString = false;
   let escaped = false;
@@ -180,10 +206,10 @@ export function parseFirstJson(text: string): unknown {
     else if (char === '{') depth++;
     else if (char === '}') {
       depth--;
-      if (depth === 0) return JSON.parse(text.slice(start, index + 1));
+      if (depth === 0) return index;
     }
   }
-  return undefined;
+  return -1;
 }
 
 /** "+2 ~1 -1 ±1" style counts for summaries */

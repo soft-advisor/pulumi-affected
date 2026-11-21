@@ -2,7 +2,7 @@ import { renderMarkdown } from '../render.ts';
 import { select } from '../select.ts';
 import { repoRootOf } from '../snapshot.ts';
 import { splitPatterns } from '../patterns.ts';
-import { eventContext, pullRequestContext } from './context.ts';
+import { eventAllowsRun, eventContext, pullRequestContext } from './context.ts';
 import {
   appendSummary,
   booleanInput,
@@ -33,7 +33,9 @@ async function main() {
     throw new Error('The pull-request input needs the github-token input');
   const context =
     pullRequestNumber && api
-      ? await pullRequestContext(api, repoRoot, pullRequestNumber)
+      ? (await eventAllowsRun(event, repoRoot, api))
+        ? await pullRequestContext(api, repoRoot, pullRequestNumber)
+        : undefined
       : await eventContext(event, repoRoot, api);
   for (const message of context?.warnings ?? []) warning(message);
   if (context === undefined) {

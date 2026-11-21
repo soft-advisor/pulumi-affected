@@ -105,7 +105,7 @@ jobs:
         if: matrix.scenario.second
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node tool/e2e/driver.ts push-second "$INDEX" "$FIXTURE"
+        run: node tool/e2e/driver.ts push-second "$INDEX" "${{ steps.prepare.outputs.pull-request }}" "$FIXTURE"
       - id: second-preview
         if: matrix.scenario.second
         uses: ./tool/run

@@ -89,6 +89,7 @@ export async function runCommand(options: RunCommandOptions): Promise<RunCommand
     messages: options.messages,
     requests: options.requests,
     reasons,
+    trustedSkipsOnly: options.mode === 'up',
     config,
   });
   const graph: DependencyGraph = new Map(
