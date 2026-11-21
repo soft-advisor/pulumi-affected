@@ -1,0 +1,94 @@
+name: pulumi-affected apply
+description: Apply exactly the Pulumi plans the plan action made for this code, without previewing again
+author: soft-advisor
+branding:
+  icon: upload-cloud
+  color: purple
+
+# Check out the planned code first (the same git tree), and sign in to Pulumi and the cloud.
+# Whether a change may be applied (approvals, branch protection) is the workflow's decision.
+
+inputs:
+  directory:
+    description: >-
+      A directory that already holds the plans (manifest.json). Without one, the artifact
+      pulumi-plans-<tree SHA of the checkout> is downloaded, here if set.
+    required: false
+  run-id:
+    description: 'The workflow run whose artifact to download. Default: the newest run that planned this tree.'
+    required: false
+  working-directory:
+    description: 'A folder inside the repository. Default: the workspace.'
+    required: false
+  command:
+    description: >-
+      How to run Pulumi for a stack, as words with {dir}, {stack}, {project} and {id}
+      placeholders, run without a shell; Pulumi's arguments are appended.
+    required: false
+    default: pulumi --cwd {dir} --stack {stack}
+  concurrency:
+    description: How many stacks of a wave to apply at once.
+    required: false
+    default: '4'
+  comment:
+    description: >-
+      Comment the result on the pull request: the triggering one, the pull-request input, or the
+      one the pushed commit was merged from.
+    required: false
+    default: 'true'
+  pull-request:
+    description: Pull request number to comment on.
+    required: false
+  github-token:
+    description: Token for finding and downloading the artifact (actions read) and commenting (pull-requests write).
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  directory:
+    description: Absolute path of the plan directory.
+    value: ${{ steps.apply.outputs.directory }}
+  result:
+    description: JSON with each stack's outcome (applied, already-applied, refused, failed, skipped) and needsPlan.
+    value: ${{ steps.apply.outputs.result }}
+  needs-plan:
+    description: JSON array of unplanned stacks that read outputs the apply changed.
+    value: ${{ steps.apply.outputs.needs-plan }}
+  failed:
+    description: "'true' when a plan wasn't applied; the action fails after commenting."
+    value: ${{ steps.apply.outputs.failed }}
+
+runs:
+  using: composite
+  steps:
+    - id: locate
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/dist/index.cjs" locate
+      env:
+        INPUT_DIRECTORY: ${{ inputs.directory }}
+        INPUT_RUN_ID: ${{ inputs.run-id }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+    - if: steps.locate.outputs.download == 'true'
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        name: ${{ steps.locate.outputs.name }}
+        run-id: ${{ steps.locate.outputs.run-id }}
+        github-token: ${{ inputs.github-token }}
+        path: ${{ steps.locate.outputs.directory }}
+    - id: apply
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/dist/index.cjs" apply
+      env:
+        INPUT_PLANS: ${{ steps.locate.outputs.directory }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_CONCURRENCY: ${{ inputs.concurrency }}
+        INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_PULL_REQUEST: ${{ inputs.pull-request }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+    - if: steps.apply.outputs.failed == 'true'
+      shell: bash
+      run: |
+        echo "::error::Not every plan was applied; see the apply step"
+        exit 1

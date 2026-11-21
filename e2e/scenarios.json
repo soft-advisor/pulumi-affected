@@ -41,8 +41,8 @@
       "site/site/index.html": "<h1>Hello, world</h1>\n"
     },
     "expected": ["fixture-site/dev", "fixture-site/prod"],
-    "changed": [],
-    "applied": [],
+    "changed": ["fixture-site/dev"],
+    "applied": ["fixture-site/dev"],
     "waves": [["fixture-site/dev"], ["fixture-site/prod"]]
   },
   {
@@ -69,7 +69,7 @@
     },
     "expected": ["fixture-accounts/business", "fixture-accounts/shop"],
     "failing": ["fixture-accounts/shop"],
-    "changed": [],
+    "changed": ["fixture-accounts/business"],
     "applied": []
   },
   {
@@ -80,6 +80,27 @@
     "expected": ["fixture-accounts/newco"],
     "changed": ["fixture-accounts/newco"],
     "applied": ["fixture-accounts/newco"]
+  },
+  {
+    "name": "a new stack, created when applied",
+    "changes": {
+      "org/accounts/Pulumi.newco2.yaml": "config:\n  fixture-accounts:alias: newco2\n"
+    },
+    "expected": ["fixture-accounts/newco2"],
+    "changed": ["fixture-accounts/newco2"],
+    "applied": ["fixture-accounts/newco2"],
+    "createStacks": "apply"
+  },
+  {
+    "name": "a stack whose state changed after planning",
+    "changes": {
+      "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
+    },
+    "expected": ["fixture-accounts/shop"],
+    "changed": ["fixture-accounts/shop"],
+    "applied": [],
+    "changeState": "fixture-accounts/shop",
+    "refused": ["fixture-accounts/shop"]
   },
   {
     "name": "a wrapper that prints before Pulumi does",

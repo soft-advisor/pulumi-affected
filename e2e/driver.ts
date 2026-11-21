@@ -1,28 +1,20 @@
 import { execFileSync } from 'node:child_process';
-import {
-  appendFileSync,
-  cpSync,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-} from 'node:fs';
+import { appendFileSync, cpSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 /*
  * Drives the end-to-end test of one scenario in this repository, as the e2e workflow's steps.
- * The workflow between them is the example from the README: select on the pull request, preview
- * the selected stacks with --save-plan, keep only the plans with changes, and after merge apply
- * exactly those plans.
+ * The workflow between them is the example from the README: the plan action on the pull request,
+ * and after merge the apply action, which finds the plans' artifact by the merged tree.
  *
  *   prepare        copies e2e/fixtures into a repository of its own, deploys every stack, pushes
  *                  it as a throwaway base branch, pushes the scenario's change as a second branch,
  *                  and opens a draft pull request between them
  *   assert-select  checks the selection
- *   assert-plans   checks which stacks previewed with changes, or failed
- *   merge          squash-merges the pull request and checks out the result
- *   assert-apply   checks which plans were applied
+ *   assert-plans   checks which stacks have plans, or failed
+ *   merge          squash-merges the pull request and checks out the result, as a fresh checkout
+ *   change-state   updates a stack between planning and applying, as someone else might
+ *   assert-apply   checks which plans were applied or refused, and that applying again is a no-op
  *   cleanup        closes the pull request and deletes both branches
  */
 
@@ -41,6 +33,12 @@ interface Scenario {
   changed: string[];
   /** Stacks whose plan is applied after merge */
   applied: string[];
+  /** The plan action's create-stacks input */
+  createStacks?: 'plan' | 'apply';
+  /** A stack to update after planning, so applying its plan is refused */
+  changeState?: string;
+  /** Stacks whose plan is refused */
+  refused?: string[];
   /** A line printed before Pulumi's output, like a wrapper's banner */
   banner?: string;
   /** The package manager the fixtures use; npm when absent */
@@ -213,6 +211,7 @@ function prepare(index: number, dir: string) {
   output('base-sha', baseSha);
   output('head-sha', head);
   output('banner', scenario.banner ?? '');
+  output('create-stacks', scenario.createStacks ?? 'plan');
 }
 
 function writeChanges(dir: string, changes: Record<string, string | null>) {
@@ -241,16 +240,6 @@ function same(actual: string[], expected: string[], what: string) {
   );
 }
 
-/** Stack ids from plan or preview file names: "plans/fixture-accounts__shop.preview.json" */
-function idsOf(files: string[]) {
-  return files.map((file) =>
-    file
-      .slice(file.lastIndexOf('/') + 1)
-      .split('.')[0]
-      .replace('__', '/'),
-  );
-}
-
 function assertSelect(index: number, file: string) {
   const scenario = scenarios[index];
   const selection = JSON.parse(readFileSync(file, 'utf8')) as {
@@ -271,23 +260,43 @@ function assertSelect(index: number, file: string) {
   check(selection.warnings.length === 0, `warnings: ${selection.warnings.join('; ')}`);
 }
 
-function assertPlans(index: number) {
+interface Manifest {
+  stacks: { id: string; state: { kind: string } }[];
+  failed: { id: string }[];
+}
+
+function assertPlans(index: number, directory: string) {
   const scenario = scenarios[index];
-  // The plan step fails only when a stack fails to preview, which some scenarios want
+  // The plan action fails only when a stack fails to preview, which some scenarios want
   const expectedOutcome = scenario.failing?.length ? 'failure' : 'success';
   check(
     process.env.PLAN_OUTCOME === expectedOutcome,
     `the plan step was ${process.env.PLAN_OUTCOME}, expected ${expectedOutcome}`,
   );
-  same(idsOf(JSON.parse(process.env.FAILED || '[]')), scenario.failing ?? [], 'failed previews');
-  same(idsOf(JSON.parse(process.env.CHANGED || '[]')), scenario.changed, 'previews with changes');
+  const manifest = JSON.parse(readFileSync(join(directory, 'manifest.json'), 'utf8')) as Manifest;
+  same(
+    manifest.failed.map((stack) => stack.id),
+    scenario.failing ?? [],
+    'failed previews',
+  );
+  same(
+    manifest.stacks.map((stack) => stack.id),
+    scenario.changed,
+    'plans',
+  );
+  if (scenario.createStacks === 'apply') {
+    for (const stack of manifest.stacks) {
+      check(stack.state.kind === 'created-on-apply', `${stack.id} was created when planning`);
+    }
+  }
 }
 
 function merge(number: string, index: number, dir: string, planned: string) {
   retried(TOOL, 'gh', ['pr', 'ready', number, '--repo', repository]);
   retried(TOOL, 'gh', ['pr', 'merge', number, '--repo', repository, '--squash']);
   retried(dir, 'git', ['fetch', '-q', remote(), branches(index).base]);
-  sh(dir, 'git', ['checkout', '-q', 'FETCH_HEAD']);
+  // Forced, like a fresh checkout: planning may have written encryption salts to config files
+  sh(dir, 'git', ['checkout', '-q', '-f', 'FETCH_HEAD']);
   // The plans are only valid for exactly the code they were made from
   const mergedTree = sh(dir, 'git', ['rev-parse', 'HEAD^{tree}']);
   const plannedTree = sh(dir, 'git', ['rev-parse', `${planned}^{tree}`]);
@@ -297,12 +306,63 @@ function merge(number: string, index: number, dir: string, planned: string) {
   );
 }
 
+function changeState(index: number, dir: string) {
+  const id = scenarios[index].changeState;
+  if (!id) return;
+  const [project, stack] = id.split('/');
+  const selection = JSON.parse(
+    sh(dir, 'node', [join(TOOL, 'src/cli.ts'), 'select', '--base', 'HEAD', '--run', id]),
+  ) as { stacks: { id: string; dir: string }[] };
+  const folder = selection.stacks.find((candidate) => candidate.id === id)?.dir ?? '';
+  const exported = JSON.parse(
+    sh(dir, 'pulumi', ['--cwd', folder, '--stack', stack, 'stack', 'export']),
+  ) as { deployment: { resources: { urn: string; type: string }[] } };
+  const resource = exported.deployment.resources.find((candidate) =>
+    candidate.type.startsWith('random:'),
+  );
+  check(resource !== undefined, `${project} has no random resource to replace`);
+  sh(dir, 'pulumi', [
+    '--cwd',
+    folder,
+    '--stack',
+    stack,
+    'up',
+    '--yes',
+    '--non-interactive',
+    '--skip-preview',
+    '--replace',
+    resource?.urn ?? '',
+  ]);
+}
+
+interface ApplyResult {
+  stacks: { id: string; outcome: string }[];
+}
+
 function assertApply(index: number) {
   const scenario = scenarios[index];
-  const applied = existsSync('applied.txt')
-    ? readFileSync('applied.txt', 'utf8').split('\n').filter(Boolean)
-    : [];
-  same(applied, scenario.applied, 'applied');
+  const refused = scenario.refused ?? [];
+  // Applying fails when planning failed or a plan is refused
+  const expectedOutcome = scenario.failing?.length || refused.length ? 'failure' : 'success';
+  check(
+    process.env.APPLY_OUTCOME === expectedOutcome,
+    `the apply step was ${process.env.APPLY_OUTCOME}, expected ${expectedOutcome}`,
+  );
+  const result = JSON.parse(process.env.APPLY_RESULT || '{"stacks":[]}') as ApplyResult;
+  const withOutcome = (outcome: string, of: ApplyResult) =>
+    of.stacks.filter((stack) => stack.outcome === outcome).map((stack) => stack.id);
+  same(withOutcome('applied', result), scenario.applied, 'applied');
+  same(withOutcome('refused', result), refused, 'refused');
+  if (expectedOutcome === 'success') {
+    // Applying the same plans again finds them all applied already
+    const again = JSON.parse(process.env.REAPPLY_RESULT || '{"stacks":[]}') as ApplyResult;
+    same(withOutcome('already-applied', again), scenario.applied, 'already applied on a rerun');
+    same(
+      again.stacks.map((stack) => stack.id),
+      scenario.applied,
+      'stacks on a rerun',
+    );
+  }
 }
 
 function cleanup(index: number, number: string | undefined) {
@@ -328,8 +388,9 @@ if (command === 'list') {
   console.log(JSON.stringify(scenarios.map((scenario, i) => ({ index: i, name: scenario.name }))));
 } else if (command === 'prepare') prepare(index, rest[0]);
 else if (command === 'assert-select') assertSelect(index, rest[0]);
-else if (command === 'assert-plans') assertPlans(index);
+else if (command === 'assert-plans') assertPlans(index, rest[0]);
 else if (command === 'merge') merge(rest[0], index, rest[1], rest[2]);
+else if (command === 'change-state') changeState(index, rest[0]);
 else if (command === 'assert-apply') assertApply(index);
 else if (command === 'cleanup') cleanup(index, rest[0]);
 else throw new Error(`Unknown command ${command}`);

@@ -2,18 +2,8 @@ import { writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { renderMarkdown } from '../render.ts';
 import { select } from '../select.ts';
-import { repoRootOf } from '../snapshot.ts';
-import { splitPatterns } from '../patterns.ts';
-import { type Context, eventContext } from './context.ts';
-import {
-  appendSummary,
-  booleanInput,
-  error,
-  input,
-  readEvent,
-  setOutput,
-  warning,
-} from './github.ts';
+import { appendSummary, error, input, setOutput, warning } from './github.ts';
+import { selectOptionsFromInputs } from './inputs.ts';
 
 /*
  * The `select` action: works out the comparison base from the triggering event, runs the
@@ -22,32 +12,8 @@ import {
  */
 
 function main() {
-  const cwd = input('working-directory') || process.cwd();
-  const repoRoot = repoRootOf(cwd);
-  const event = readEvent();
-  // An explicit base replaces what the event would say, so the event isn't read at all: it may
-  // belong to another repository, as when a workflow selects in a checkout of its own
-  const context: Context = input('base')
-    ? { base: undefined, messages: [], all: false, warnings: [] }
-    : eventContext(event, repoRoot);
-  for (const message of context.warnings) warning(message);
-
-  const base = input('base') || context.base;
-  if (!base && !booleanInput('all') && !context.all) {
-    warning(
-      `A ${event.name || 'local'} run has no revision to compare with, so only requested stacks are selected; set the base input`,
-    );
-  }
-  const result = select({
-    cwd,
-    base: base || 'HEAD',
-    head: input('head') || undefined,
-    bases: input('bases') ? JSON.parse(input('bases')) : undefined,
-    run: splitPatterns(input('run')),
-    skip: splitPatterns(input('skip')),
-    all: booleanInput('all') || context.all,
-    messages: context.messages,
-  });
+  const { options } = selectOptionsFromInputs();
+  const result = select(options);
 
   for (const message of result.warnings) warning(message);
   appendSummary(renderMarkdown(result));
