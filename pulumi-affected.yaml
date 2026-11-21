@@ -1,0 +1,4 @@
+# Config for the fixtures when the end-to-end test copies them into a repository of their own
+dependsOn:
+  # prod reads dev's resources in the cloud, which analysis can't see
+  fixture-site/prod: [fixture-site/dev]
