@@ -3,9 +3,15 @@ name: Publish
 # Publishes the package when its package.json version isn't on npm yet, and tags the commit so
 # the actions can be pinned to it. What's published is exactly the committed files: CI checks
 # the committed build matches the source, and this workflow installs and runs no dependencies,
-# so a compromised dev dependency can't change what reaches npm.
-# Manual only until trusted publishing is set up; then add `push: branches: [main]` back
+# so a compromised dev dependency can't change what reaches npm. It signs in to npm with this
+# workflow's OIDC token (npm trusted publishing), so no npm token is stored anywhere.
+#
+# npm may hold a release for a maintainer's approval (staged publishing). The tags only move once
+# the version is public: if it isn't yet, a later run (any merge, or running this by hand) tags
+# the commit that set the version.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 # Never publish twice at once
@@ -20,7 +26,7 @@ jobs:
   publish:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     # Restricted to main in the repository settings; npm's trusted publisher names it too
     environment: release
     permissions:
@@ -29,53 +35,73 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0 # to find the commit that set the version
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '24'
+          node-version: '24' # its npm (11.5.1 or later) supports trusted publishing
           registry-url: https://registry.npmjs.org
-      - name: Check the commit passed CI
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          conclusion=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=check" --jq '.check_runs[0].conclusion')
-          if [ "$conclusion" != success ]; then
-            echo "::error::CI's check job hasn't passed on $GITHUB_SHA ($conclusion)"
-            exit 1
-          fi
       - id: version
         name: Check whether this version is new
         run: |
           name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if npm view "$name@$version" version >/dev/null 2>&1; then
             echo "$name@$version is already published"
           else
             echo "new=true" >> "$GITHUB_OUTPUT"
           fi
+      # CI runs at the same time on a push; wait for its check job to pass on this commit
+      - name: Wait for CI to pass
+        if: steps.version.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in $(seq 1 80); do
+            conclusion=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=check" --jq '.check_runs[0].conclusion // "pending"')
+            case "$conclusion" in
+              success) exit 0 ;;
+              pending) sleep 15 ;;
+              *) echo "::error::CI's check job didn't pass on $GITHUB_SHA ($conclusion)"; exit 1 ;;
+            esac
+          done
+          echo "::error::CI's check job didn't finish on $GITHUB_SHA"
+          exit 1
       # The committed files, with no lifecycle scripts run
       - name: Pack
         if: steps.version.outputs.new == 'true'
         run: npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
-      # The first release uses an npm token, since npm only lets a package that exists name a
-      # trusted publisher; afterwards this workflow's OIDC token signs in and the token goes
       - name: Publish
         if: steps.version.outputs.new == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.XYZ }}
         run: npm publish "$RUNNER_TEMP"/*.tgz --provenance --access public --ignore-scripts
-      - name: Tag the release and move the major version tag
-        if: steps.version.outputs.new == 'true'
+      - name: Tag the release and move the major version tag, once it's public
         env:
           GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.version.outputs.name }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/v$VERSION" -f sha="$GITHUB_SHA"
-          major="v${VERSION%%.*}"
           # git/ref (singular) matches exactly; git/refs would also match v0.1.0 for v0
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "v$VERSION is already tagged"
+            exit 0
+          fi
+          # A staged release waits for approval; give a direct one a moment to appear
+          for attempt in $(seq 1 10); do
+            npm view "$NAME@$VERSION" version >/dev/null 2>&1 && break
+            if [ "$attempt" = 10 ]; then
+              echo "::notice::$NAME@$VERSION isn't public yet (awaiting approval?); a later run tags it"
+              exit 0
+            fi
+            sleep 30
+          done
+          # The commit that set this version, which is the one published
+          sha=$(git log -n 1 --format=%H -G"\"version\": \"$VERSION\"" -- package.json)
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/v$VERSION" -f sha="$sha"
+          major="v${VERSION%%.*}"
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$major" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" -f sha="$GITHUB_SHA" -F force=true
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" -f sha="$sha" -F force=true
           else
-            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$major" -f sha="$GITHUB_SHA"
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$major" -f sha="$sha"
           fi
