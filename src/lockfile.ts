@@ -345,11 +345,12 @@ function readPnpm(path: string, dir: string, text: string): LockGraph {
     const resolution = (packageInfo[key] ?? packageInfo[key.split('(')[0]] ?? {}).resolution ?? {};
     // From the registry, a resolution is only a checksum
     const fromRegistry = !resolution.tarball && !resolution.commit && !resolution.repo;
+    const packageId = pnpmPackageIdentity(id);
     const identity = fromRegistry
-      ? identityOf(version, id)
+      ? identityOf(version, packageId)
       : identityOf(
           version,
-          id,
+          packageId,
           resolution.integrity,
           resolution.tarball,
           resolution.commit,
@@ -437,5 +438,16 @@ function splitPnpmId(id: string) {
   const plain = peers === -1 ? id : id.slice(0, peers);
   const at = plain.lastIndexOf('@');
   if (at <= 0) return { name: plain, version: '' };
-  return { name: plain.slice(0, at), version: id.slice(at + 1) };
+  return { name: plain.slice(0, at), version: plain.slice(at + 1) };
+}
+
+/**
+ * The parts of a pnpm id that are the package itself: the name, version and any patch hash. Peer
+ * resolutions in parentheses are left out; the peers are packages of their own in the closure,
+ * so an unrelated peer of a peer (a type package) changing doesn't make this one look changed.
+ */
+function pnpmPackageIdentity(id: string) {
+  const patch = /\(patch_hash=[^)]*\)/.exec(id)?.[0] ?? '';
+  const peers = id.indexOf('(');
+  return `${peers === -1 ? id : id.slice(0, peers)}${patch}`;
 }

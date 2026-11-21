@@ -180,3 +180,20 @@ test('packages.ignore leaves out matching packages', () => {
   const result = selectChange(before, lockfiles.npm({ ...V1, leftPad: '1.1.0' }));
   assert.deepEqual(selectedIds(result), []);
 });
+
+test('type declaration packages never count, even when a runtime dependency lists one', () => {
+  const lock = (types: string) =>
+    JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        '': { dependencies: { tool: '*' } },
+        'node_modules/tool': { version: '1.0.0', dependencies: { '@types/node': '*' } },
+        'node_modules/@types/node': { version: types },
+      },
+    });
+  const before = {
+    ...project('', 'app', ['dev'], { 'index.ts': "import 'tool';\n" }),
+    'package-lock.json': lock('22.0.0'),
+  };
+  assert.deepEqual(selectedIds(selectChange(before, { 'package-lock.json': lock('22.1.0') })), []);
+});
