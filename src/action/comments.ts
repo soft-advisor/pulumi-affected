@@ -24,10 +24,12 @@ export async function syncComments(
 ) {
   const prefix = `<!-- pulumi-affected:${kind}:`;
   const comments = await api.list<Comment>(api.repo(`/issues/${number}/comments`));
+  // Anyone can post a comment starting with the marker; only the action's own are its reports
+  const self = await api.identity();
   const existing = new Map<number, Comment>();
   for (const comment of comments) {
     const body = comment.body ?? '';
-    if (!body.startsWith(prefix)) continue;
+    if (comment.user?.login !== self || !body.startsWith(prefix)) continue;
     const index = Number(body.slice(prefix.length, body.indexOf(' -->')));
     if (Number.isInteger(index) && !existing.has(index)) existing.set(index, comment);
   }

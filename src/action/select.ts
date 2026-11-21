@@ -6,6 +6,7 @@ import { eventContext, pullRequestContext } from './context.ts';
 import {
   appendSummary,
   booleanInput,
+  error,
   GitHubApi,
   input,
   notice,
@@ -34,6 +35,7 @@ async function main() {
     pullRequestNumber && api
       ? await pullRequestContext(api, repoRoot, pullRequestNumber)
       : await eventContext(event, repoRoot, api);
+  for (const message of context?.warnings ?? []) warning(message);
   if (context === undefined) {
     notice('Not a /pulumi-affected command; nothing to select');
     writeOutputs([], [], '{}');
@@ -70,7 +72,7 @@ function writeOutputs(stacks: unknown[], waves: string[][], result: string) {
   setOutput('result', result);
 }
 
-main().catch((error: unknown) => {
-  console.log(`::error::${error instanceof Error ? error.message : String(error)}`);
+main().catch((caught: unknown) => {
+  error(caught instanceof Error ? caught.message : String(caught));
   process.exitCode = 1;
 });

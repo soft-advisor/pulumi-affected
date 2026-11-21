@@ -1,7 +1,7 @@
 name: Publish
 
 # Publishes the package when its package.json version isn't on npm yet, and tags the commit so
-# the action can be pinned to it. Bump the version in a PR; merging it publishes.
+# the actions can be pinned to it. Bump the version in a PR; merging it publishes.
 on:
   push:
     branches: [main]
@@ -16,9 +16,38 @@ permissions:
   contents: read
 
 jobs:
-  publish:
+  # Tests run third-party dev dependencies, so they run without publishing permissions
+  test:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Activate the pinned package manager
+        run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm build
+      - name: Pack the package
+        run: npm pack --pack-destination "$RUNNER_TEMP/package"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package
+          path: ${{ runner.temp }}/package/*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Restricted to main in the repository settings; npm's trusted publisher names it too
+    environment: release
     permissions:
       contents: write # release tags
       id-token: write # npm provenance and trusted publishing
@@ -30,10 +59,10 @@ jobs:
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
-      - name: Activate the pinned package manager
-        run: corepack enable
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm test
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package
+          path: ${{ runner.temp }}/package
       - id: version
         name: Check whether this version is new
         run: |
@@ -46,10 +75,10 @@ jobs:
             echo "new=true" >> "$GITHUB_OUTPUT"
           fi
       # Signs in to npm with this workflow's GitHub OIDC token (npm trusted publishing), so no
-      # npm token is stored
+      # npm token is stored. No install or build runs in this job.
       - name: Publish
         if: steps.version.outputs.new == 'true'
-        run: npm publish --provenance --access public
+        run: npm publish "$RUNNER_TEMP"/package/*.tgz --provenance --access public
       - name: Tag the release and move the major version tag
         if: steps.version.outputs.new == 'true'
         env:

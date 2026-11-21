@@ -33,8 +33,21 @@ const STACK_FILE = /^Pulumi\.(.+)\.ya?ml$/;
 
 export class ProjectError extends Error {}
 
+/*
+ * Names reach shell commands and workflow expressions, so anything outside what Pulumi itself
+ * accepts is left out with a warning rather than quoted and hoped for.
+ */
+/** Pulumi's own rule for project and stack names */
+const NAME = /^[A-Za-z0-9_.-]+$/;
+/** Folders: letters, digits, spaces and a few punctuation marks; no quotes, $, backticks or newlines */
+const FOLDER = /^[A-Za-z0-9 _.@+/-]*$/;
+
 /** Finds every Pulumi project in the snapshot and its stacks */
-export function discoverProjects(snapshot: Snapshot, config: Config): Project[] {
+export function discoverProjects(
+  snapshot: Snapshot,
+  config: Config,
+  warnings: string[] = [],
+): Project[] {
   const projects: Project[] = [];
   const names = new Map<string, string>();
   for (const file of snapshot.paths) {
@@ -48,7 +61,17 @@ export function discoverProjects(snapshot: Snapshot, config: Config): Project[] 
     if (!included) continue;
     if (matchesAnyGlob(config.projects.exclude, dirForGlobs)) continue;
 
-    const project = readProject(snapshot, file);
+    if (!FOLDER.test(dir)) {
+      warnings.push(
+        `${file} is in a folder whose name has characters that aren't safe in commands; skipped`,
+      );
+      continue;
+    }
+    const project = readProject(snapshot, file, warnings);
+    if (!NAME.test(project.name)) {
+      warnings.push(`${file}: project name "${project.name}" isn't a valid Pulumi name; skipped`);
+      continue;
+    }
     const sameName = names.get(project.name);
     if (sameName !== undefined) {
       throw new ProjectError(
@@ -71,7 +94,7 @@ export function discoverProjects(snapshot: Snapshot, config: Config): Project[] 
 }
 
 /** Reads one project; `file` is the path of its Pulumi.yaml */
-export function readProject(snapshot: Snapshot, file: string): Project {
+export function readProject(snapshot: Snapshot, file: string, warnings: string[] = []): Project {
   const dir = dirnameOf(file);
   const settings = parseProjectFile(snapshot.read(file) ?? '', file);
   const stackConfigDir = joinPath(dir, settings.stackConfigDir ?? '');
@@ -87,7 +110,12 @@ export function readProject(snapshot: Snapshot, file: string): Project {
   for (const path of snapshot.paths) {
     if (dirnameOf(path) !== stackConfigDir) continue;
     const match = STACK_FILE.exec(path.slice(path.lastIndexOf('/') + 1));
-    if (match) project.stacks.push(makeStack(project, match[1], match[0]));
+    if (!match) continue;
+    if (!NAME.test(match[1])) {
+      warnings.push(`${path}: "${match[1]}" isn't a valid Pulumi stack name; skipped`);
+      continue;
+    }
+    project.stacks.push(makeStack(project, match[1], match[0]));
   }
   project.stacks.sort((a, b) => a.stack.localeCompare(b.stack));
   return project;

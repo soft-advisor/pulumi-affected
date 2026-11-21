@@ -40,8 +40,37 @@ function sh(cwd: string, command: string, args: string[], input?: string) {
     cwd,
     encoding: 'utf8',
     input,
+    env: command === 'git' ? { ...process.env, ...gitAuth() } : process.env,
     stdio: ['pipe', 'pipe', 'inherit'],
   }).trim();
+}
+
+/**
+ * Authenticates git through environment-only config, so the token never appears in a command
+ * line (which error messages repeat)
+ */
+function gitAuth(): NodeJS.ProcessEnv {
+  const token = process.env.GH_TOKEN;
+  if (!token) return {};
+  const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
+  return {
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+    GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
+  };
+}
+
+/** Runs a GitHub-facing command again after a short wait when GitHub has a transient failure */
+function retried(cwd: string, command: string, args: string[]) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return sh(cwd, command, args);
+    } catch (error) {
+      if (attempt === 3) throw error;
+      console.log(`Attempt ${attempt} of ${command} ${args[0]} failed; retrying`);
+      execFileSync('sleep', [String(attempt * 5)]);
+    }
+  }
 }
 
 function output(name: string, value: string) {
@@ -52,7 +81,8 @@ function output(name: string, value: string) {
 
 function remote() {
   required('GITHUB_REPOSITORY');
-  return `https://x-access-token:${required('GH_TOKEN')}@github.com/${repository}.git`;
+  required('GH_TOKEN');
+  return `https://github.com/${repository}.git`;
 }
 
 function branches(index: number) {
@@ -96,7 +126,7 @@ function prepare(index: number, dir: string) {
   );
   if (failed.length > 0) throw new Error(`The initial deploy failed: ${deploy}`);
   const baseSha = commitAll(dir, 'Commit the encryption salts Pulumi wrote');
-  sh(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${base}`]);
+  retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${base}`]);
 
   for (const [path, content] of Object.entries(scenario.changes)) {
     mkdirSync(dirname(join(dir, path)), { recursive: true });
@@ -109,9 +139,9 @@ function prepare(index: number, dir: string) {
     );
   }
   commitAll(dir, scenario.name);
-  sh(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${change}`]);
+  retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${change}`]);
 
-  const url = sh(dir, 'gh', [
+  const url = retried(dir, 'gh', [
     'pr',
     'create',
     '--repo',
@@ -174,7 +204,7 @@ function assertPreview(index: number, number: string, results: string) {
   }
   check(previews.length === 1, `expected one preview comment, found ${previews.length}`);
   for (const id of scenario.expected)
-    check(previews[0].includes(`\`${id}\``), `the preview comment doesn't mention ${id}`);
+    check(previews[0].includes(`<code>${id}</code>`), `the preview comment doesn't mention ${id}`);
 }
 
 function assertDeploy(index: number, number: string, results: string) {
@@ -185,12 +215,12 @@ function assertDeploy(index: number, number: string, results: string) {
   );
   check(deploys.length === 1, `expected one deploy comment, found ${deploys.length}`);
   for (const id of scenario.deployed)
-    check(deploys[0].includes(`\`${id}\``), `the deploy comment doesn't mention ${id}`);
+    check(deploys[0].includes(`<code>${id}</code>`), `the deploy comment doesn't mention ${id}`);
 }
 
 function merge(index: number, number: string, dir: string) {
   sh(TOOL, 'gh', ['pr', 'ready', number, '--repo', repository]);
-  sh(TOOL, 'gh', ['pr', 'merge', number, '--repo', repository, '--squash']);
+  retried(TOOL, 'gh', ['pr', 'merge', number, '--repo', repository, '--squash']);
   sh(dir, 'git', ['fetch', '-q', remote(), branches(index).base]);
   sh(dir, 'git', ['checkout', '-q', 'FETCH_HEAD']);
 }

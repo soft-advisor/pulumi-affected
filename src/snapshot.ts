@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { lstatSync, readFileSync, readlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -35,7 +35,8 @@ export function repoRootOf(cwd: string) {
 }
 
 export function resolveCommit(repoRoot: string, rev: string) {
-  return git(repoRoot, ['rev-parse', '--verify', `${rev}^{commit}`]).trim();
+  // A revision from an input or event must never be read as an option
+  return git(repoRoot, ['rev-parse', '--verify', '--end-of-options', `${rev}^{commit}`]).trim();
 }
 
 abstract class BaseSnapshot implements Snapshot {
@@ -122,7 +123,7 @@ export class WorktreeSnapshot extends BaseSnapshot {
     const paths = new Set<string>();
     for (const path of listing.split('\0')) {
       // Tracked files deleted from the working tree are still listed
-      if (path && existsSync(join(repoRoot, path)) && statSync(join(repoRoot, path)).isFile()) {
+      if (path && isFileOrLink(join(repoRoot, path))) {
         paths.add(path);
       }
     }
@@ -136,18 +137,36 @@ export class WorktreeSnapshot extends BaseSnapshot {
 
   read(path: string) {
     if (!this.present.has(path)) return undefined;
-    return readFileSync(join(this.repoRoot, path), 'utf8');
+    return readRaw(join(this.repoRoot, path)).toString('utf8');
   }
 
   hash(path: string) {
     if (!this.present.has(path)) return undefined;
     let hash = this.hashes.get(path);
     if (!hash) {
-      hash = gitBlobId(readFileSync(join(this.repoRoot, path)));
+      hash = gitBlobId(readRaw(join(this.repoRoot, path)));
       this.hashes.set(path, hash);
     }
     return hash;
   }
+}
+
+function isFileOrLink(path: string) {
+  try {
+    const stats = lstatSync(path);
+    return stats.isFile() || stats.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A file's content as git stores it: a symbolic link is its target path, never the file it
+ * points to, so the working tree reads like a commit and a link can't pull in files from
+ * outside the repository
+ */
+function readRaw(path: string) {
+  return lstatSync(path).isSymbolicLink() ? Buffer.from(readlinkSync(path)) : readFileSync(path);
 }
 
 /** The id git gives a blob with this content, so working-tree files compare with committed ones */
@@ -178,4 +197,28 @@ export function dirnameOf(path: string) {
 /** True when `path` is `dir` itself or inside it; "" is the repo root */
 export function isInside(path: string, dir: string) {
   return dir === '' || path === dir || path.startsWith(`${dir}/`);
+}
+
+export function isSha(value: string) {
+  return /^[0-9a-f]{40}$/.test(value);
+}
+
+/** True when the commit is available locally, fetching it if needed */
+export function ensureCommit(repoRoot: string, sha: string) {
+  if (!isSha(sha)) return false;
+  const exists = () => {
+    try {
+      git(repoRoot, ['cat-file', '-e', `${sha}^{commit}`]);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (exists()) return true;
+  try {
+    git(repoRoot, ['fetch', '--quiet', '--no-tags', 'origin', sha]);
+  } catch {
+    return false;
+  }
+  return exists();
 }

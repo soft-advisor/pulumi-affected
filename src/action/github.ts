@@ -31,6 +31,21 @@ export function appendSummary(markdown: string) {
   if (file) appendFileSync(file, `${markdown}\n`);
 }
 
+/**
+ * Prints text from outside the action (Pulumi's output, names from the repository) so that no
+ * line of it can be read as a workflow command such as ::set-env or ::stop-commands.
+ */
+export function printUntrusted(text: string) {
+  const token = randomUUID();
+  console.log(`::stop-commands::${token}`);
+  console.log(text);
+  console.log(`::${token}::`);
+}
+
+export function error(message: string) {
+  console.log(`::error::${escapeCommand(message)}`);
+}
+
 export function warning(message: string) {
   console.log(`::warning::${escapeCommand(message)}`);
 }
@@ -96,6 +111,20 @@ export class GitHubApi {
       items.push(...batch);
       if (batch.length < 100) return items;
     }
+  }
+
+  private login: Promise<string> | undefined;
+
+  /**
+   * Who comments with this token: the user behind a personal token, or github-actions[bot] for
+   * the workflow's own token (which can't read /user)
+   */
+  identity() {
+    this.login ??= this.request<{ login: string }>('GET', '/user').then(
+      (user) => user.login,
+      () => 'github-actions[bot]',
+    );
+    return this.login;
   }
 
   repo(path: string) {
