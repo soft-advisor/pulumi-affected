@@ -2,7 +2,7 @@ import { type Config, loadConfig } from '../config.ts';
 import type { DependencyGraph } from '../graph.ts';
 import { discoverProjects } from '../projects.ts';
 import { type Request, type SelectResult, select } from '../select.ts';
-import { GitSnapshot, git, repoRootOf, resolveCommit } from '../snapshot.ts';
+import { ensureCommit, GitSnapshot, repoRootOf, resolveCommit } from '../snapshot.ts';
 import { commandRunner, lastDeployedCommit } from './pulumi.ts';
 import { mapConcurrently, type Mode, runStacks, type StackRun } from './runner.ts';
 
@@ -22,6 +22,8 @@ export interface RunCommandOptions {
   command?: string;
   concurrency?: number;
   failFast?: boolean;
+  /** Let Pulumi request GitHub OIDC tokens; see RunnerOptions */
+  passOidc?: boolean;
   onFinish?: (run: StackRun) => void;
   onWarning?: (message: string) => void;
 }
@@ -42,7 +44,9 @@ export async function runCommand(options: RunCommandOptions): Promise<RunCommand
   const headRevision = options.head ?? 'HEAD';
   const head = new GitSnapshot(repoRoot, resolveCommit(repoRoot, headRevision));
   const config = options.config ?? loadConfig(head);
-  const runner = commandRunner(options.command || config.run.command, repoRoot);
+  const runner = commandRunner(options.command || config.run.command, repoRoot, {
+    passOidc: options.passOidc,
+  });
   const concurrency = options.concurrency ?? config.run.concurrency;
   const allStacks = discoverProjects(head, config).flatMap((project) => project.stacks);
 
@@ -90,26 +94,8 @@ export async function runCommand(options: RunCommandOptions): Promise<RunCommand
     ignore: config.classify.ignore,
     concurrency,
     failFast: options.failFast ?? config.run.failFast,
+    newStacks: config.run.newStacks,
     onFinish: options.onFinish,
   });
   return { selection, runs };
-}
-
-/** True when the commit is available locally, fetching it if needed */
-function ensureCommit(repoRoot: string, sha: string) {
-  const exists = () => {
-    try {
-      git(repoRoot, ['cat-file', '-e', `${sha}^{commit}`]);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  if (exists()) return true;
-  try {
-    git(repoRoot, ['fetch', '--quiet', '--no-tags', 'origin', sha]);
-  } catch {
-    return false;
-  }
-  return exists();
 }

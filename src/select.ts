@@ -85,9 +85,9 @@ export function select(options: SelectOptions): SelectResult {
   const config = options.config ?? loadConfig(head);
   const session = new Session(repoRoot, head, config);
   const defaultBase = resolveCommit(repoRoot, options.base);
-  const projects = discoverProjects(head, config);
-  const stacks = projects.flatMap((project) => project.stacks);
   const warnings: string[] = [];
+  const projects = discoverProjects(head, config, warnings);
+  const stacks = projects.flatMap((project) => project.stacks);
 
   const reasons = new Map<string, string[]>();
   const addReason = (stack: Stack, reason: string) => {

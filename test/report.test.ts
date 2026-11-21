@@ -67,13 +67,24 @@ test('errors are fenced even when they contain backticks', () => {
   assert.match(details, /````\nerror: ```bad```\n````/);
 });
 
+test('names from the repository are escaped in comments', () => {
+  const run = runWithChanges(1);
+  const changes = run.classification?.changes ?? [];
+  changes[0].name = '</code><img src=x onerror=alert(1)>`|';
+  const details = renderStackDetails(run);
+  assert.ok(!details.includes('<img'));
+  assert.match(details, /<code>&lt;\/code&gt;&lt;img src=x onerror=alert\(1\)&gt;`&#124;<\/code>/);
+});
+
 test('comments are edited in place, added, and extras deleted', async () => {
   const api = await fakeApi({
     'GET /repos/acme/infra/issues/4/comments': [
-      { id: 10, body: `${marker('preview', 0)}\nold`, user: { login: 'bot' } },
-      { id: 11, body: `${marker('preview', 1)}\nold`, user: { login: 'bot' } },
-      { id: 12, body: `${marker('preview', 2)}\nold`, user: { login: 'bot' } },
+      { id: 10, body: `${marker('preview', 0)}\nold`, user: { login: 'github-actions[bot]' } },
+      { id: 11, body: `${marker('preview', 1)}\nold`, user: { login: 'github-actions[bot]' } },
+      { id: 12, body: `${marker('preview', 2)}\nold`, user: { login: 'github-actions[bot]' } },
       { id: 13, body: 'unrelated', user: { login: 'someone' } },
+      // Someone else's comment with the marker is never taken for the action's own
+      { id: 14, body: `${marker('preview', 0)}\nspoofed`, user: { login: 'someone' } },
     ],
     'PATCH /repos/acme/infra/issues/comments/10': {},
     'DELETE /repos/acme/infra/issues/comments/11': '',
@@ -92,6 +103,7 @@ test('comments are edited in place, added, and extras deleted', async () => {
       'DELETE /repos/acme/infra/issues/comments/11',
       'DELETE /repos/acme/infra/issues/comments/12',
     ]);
+    assert.ok(!api.calls.some((call) => call.path.endsWith('/14')));
   } finally {
     api.close();
   }
@@ -103,8 +115,8 @@ test('with nothing to report and no earlier comment, nothing is posted', async (
   try {
     await syncComments(new GitHubApi('token', 'acme/infra'), 4, 'preview', ['body'], true);
     assert.deepEqual(
-      api.calls.map((call) => call.method),
-      ['GET'],
+      api.calls.filter((call) => call.method !== 'GET'),
+      [],
     );
   } finally {
     api.close();

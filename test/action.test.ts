@@ -116,14 +116,21 @@ test('on a push, compares with the previous commit and honours merged pull reque
       {
         number: 3,
         body: 'Pulumi-Affected-Run: alpha/dev',
-        base: { sha: base },
+        base: { sha: base, ref: 'main' },
         head: { sha: head },
+        merged_at: '2026-01-01T00:00:00Z',
       },
     ],
     'GET /repos/acme/infra/issues/3/comments': [],
   });
   try {
-    const { outputs } = await runAction(dir, 'push', { before: base }, {}, api.url);
+    const { outputs } = await runAction(
+      dir,
+      'push',
+      { before: base, ref: 'refs/heads/main' },
+      {},
+      api.url,
+    );
     assert.deepEqual(JSON.parse(outputs.ids), ['alpha/dev']);
   } finally {
     api.close();

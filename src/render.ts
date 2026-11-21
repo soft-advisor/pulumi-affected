@@ -1,3 +1,4 @@
+import { code, escapeHtml } from './run/report.ts';
 import type { SelectResult } from './select.ts';
 
 /** A Markdown summary of a selection, for job summaries and pull request comments */
@@ -8,7 +9,7 @@ export function renderMarkdown(result: SelectResult) {
     lines.push('| Wave | Stack | Why |', '| --- | --- | --- |');
     for (const stack of result.stacks) {
       const why = stack.reasons.map(escapeCell).join('<br>');
-      lines.push(`| ${stack.wave + 1} | \`${stack.id}\` | ${why} |`);
+      lines.push(`| ${stack.wave + 1} | ${code(stack.id)} | ${why} |`);
     }
     lines.push('');
   }
@@ -16,7 +17,7 @@ export function renderMarkdown(result: SelectResult) {
     lines.push(
       `<details><summary>${result.unaffected.length} unaffected</summary>`,
       '',
-      result.unaffected.map((id) => `\`${id}\``).join(', '),
+      result.unaffected.map(code).join(', '),
       '',
       '</details>',
       '',
@@ -41,5 +42,5 @@ function shortLabel(label: string) {
 }
 
 function escapeCell(text: string) {
-  return text.replace(/\|/g, '\\|').replace(/\n/g, ' ');
+  return escapeHtml(text).replace(/\|/g, '&#124;').replace(/\n/g, ' ');
 }

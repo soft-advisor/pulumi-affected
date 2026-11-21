@@ -28,7 +28,53 @@ export interface PulumiRunner {
 
 const MISSING_STACK = /no stack named '[^']*' found/i;
 
-export function commandRunner(template: string, repoRoot: string): PulumiRunner {
+export interface RunnerOptions {
+  /**
+   * Pass the variables that let a step request a GitHub OIDC token. Off by default: with them,
+   * the program could mint tokens that cloud trust policies accept for this workflow.
+   */
+  passOidc?: boolean;
+}
+
+/**
+ * Variables the action runtime sets that a Pulumi program never needs: the job token passed as an
+ * input, the runtime's own tokens, and the files whose contents become later steps' environment,
+ * path and outputs.
+ */
+const PRIVATE_VARIABLES = [
+  /^INPUT_/,
+  /^ACTIONS_RUNTIME_/,
+  /^ACTIONS_RESULTS_URL$/,
+  /^ACTIONS_CACHE_URL$/,
+  /^GITHUB_(ENV|PATH|OUTPUT|STATE|STEP_SUMMARY)$/,
+];
+const OIDC_VARIABLES = /^ACTIONS_ID_TOKEN_REQUEST_/;
+
+export function childEnvironment(options: RunnerOptions, extra: NodeJS.ProcessEnv = {}) {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (PRIVATE_VARIABLES.some((pattern) => pattern.test(name))) continue;
+    if (!options.passOidc && OIDC_VARIABLES.test(name)) continue;
+    env[name] = value;
+  }
+  return { ...env, ...extra };
+}
+
+/** The stack, also as variables, so wrapper scripts can quote them safely: "$PULUMI_AFFECTED_STACK" */
+function stackVariables(stack: Stack): NodeJS.ProcessEnv {
+  return {
+    PULUMI_AFFECTED_DIR: stack.dir === '' ? '.' : stack.dir,
+    PULUMI_AFFECTED_STACK: stack.stack,
+    PULUMI_AFFECTED_PROJECT: stack.project,
+    PULUMI_AFFECTED_ID: stack.id,
+  };
+}
+
+export function commandRunner(
+  template: string,
+  repoRoot: string,
+  options: RunnerOptions = {},
+): PulumiRunner {
   const exec = (command: string, env: NodeJS.ProcessEnv) =>
     new Promise<CommandResult>((resolve) => {
       const child = spawn('/bin/sh', ['-c', command], { cwd: repoRoot, env });
@@ -47,12 +93,12 @@ export function commandRunner(template: string, repoRoot: string): PulumiRunner 
     });
   return {
     run: (stack, args, env = {}) =>
-      exec(`${expandTemplate(template, stack)} ${args.map(quote).join(' ')}`, {
-        ...process.env,
-        ...env,
-      }),
+      exec(
+        `${expandTemplate(template, stack)} ${args.map(quote).join(' ')}`,
+        childEnvironment(options, { ...stackVariables(stack), ...env }),
+      ),
     runPulumi: (args, env) =>
-      exec(`pulumi ${args.map(quote).join(' ')}`, { ...process.env, ...env }),
+      exec(`pulumi ${args.map(quote).join(' ')}`, childEnvironment(options, env)),
   };
 }
 
@@ -76,16 +122,25 @@ export function isMissingStack(result: CommandResult) {
 
 export type PreviewOutcome =
   | { kind: 'previewed'; classification: Classification; newStack: boolean }
-  | { kind: 'failed'; error: string };
+  | { kind: 'failed'; error: string; newStack: boolean }
+  | { kind: 'new-stack-skipped' };
+
+export type NewStacks = 'preview' | 'skip';
 
 export async function previewStack(
   runner: PulumiRunner,
   stack: Stack,
   repoRoot: string,
   ignore: readonly IgnoreRule[],
+  newStacks: NewStacks = 'preview',
 ): Promise<PreviewOutcome> {
+  // Asking for the outputs doesn't run the program, so its output can't pose as a missing stack
+  const existence = await runner.run(stack, ['stack', 'output', '--json']);
+  if (isMissingStack(existence)) {
+    if (newStacks === 'skip') return { kind: 'new-stack-skipped' };
+    return previewNewStack(runner, stack, repoRoot, ignore);
+  }
   const result = await runner.run(stack, ['preview', '--json', '--non-interactive']);
-  if (isMissingStack(result)) return previewNewStack(runner, stack, repoRoot, ignore);
   return toOutcome(result, ignore, false);
 }
 
@@ -122,17 +177,23 @@ async function previewNewStack(
       ],
       env,
     );
-    if (init.code !== 0) return { kind: 'failed', error: errorText(init) };
+    if (init.code !== 0)
+      return { kind: 'failed', error: newStackHint(errorText(init)), newStack: true };
     const result = await runner.runPulumi(
       ['--cwd', cwd, '--stack', stack.stack, 'preview', '--json', '--non-interactive'],
       env,
     );
-    return toOutcome(result, ignore, true);
+    const outcome = toOutcome(result, ignore, true);
+    return outcome.kind === 'failed' ? { ...outcome, error: newStackHint(outcome.error) } : outcome;
   } finally {
     if (originalConfig === undefined) rmSync(configPath, { force: true });
     else writeFileSync(configPath, originalConfig);
     rmSync(backend, { recursive: true, force: true });
   }
+}
+
+function newStackHint(error: string) {
+  return `${error}\n\nThis stack doesn't exist yet, so it was previewed in a temporary local backend, where other stacks (StackReference), ESC environments and the real backend's secrets aren't available. Set run.newStacks to "skip" to leave new stacks out of previews.`;
 }
 
 function readSecretsProvider(config: string | undefined) {
@@ -150,11 +211,15 @@ function toOutcome(
   ignore: readonly IgnoreRule[],
   newStack: boolean,
 ): PreviewOutcome {
-  if (result.code !== 0) return { kind: 'failed', error: errorText(result) };
+  if (result.code !== 0) return { kind: 'failed', error: errorText(result), newStack };
   try {
     return { kind: 'previewed', classification: classify(result.stdout, ignore), newStack };
   } catch (error) {
-    return { kind: 'failed', error: error instanceof Error ? error.message : String(error) };
+    return {
+      kind: 'failed',
+      error: error instanceof Error ? error.message : String(error),
+      newStack,
+    };
   }
 }
 
@@ -259,16 +324,39 @@ function parseFirstJsonArray(text: string): HistoryEntry[] {
   }
 }
 
-/** The useful part of a failed command's output: Pulumi's error lines, or its last lines */
+/**
+ * The useful part of a failed command's output, without the resource values the JSON output
+ * carries: Pulumi's error diagnostics (from the preview document or the event stream), else
+ * error lines and the last lines of stderr and of any non-JSON output.
+ */
 export function errorText(result: CommandResult) {
+  const messages: string[] = [];
   const json = parseFirstJson(result.stdout) as
-    | { diagnostics?: { message?: string }[] }
+    | { diagnostics?: { message?: string; severity?: string }[] }
     | undefined;
-  const diagnostics = json?.diagnostics
-    ?.map((diagnostic) => diagnostic.message?.trim())
-    .filter(Boolean);
-  if (diagnostics?.length) return diagnostics.join('\n');
-  const lines = `${result.stderr}\n${result.stdout}`.trim().split('\n');
+  for (const diagnostic of json?.diagnostics ?? []) {
+    if (diagnostic.severity === undefined || diagnostic.severity === 'error') {
+      if (diagnostic.message?.trim()) messages.push(diagnostic.message.trim());
+    }
+  }
+  for (const line of result.stdout.split('\n')) {
+    if (!line.startsWith('{"sequence"')) continue;
+    try {
+      const event = JSON.parse(line) as {
+        diagnosticEvent?: { message?: string; severity?: string };
+      };
+      const diagnostic = event.diagnosticEvent;
+      if (diagnostic?.severity === 'error' && diagnostic.message?.trim()) {
+        messages.push(diagnostic.message.trim());
+      }
+    } catch {
+      // Not an event line
+    }
+  }
+  if (messages.length > 0) return [...new Set(messages)].join('\n');
+
+  const plainOutput = json === undefined ? result.stdout : '';
+  const lines = `${result.stderr}\n${plainOutput}`.trim().split('\n');
   const errors = lines.filter((line) => /^\s*error:/i.test(line));
   return (errors.length > 0 ? errors : lines.slice(-20)).join('\n');
 }

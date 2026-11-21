@@ -9,9 +9,11 @@ import { eventContext, pullRequestContext } from './context.ts';
 import {
   appendSummary,
   booleanInput,
+  error,
   GitHubApi,
   input,
   notice,
+  printUntrusted,
   readEvent,
   setOutput,
   warning,
@@ -40,6 +42,7 @@ async function main() {
     pullRequestNumber && api
       ? await pullRequestContext(api, repoRoot, pullRequestNumber)
       : await eventContext(event, repoRoot, api);
+  for (const message of context?.warnings ?? []) warning(message);
   if (context === undefined) {
     notice('Not a /pulumi-affected command; nothing to run');
     writeOutputs([]);
@@ -59,6 +62,7 @@ async function main() {
     command: input('command') || undefined,
     concurrency: input('concurrency') ? Number(input('concurrency')) : undefined,
     failFast: input('fail-fast') ? booleanInput('fail-fast') : undefined,
+    passOidc: booleanInput('pass-oidc'),
     onFinish: printRun,
     onWarning: warning,
   });
@@ -105,15 +109,21 @@ async function main() {
 }
 
 function printRun(run: StackRun) {
-  console.log(`::group::${run.stack.id}: ${run.status}`);
-  console.log(`Why: ${run.reasons.join('; ')}`);
+  console.log(`::group::${escapeData(run.stack.id)}: ${run.status}`);
+  const lines = [`Why: ${run.reasons.join('; ')}`];
   for (const change of run.classification?.changes ?? []) {
-    console.log(`  ${change.op} ${change.type} ${change.name} ${change.properties.join(', ')}`);
+    lines.push(`  ${change.op} ${change.type} ${change.name} ${change.properties.join(', ')}`);
   }
-  if (run.changedOutputs?.length) console.log(`Outputs changed: ${run.changedOutputs.join(', ')}`);
-  if (run.error) console.log(run.error);
-  for (const note of run.notes ?? []) warning(`${run.stack.id}: ${note}`);
+  if (run.changedOutputs?.length) lines.push(`Outputs changed: ${run.changedOutputs.join(', ')}`);
+  if (run.error) lines.push(run.error);
+  printUntrusted(lines.join('\n'));
   console.log('::endgroup::');
+  for (const note of run.notes ?? []) warning(`${run.stack.id}: ${note}`);
+}
+
+/** A group title can't contain a newline, or the rest would be read as commands */
+function escapeData(text: string) {
+  return text.replace(/[\r\n]/g, ' ');
 }
 
 function writeOutputs(runs: StackRun[]) {
@@ -144,7 +154,7 @@ function runLink() {
   return `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}`;
 }
 
-main().catch((error: unknown) => {
-  console.log(`::error::${error instanceof Error ? error.message : String(error)}`);
+main().catch((caught: unknown) => {
+  error(caught instanceof Error ? caught.message : String(caught));
   process.exitCode = 1;
 });

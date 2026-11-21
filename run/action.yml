@@ -22,6 +22,12 @@ inputs:
   fail-fast:
     description: 'Stop starting stacks after the first failure. Default: keep going and fail at the end.'
     required: false
+  pass-oidc:
+    description: >-
+      Let Pulumi programs and the command template request GitHub OIDC tokens. Off by default, so
+      code under preview can't mint tokens your cloud's trust policies would accept.
+    required: false
+    default: 'false'
   comment:
     description: >-
       Comment on pull requests: the preview on the pull request, the deploy result on the pull

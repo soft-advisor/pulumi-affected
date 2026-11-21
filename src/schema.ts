@@ -112,6 +112,11 @@ export const configSchema = {
           type: 'integer',
           minimum: 1,
         },
+        newStacks: {
+          description:
+            "Stacks that don't exist yet: preview them in a temporary local backend, where StackReferences, ESC environments and the real backend's secrets aren't available, or skip them. Default: preview",
+          enum: ['preview', 'skip'],
+        },
         failFast: {
           description:
             'Stop starting stacks after the first failure. Default: false, which keeps going and fails at the end',

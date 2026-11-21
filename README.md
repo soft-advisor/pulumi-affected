@@ -71,6 +71,7 @@ run:
   command: scripts/pulumi.sh {stack} # default: pulumi --cwd {dir} --stack {stack}
   concurrency: 4
   failFast: false
+  newStacks: preview # or skip
 ```
 
 ## GitHub Actions
@@ -90,6 +91,53 @@ Both take the comparison base from the event:
 | anything else                                     | the `base` input                                                    |
 
 Pin the actions to a commit SHA: jobs that preview and deploy usually hold credentials for your cloud accounts.
+
+## Security
+
+A preview runs the pull request's Pulumi program, so whoever can open a pull request can run code in a preview job. Plan credentials with that in mind:
+
+- **Previews get read-only credentials; deploys get the rest.** Deploy only on pushes to protected branches, in a separate job or workflow, ideally behind a GitHub environment.
+- **Forks.** `pull_request` runs from forks get no secrets, so their previews can't sign in. `pull_request_target` with a fork's code checked out is refused.
+- **Comment commands** run only for people with write access, only on pull requests from this repository, and only for new comments. The action checks this itself, but also gate the job, so it doesn't even start for others:
+
+  ```yaml
+  on:
+    issue_comment:
+      types: [created]
+  jobs:
+    preview:
+      if: >-
+        github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/pulumi-affected') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            ref: refs/pull/${{ github.event.issue.number }}/head
+            fetch-depth: 0
+        # read-only sign-in, then the run action with mode: preview
+  ```
+
+  A comment-triggered run's OIDC token says `ref: refs/heads/<default branch>`, so cloud trust policies for deploy roles should also check `event_name` or the workflow, not only the branch.
+- **What Pulumi sees.** Pulumi runs without the job token, the runner's internal tokens and the files that set later steps' environment. It also can't request GitHub OIDC tokens unless `pass-oidc: true`.
+- **Names.** Project and stack names that Pulumi wouldn't accept, and folders whose names contain quotes, `$`, backticks or newlines, are skipped with a warning. Wrapper scripts should still quote their arguments, or use the `PULUMI_AFFECTED_DIR`, `PULUMI_AFFECTED_STACK`, `PULUMI_AFFECTED_PROJECT` and `PULUMI_AFFECTED_ID` variables the command gets.
+- **Comments and logs** show resource types, names and changed property names, never values. A failed stack shows Pulumi's error diagnostics.
+
+**Concurrency.** Two deploys of the same stacks at once fight over stack locks, or apply out of order. Previews of the same pull request duplicate comments. Use concurrency groups:
+
+```yaml
+concurrency:
+  # Deploys: one at a time, never cancelled midway
+  group: pulumi-deploy
+  cancel-in-progress: false
+```
+
+```yaml
+concurrency:
+  # Previews: the latest push of a pull request wins
+  group: pulumi-preview-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+```
 
 ### `run`
 
@@ -116,13 +164,13 @@ jobs:
           mode: ${{ github.event_name == 'push' && 'up' || 'preview' }}
 ```
 
-**Preview** runs every selected stack in parallel. A stack that doesn't exist yet is previewed in a temporary local backend with its config, so nothing is written to the real backend before merge. Secrets encrypted by a backend the temporary one can't use (such as Pulumi Cloud) make that preview fail with a clear error.
+**Preview** runs every selected stack in parallel. A stack that doesn't exist yet is previewed in a temporary local backend with its config, so nothing is written to the real backend before merge. There, other stacks (`StackReference`), ESC environments and secrets encrypted by the real backend aren't available, so such a preview fails with an explanation. `run.newStacks: skip` leaves new stacks out of previews instead.
 
 **Up** compares each stack with the commit it was last deployed from (Pulumi records it as `git.head` in the stack's history), so a stack whose deploy failed, or that was never deployed, runs again on the next push. Stacks run after the ones they depend on. When a deploy changes a stack's outputs, the stacks that depend on it are deployed too, with the reason. A failure skips the stacks that depend on the failed one, lets the others finish, and fails the job at the end (`fail-fast` stops early instead).
 
 **Comments.** A preview posts one comment on the pull request and edits it on every push: a table of stacks with their result and why they ran, then each stack's resource changes. A push that selects nothing rewrites an earlier comment rather than adding one. A deploy comments its results on the pull requests the push merged. GitHub limits a comment to 65,536 characters, so a long report continues in further comments, split between stacks. Resource changes show types, names and changed property names, never values; a failed stack shows the error Pulumi printed. Pull requests from forks can't be commented on with the default token; the job summary has everything.
 
-**Inputs:** `mode` (`preview` or `up`), `command`, `concurrency`, `fail-fast`, `comment`, `base`, `head`, `run`, `skip`, `all`, `working-directory`, `github-token`.
+**Inputs:** `mode` (`preview` or `up`), `command`, `concurrency`, `fail-fast`, `comment`, `pass-oidc`, `base`, `head`, `run`, `skip`, `all`, `pull-request`, `working-directory`, `github-token`.
 **Outputs:** `results` (JSON array of `{ id, status, reasons, counts, changedOutputs, newStack, error }`, status being `changes`, `no-changes`, `failed` or `skipped`), `changed`, `failed`, `any-changes`.
 
 ### `select`
@@ -155,12 +203,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # your own Pulumi and cloud sign-in
-      - run: pulumi preview --cwd "${{ matrix.stack.dir }}" --stack "${{ matrix.stack.stack }}"
+      # Through env, never ${{ }} inside the script: the values come from repository files
+      - run: pulumi preview --cwd "$STACK_DIR" --stack "$STACK_NAME"
+        env:
+          STACK_DIR: ${{ matrix.stack.dir }}
+          STACK_NAME: ${{ matrix.stack.stack }}
 ```
 
 To deploy only stacks whose last deploy is older than the change, pass `bases`: a JSON object from stack id to the commit each was last deployed from, or `null` for a stack never deployed.
 
-**Inputs:** `base`, `head`, `bases`, `run`, `skip`, `all`, `working-directory`, `github-token`.
+**Inputs:** `base`, `head`, `bases`, `run`, `skip`, `all`, `pull-request`, `working-directory`, `github-token`.
 **Outputs:** `stacks` (JSON array of `{ id, project, dir, stack, configFile, wave, reasons }`), `ids`, `waves`, `any`, `result`.
 
 ## CLI

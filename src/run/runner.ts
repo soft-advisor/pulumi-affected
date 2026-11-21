@@ -1,7 +1,7 @@
 import type { Classification, IgnoreRule } from '../classify.ts';
 import { type DependencyGraph, dependentsOf } from '../graph.ts';
 import type { Stack } from '../projects.ts';
-import { type PulumiRunner, previewStack, upStack } from './pulumi.ts';
+import { type NewStacks, type PulumiRunner, previewStack, upStack } from './pulumi.ts';
 
 /*
  * Runs previews or deploys for selected stacks.
@@ -41,6 +41,8 @@ export interface RunOptions {
   ignore: readonly IgnoreRule[];
   concurrency: number;
   failFast: boolean;
+  /** Whether stacks that don't exist yet are previewed in a temporary backend or left out */
+  newStacks?: NewStacks;
   /** Called as each stack finishes, e.g. to print its log */
   onFinish?: (run: StackRun) => void;
 }
@@ -62,10 +64,31 @@ async function runPreviews(options: RunOptions) {
           status: 'skipped',
           error: 'an earlier stack failed',
         });
-      const outcome = await previewStack(options.runner, stack, options.repoRoot, options.ignore);
+      const outcome = await previewStack(
+        options.runner,
+        stack,
+        options.repoRoot,
+        options.ignore,
+        options.newStacks,
+      );
+      if (outcome.kind === 'new-stack-skipped') {
+        return finish(options, {
+          stack,
+          reasons,
+          status: 'skipped',
+          newStack: true,
+          error: "doesn't exist yet, and run.newStacks is skip",
+        });
+      }
       if (outcome.kind === 'failed') {
         if (options.failFast) stop = true;
-        return finish(options, { stack, reasons, status: 'failed', error: outcome.error });
+        return finish(options, {
+          stack,
+          reasons,
+          status: 'failed',
+          error: outcome.error,
+          newStack: outcome.newStack,
+        });
       }
       return finish(options, {
         stack,
