@@ -23,6 +23,9 @@ const hasPulumi = (() => {
   }
 })();
 
+/** The provider version CI installs ahead of time; see .github/workflows/ci.yml */
+const RANDOM_VERSION = '4.21.6';
+
 const pet = (name: string, keeper: string) => ({
   [`${name}/Pulumi.yaml`]: [
     `name: ${name}`,
@@ -37,6 +40,9 @@ const pet = (name: string, keeper: string) => ({
     '    properties:',
     '      keepers:',
     '        k: ${keeper}',
+    // Pinned, so Pulumi never looks up the latest version (which shared CI runners get rate limited on)
+    `    options:`,
+    `      version: ${RANDOM_VERSION}`,
     'outputs:',
     '  name: ${pet.id}',
     '',
@@ -68,8 +74,14 @@ const FILES: Files = {
   'pulumi-affected.yaml': 'dependsOn:\n  consumer/dev: [base/dev]\n',
 };
 
-const statuses = (runs: StackRun[]) =>
-  Object.fromEntries(runs.map((entry) => [entry.stack.id, entry.status]));
+/** Statuses by stack, with any errors, so a failed assertion says what Pulumi said */
+const statuses = (runs: StackRun[]) => {
+  const errors = runs.filter((entry) => entry.error && entry.status !== 'skipped');
+  if (errors.length > 0) {
+    console.error(errors.map((entry) => `${entry.stack.id}: ${entry.error}`).join('\n'));
+  }
+  return Object.fromEntries(runs.map((entry) => [entry.stack.id, entry.status]));
+};
 
 describe('run with real Pulumi', { skip: !hasPulumi && 'the pulumi CLI is not installed' }, () => {
   let backend: string;
