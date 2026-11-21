@@ -49,10 +49,16 @@ async function main() {
     return;
   }
 
+  const base = input('base') || context.base;
+  if (!base && !booleanInput('all') && !context.all) {
+    warning(
+      `A ${event.name || 'local'} run has no revision to compare with, so only requested stacks${mode === 'up' ? ' and stacks whose last deploy is older' : ''} run; set the base input`,
+    );
+  }
   const { selection, runs } = await runCommand({
     cwd,
     mode,
-    base: input('base') || context.base || 'HEAD',
+    base: base || 'HEAD',
     head: input('head') || undefined,
     run: splitPatterns(input('run')),
     skip: splitPatterns(input('skip')),
@@ -60,7 +66,7 @@ async function main() {
     messages: context.messages,
     requests: context.requests,
     command: input('command') || undefined,
-    concurrency: input('concurrency') ? Number(input('concurrency')) : undefined,
+    concurrency: concurrencyInput(),
     failFast: input('fail-fast') ? booleanInput('fail-fast') : undefined,
     passOidc: booleanInput('pass-oidc'),
     onFinish: printRun,
@@ -73,7 +79,7 @@ async function main() {
     .filter((run) => run.status !== 'no-changes')
     .map((run) => renderStackDetails(run, undefined, runUrl));
   const intro = runs.length > 0 ? renderTable(runs) : 'No stacks affected.';
-  appendSummary([heading, intro, ...sections].join('\n\n'));
+  appendSummary(limitSummary([heading, intro, ...sections].join('\n\n'), runUrl));
   if (runs.length === 0) appendSummary(renderMarkdown(selection));
 
   if (api && booleanInput('comment')) {
@@ -86,7 +92,8 @@ async function main() {
         // A push that selects nothing updates an earlier comment rather than adding one
         await syncComments(api, context.pullRequest.number, 'preview', bodies, runs.length === 0);
       }
-      if (mode === 'up') {
+      // Nothing deployed means nothing to report on the merged pull requests
+      if (mode === 'up' && runs.length > 0) {
         const sha = (process.env.GITHUB_SHA ?? 'head').slice(0, 12);
         for (const pullRequest of context.mergedPullRequests) {
           const bodies = splitComments(heading, intro + footer, sections, (index) =>
@@ -126,6 +133,26 @@ function escapeData(text: string) {
   return text.replace(/[\r\n]/g, ' ');
 }
 
+/** GitHub drops a job summary over 1 MiB, so a longer one is cut short with a pointer */
+const SUMMARY_LIMIT = 900_000;
+/** Each step output is limited too; errors are the part that can grow without bound */
+const OUTPUT_ERROR_LIMIT = 4_000;
+
+function limitSummary(markdown: string, runUrl: string | undefined) {
+  if (markdown.length <= SUMMARY_LIMIT) return markdown;
+  return `${markdown.slice(0, SUMMARY_LIMIT)}\n\n…cut short; the full output is in the ${runUrl ? `[run log](${runUrl})` : 'run log'}.`;
+}
+
+function concurrencyInput() {
+  const text = input('concurrency');
+  if (!text) return undefined;
+  const value = Number(text);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`The concurrency input must be a whole number of at least 1, not "${text}"`);
+  }
+  return value;
+}
+
 function writeOutputs(runs: StackRun[]) {
   const ids = (status: StackRun['status']) =>
     JSON.stringify(runs.filter((run) => run.status === status).map((run) => run.stack.id));
@@ -139,7 +166,10 @@ function writeOutputs(runs: StackRun[]) {
         counts: run.classification?.counts ?? {},
         changedOutputs: run.changedOutputs ?? [],
         newStack: run.newStack ?? false,
-        error: run.error,
+        error:
+          run.error && run.error.length > OUTPUT_ERROR_LIMIT
+            ? `${run.error.slice(0, OUTPUT_ERROR_LIMIT)}…`
+            : run.error,
       })),
     ),
   );

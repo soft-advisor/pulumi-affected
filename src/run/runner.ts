@@ -106,7 +106,31 @@ async function runDeploys(options: RunOptions) {
   const byId = new Map(options.allStacks.map((stack) => [stack.id, stack]));
   const pending = new Map(options.stacks.map((entry) => [entry.stack.id, entry]));
   const runs = new Map<string, StackRun>();
+  const failed = new Set<string>();
   let stop = false;
+
+  /** True when a stack it depends on, directly or not, failed in this run */
+  const dependsOnFailure = (id: string) => {
+    const seen = new Set<string>();
+    const queue = [...(options.graph.get(id) ?? [])];
+    while (queue.length > 0) {
+      const dependency = queue.shift() as string;
+      if (seen.has(dependency)) continue;
+      seen.add(dependency);
+      if (failed.has(dependency)) return dependency;
+      queue.push(...(options.graph.get(dependency) ?? []));
+    }
+    return undefined;
+  };
+
+  /**
+   * A stack added because its inputs changed isn't selected again by later pushes, so if it can't
+   * run now, someone has to run it
+   */
+  const missedInputsNote = (reasons: string[]) =>
+    reasons.some((reason) => reason.includes(' outputs changed: '))
+      ? '; its inputs changed in this run, so run it again (e.g. Pulumi-Affected-Run) once that is fixed'
+      : '';
 
   /** True when `id` must wait: a stack it depends on, directly or not, is still pending */
   const isBlocked = (id: string) => {
@@ -133,7 +157,7 @@ async function runDeploys(options: RunOptions) {
         finish(options, {
           ...entry,
           status: 'skipped',
-          error: `${id} failed, and this stack depends on it`,
+          error: `${id} failed, and this stack depends on it${missedInputsNote(entry.reasons)}`,
         }),
       );
     }
@@ -174,16 +198,37 @@ async function runDeploys(options: RunOptions) {
       },
     );
 
+    // Failures first, so a stack never runs because one dependency changed while another failed
     for (const run of finished) {
       runs.set(run.stack.id, run);
       if (run.status === 'failed') {
+        failed.add(run.stack.id);
         skipDependentsOf(run.stack.id);
-        continue;
       }
-      if (!run.changedOutputs?.length) continue;
+    }
+    for (const run of finished) {
+      if (run.status === 'failed' || !run.changedOutputs?.length) continue;
       for (const dependent of dependentsOf(options.graph, run.stack.id)) {
         if (runs.has(dependent)) continue;
         const reason = `${run.stack.id} outputs changed: ${run.changedOutputs.join(', ')}`;
+        const failedDependency = dependsOnFailure(dependent);
+        if (failedDependency) {
+          const entry = pending.get(dependent);
+          const stack = entry?.stack ?? byId.get(dependent);
+          if (!stack) continue;
+          const reasons = [...(entry?.reasons ?? []), reason];
+          pending.delete(dependent);
+          runs.set(
+            dependent,
+            finish(options, {
+              stack,
+              reasons,
+              status: 'skipped',
+              error: `${failedDependency} failed, and this stack depends on it${missedInputsNote(reasons)}`,
+            }),
+          );
+          continue;
+        }
         const entry = pending.get(dependent);
         if (entry) entry.reasons.push(reason);
         else if (byId.has(dependent)) {
@@ -195,7 +240,11 @@ async function runDeploys(options: RunOptions) {
       for (const entry of pending.values()) {
         runs.set(
           entry.stack.id,
-          finish(options, { ...entry, status: 'skipped', error: 'an earlier stack failed' }),
+          finish(options, {
+            ...entry,
+            status: 'skipped',
+            error: `an earlier stack failed${missedInputsNote(entry.reasons)}`,
+          }),
         );
       }
       pending.clear();

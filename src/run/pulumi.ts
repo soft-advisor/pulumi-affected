@@ -247,7 +247,13 @@ export async function upStack(
   if (before === 'missing') {
     const configPath = join(repoRoot, stack.configFile);
     const configBefore = existsSync(configPath) ? readFileSync(configPath, 'utf8') : undefined;
-    const init = await runner.run(stack, ['stack', 'init', '--non-interactive']);
+    const secretsProvider = readSecretsProvider(configBefore);
+    const init = await runner.run(stack, [
+      'stack',
+      'init',
+      '--non-interactive',
+      ...(secretsProvider ? ['--secrets-provider', secretsProvider] : []),
+    ]);
     if (init.code !== 0) return { kind: 'failed', error: errorText(init) };
     const configAfter = existsSync(configPath) ? readFileSync(configPath, 'utf8') : undefined;
     if (configAfter !== configBefore) {

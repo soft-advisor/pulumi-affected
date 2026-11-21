@@ -13,6 +13,8 @@ for (const action of ['select', 'run']) {
     target: 'node22',
     format: 'cjs',
     legalComments: 'none',
+    // About a third of the size; the source is in the repository for reading
+    minify: true,
     logLevel: 'warning',
   });
 }

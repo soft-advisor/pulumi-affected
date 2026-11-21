@@ -213,7 +213,12 @@ function assertDeploy(index: number, number: string, results: string) {
   const deploys = comments(number).filter((body) =>
     body.startsWith('<!-- pulumi-affected:deploy-'),
   );
-  check(deploys.length === 1, `expected one deploy comment, found ${deploys.length}`);
+  // Nothing deployed means no deploy comment
+  const expectedComments = scenario.deployed.length > 0 ? 1 : 0;
+  check(
+    deploys.length === expectedComments,
+    `expected ${expectedComments} deploy comments, found ${deploys.length}`,
+  );
   for (const id of scenario.deployed)
     check(deploys[0].includes(`<code>${id}</code>`), `the deploy comment doesn't mention ${id}`);
 }

@@ -38,7 +38,7 @@ inputs:
     description: 'Revision to compare against. Default: from the event, like the select action.'
     required: false
   head:
-    description: 'Revision to analyse. Default: the checked-out working tree.'
+    description: 'Revision to analyse. Default: HEAD. Pulumi runs the checked-out files, so check out the same revision.'
     required: false
   run:
     description: Stack patterns to run regardless of changes, separated by commas or newlines.
