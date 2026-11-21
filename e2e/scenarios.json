@@ -66,7 +66,11 @@
     },
     "expected": ["fixture-site/dev", "fixture-site/prod"],
     "waves": [["fixture-site/dev"], ["fixture-site/prod"]],
-    "deployed": ["fixture-site/dev", "fixture-site/prod"]
+    "deployed": ["fixture-site/dev", "fixture-site/prod"],
+    "deployStatuses": {
+      "fixture-site/dev": "changes",
+      "fixture-site/prod": "changes"
+    }
   },
   {
     "name": "docs only",
@@ -140,6 +144,41 @@
       "site/site/index.html": "<h1>Hello again</h1>\n"
     },
     "secondExpected": ["fixture-dns/prod", "fixture-site/dev", "fixture-site/prod"],
-    "deployed": ["fixture-dns/prod", "fixture-site/dev", "fixture-site/prod"]
+    "deployed": ["fixture-dns/prod", "fixture-site/dev", "fixture-site/prod"],
+    "deployStatuses": {
+      "fixture-dns/prod": "changes",
+      "fixture-site/dev": "changes",
+      "fixture-site/prod": "changes"
+    }
+  },
+  {
+    "name": "a wrapper that prints before Pulumi does",
+    "command": "echo 'Assuming role {deploy} for {stack}'; pulumi --cwd {dir} --stack {stack}",
+    "changes": {
+      "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
+    },
+    "expected": ["fixture-accounts/shop"],
+    "previewStatuses": {
+      "fixture-accounts/shop": "changes"
+    },
+    "deployed": ["fixture-access/prod", "fixture-accounts/shop"],
+    "deployStatuses": {
+      "fixture-accounts/shop": "changes",
+      "fixture-access/prod": "changes"
+    }
+  },
+  {
+    "name": "a skip in the description holds back the preview, not the deploy",
+    "changes": {
+      "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
+    },
+    "body": "Skipping the preview on purpose.\n\nPulumi-Affected-Skip: fixture-accounts/shop\n",
+    "expected": [],
+    "deployed": ["fixture-access/prod", "fixture-accounts/shop"],
+    "deployStatuses": {
+      "fixture-accounts/shop": "changes",
+      "fixture-access/prod": "changes"
+    },
+    "expectSkipped": ["fixture-accounts/shop"]
   }
 ]

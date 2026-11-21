@@ -32,6 +32,10 @@ interface Scenario {
   secondExpected?: string[];
   deployed: string[];
   deployStatuses?: Record<string, string>;
+  /** Stacks the preview must show as skipped */
+  expectSkipped?: string[];
+  /** run.command for the action, e.g. a wrapper that prints a banner first */
+  command?: string;
 }
 
 const E2E = import.meta.dirname;
@@ -193,7 +197,7 @@ function pushSecond(index: number, number: string, dir: string) {
 }
 
 function comments(number: string) {
-  const raw = sh(TOOL, 'gh', [
+  const raw = retried(TOOL, 'gh', [
     'api',
     '--paginate',
     `repos/${repository}/issues/${number}/comments`,
@@ -222,7 +226,18 @@ function assertRuns(
   results: string,
   statuses: Record<string, string> = {},
 ) {
-  const runs = JSON.parse(results || '[]') as { id: string; status: string }[];
+  // The action itself must have worked: failing only when a stack fails on purpose, and never
+  // crashing, which would otherwise look like "nothing selected"
+  const outcome = process.env.OUTCOME;
+  const shouldFail = Object.values(statuses).includes('failed');
+  if (outcome !== undefined) {
+    check(
+      outcome === (shouldFail ? 'failure' : 'success'),
+      `${kind}: the action's outcome was ${outcome}, expected ${shouldFail ? 'failure' : 'success'}`,
+    );
+  }
+  check(results !== '', `${kind}: the action wrote no results`);
+  const runs = JSON.parse(results) as { id: string; status: string }[];
   console.log(
     `${kind}: ${JSON.stringify(Object.fromEntries(runs.map((run) => [run.id, run.status])))}`,
   );
@@ -258,10 +273,19 @@ function assertPreview(index: number, number: string, results: string) {
   const previews = comments(number).filter((body) =>
     body.startsWith('<!-- pulumi-affected:preview:'),
   );
-  if (scenario.expected.length === 0) {
+  const skipped = scenario.expectSkipped ?? [];
+  if (scenario.expected.length === 0 && skipped.length === 0) {
     check(previews.length === 0, 'a preview comment was posted although no stack was selected');
     return;
   }
+  // Skipped stacks are shown, so a skip in a description can't go unnoticed
+  for (const id of skipped) {
+    check(
+      previews.length === 1 && previews[0].includes(`<code>${id}</code>, skipped by`),
+      `the preview comment doesn't show that ${id} was skipped`,
+    );
+  }
+  if (scenario.expected.length === 0) return;
   check(previews.length === 1, `expected one preview comment, found ${previews.length}`);
   for (const id of scenario.expected)
     check(previews[0].includes(`<code>${id}</code>`), `the preview comment doesn't mention ${id}`);
@@ -303,9 +327,9 @@ function assertSecondPreview(index: number, number: string, results: string) {
 }
 
 function merge(index: number, number: string, dir: string) {
-  sh(TOOL, 'gh', ['pr', 'ready', number, '--repo', repository]);
+  retried(TOOL, 'gh', ['pr', 'ready', number, '--repo', repository]);
   retried(TOOL, 'gh', ['pr', 'merge', number, '--repo', repository, '--squash']);
-  sh(dir, 'git', ['fetch', '-q', remote(), branches(index).base]);
+  retried(dir, 'git', ['fetch', '-q', remote(), branches(index).base]);
   sh(dir, 'git', ['checkout', '-q', 'FETCH_HEAD']);
 }
 
@@ -319,7 +343,7 @@ function cleanup(index: number, number: string | undefined) {
   }
   for (const branch of Object.values(branches(index))) {
     try {
-      sh(TOOL, 'gh', ['api', '-X', 'DELETE', `repos/${repository}/git/refs/heads/${branch}`]);
+      retried(TOOL, 'gh', ['api', '-X', 'DELETE', `repos/${repository}/git/refs/heads/${branch}`]);
     } catch {
       // Never pushed, or already deleted
     }
@@ -333,6 +357,7 @@ if (command === 'list') {
     index: i,
     name: scenario.name,
     second: Boolean(scenario.second),
+    command: scenario.command ?? '',
   }));
   console.log(JSON.stringify(list));
 } else if (command === 'push-second') pushSecond(index, rest[0], rest[1]);
