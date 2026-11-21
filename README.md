@@ -354,12 +354,8 @@ Tests build real git repositories in a temporary folder. The `E2E` workflow runs
 
 ## Releasing
 
-Publishing is manual for now ([`publish.yml`](.github/workflows/publish.yml) only runs on `workflow_dispatch`). Once trusted publishing is set up, it runs on merges to `main`: bump `version` in `package.json` in a PR, and merging it publishes to npm with provenance and tags the commit `v<version>` and `v<major>`.
+Bump `version` in `package.json` in a PR. Merging it runs [`publish.yml`](.github/workflows/publish.yml): once CI has passed on the commit, it publishes to npm with provenance, signing in with the workflow's own OIDC token (npm trusted publishing: repository `soft-advisor/pulumi-affected`, workflow `publish.yml`, environment `release`), so no npm token is stored. The commit is tagged `v<version>`, and `v<major>` moves to it.
 
 What's published is exactly the committed files: the built `dist/` is committed like the action bundles, CI checks it matches the source, and the publish job only checks out, packs and publishes, with no install and no lifecycle scripts. So a compromised dev dependency can't change the package without that showing in a reviewed diff.
 
-npm trusted publishing (GitHub OIDC, no token) can only be set up for a package that already exists, so:
-
-1. The first version is published with the organization's npm token (the `XYZ` secret).
-2. On npmjs.com, the package's Settings → Trusted publisher is set to GitHub Actions, repository `soft-advisor/pulumi-affected`, workflow `publish.yml`, environment `release`.
-3. The token is removed from the workflow, and publishing runs on merges to `main`.
+If npm holds a release for approval (staged publishing), approve it on npmjs.com; the tags move on the next run of the workflow (any merge, or running it by hand), so actions pinned to `v<major>` never get a release npm hasn't let out.
