@@ -35,7 +35,7 @@ export const configSchema = {
     stacks: {
       description: 'Stacks that have no Pulumi.<stack>.yaml file, as "<project>/<stack>"',
       type: 'array',
-      items: { type: 'string', pattern: '^[^/*]+/[^/*]+$' },
+      items: { type: 'string', pattern: '^[A-Za-z0-9_./ @+-]+/[A-Za-z0-9_.-]+$' },
     },
     dependsOn: {
       description:

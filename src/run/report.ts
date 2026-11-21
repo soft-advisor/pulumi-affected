@@ -12,7 +12,7 @@ export const COMMENT_LIMIT = 60_000;
 const STATUS_TEXT: Record<StackRun['status'], string> = {
   changes: '',
   'no-changes': 'no changes',
-  failed: '**failed**',
+  failed: 'failed',
   skipped: 'skipped',
 };
 
@@ -40,14 +40,15 @@ export function renderTable(runs: StackRun[]) {
   const lines = ['| Stack | Result | Why it ran |', '| --- | --- | --- |'];
   for (const run of runs) {
     const label = run.newStack ? `${code(run.stack.id)} (new)` : code(run.stack.id);
-    lines.push(`| ${label} | ${cell(resultText(run))} | ${run.reasons.map(cell).join('<br>')} |`);
+    const result = run.status === 'failed' ? '<b>failed</b>' : cell(resultText(run));
+    lines.push(`| ${label} | ${result} | ${run.reasons.map(reasonText).join('<br>')} |`);
   }
   return lines.join('\n');
 }
 
 /** A stack's details: its resource changes, or its error */
 export function renderStackDetails(run: StackRun, maxLength = COMMENT_LIMIT, runUrl?: string) {
-  const title = `<details><summary>${code(run.stack.id)}: ${cell(resultText(run).replace(/\*\*/g, ''))}</summary>\n\n`;
+  const title = `<details><summary>${code(run.stack.id)}: ${cell(resultText(run))}</summary>\n\n`;
   const end = '\n\n</details>';
   let body: string;
   if (run.error) {
@@ -68,7 +69,7 @@ export function renderStackDetails(run: StackRun, maxLength = COMMENT_LIMIT, run
     if (ignored > 0) body += `\n\n${ignored} ignored by \`classify.ignore\` in the config.`;
   }
   if (run.notes?.length)
-    body = `${run.notes.map((note) => `> [!WARNING]\n> ${note}`).join('\n\n')}\n\n${body}`;
+    body = `${run.notes.map((note) => `> [!WARNING]\n> ${reasonText(note)}`).join('\n\n')}\n\n${body}`;
   const full = title + body + end;
   if (full.length <= maxLength) return full;
   const note = `\n\n…cut short; the full output is in the ${runUrl ? `[run](${runUrl})` : 'run log'}.`;
@@ -117,9 +118,25 @@ function splitTable(table: string, limit: number) {
   return parts;
 }
 
-/** Text for a table cell: HTML-escaped, so repository content can't inject markup */
+/**
+ * Text for a table cell or code span: HTML-escaped, with the characters Markdown acts on as
+ * entities too, so repository content can't add links, images, mentions or formatting
+ */
 function cell(text: string) {
-  return escapeHtml(text).replace(/\|/g, '&#124;').replace(/\n/g, ' ');
+  return escapeHtml(text)
+    .replace(/[|[\]()!@#*_~`:\\<>]/g, (character) => `&#${character.charCodeAt(0)};`)
+    .replace(/\n/g, ' ');
+}
+
+/**
+ * A reason, which is the tool's own text with names from the repository in backticks: the names
+ * become code, and everything is escaped
+ */
+export function reasonText(text: string) {
+  return text
+    .split('`')
+    .map((part, index) => (index % 2 === 1 ? code(part) : cell(part)))
+    .join('');
 }
 
 /** A name in code style; <code> rather than backticks, so a backtick in it can't break out */
@@ -130,6 +147,9 @@ export function code(text: string) {
 export function escapeHtml(text: string) {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+
+/** The Markdown-safe form of any text from outside the tool */
+export { cell as safeText };
 
 function fence(text: string) {
   const longest = Math.max(2, ...[...text.matchAll(/`+/g)].map((match) => match[0].length));

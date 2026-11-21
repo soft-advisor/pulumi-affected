@@ -96,7 +96,13 @@ export function discoverProjects(
   }
 
   for (const extra of config.stacks) {
-    const [projectRef, stack] = extra.split('/');
+    const slash = extra.lastIndexOf('/');
+    const projectRef = extra.slice(0, slash);
+    const stack = extra.slice(slash + 1);
+    if (!NAME.test(stack)) {
+      warnings.push(`stacks: "${stack}" isn't a valid Pulumi stack name; skipped`);
+      continue;
+    }
     const project = projects.find((p) => p.name === projectRef || (p.dir || '.') === projectRef);
     if (!project) throw new ProjectError(`stacks: no project matches "${projectRef}"`);
     if (!project.stacks.some((s) => s.stack === stack)) {
@@ -104,6 +110,7 @@ export function discoverProjects(
       project.stacks.push(makeStack(project, stack, `Pulumi.${stack}.${extension}`));
     }
   }
+  for (const project of projects) project.stacks.sort((a, b) => a.stack.localeCompare(b.stack));
   return projects.sort((a, b) => a.dir.localeCompare(b.dir));
 }
 

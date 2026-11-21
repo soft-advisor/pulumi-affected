@@ -48,6 +48,12 @@ export interface SelectOptions {
   run?: string[];
   /** Stack patterns to leave out unless also named in `run` */
   skip?: string[];
+  /**
+   * Honour Pulumi-Affected-Skip only from `skip`, not from commit messages or `messages`, which
+   * anyone opening a pull request writes. Deploys use this: a skip there would hold a change back
+   * until someone noticed.
+   */
+  trustedSkipsOnly?: boolean;
   /** Select every stack */
   all?: boolean;
   /** A reason to select a stack whatever changed, e.g. "its last deploy was from a dirty tree" */
@@ -73,6 +79,8 @@ export interface SelectResult {
   waves: string[][];
   /** Ids of stacks that weren't selected */
   unaffected: string[];
+  /** Stacks a change affected but a Pulumi-Affected-Skip line or --skip left out */
+  skipped: { id: string; source: string; reasons: string[] }[];
   /** Every stack id to the ids of the stacks it depends on */
   dependencies: Record<string, string[]>;
   warnings: string[];
@@ -118,7 +126,7 @@ export function select(options: SelectOptions): SelectResult {
     return requests;
   };
   const forced = new Set<string>();
-  const skipped = new Set<string>();
+  const skipped = new Map<string, string>();
   const unmatched = new Map<string, string>();
 
   for (const project of projects) {
@@ -149,13 +157,24 @@ export function select(options: SelectOptions): SelectResult {
         addReason(stack, `requested by ${source}`);
         forced.add(stack.id);
       }
-      if (requests.skip.some(({ pattern }) => matchesStack(pattern, stack))) skipped.add(stack.id);
+      const skip = requests.skip.find(
+        ({ pattern, source }) =>
+          matchesStack(pattern, stack) && (!options.trustedSkipsOnly || source === '--skip'),
+      );
+      if (skip) skipped.set(stack.id, skip.source);
     }
   }
   for (const [pattern, source] of unmatched) {
     if (source) warnings.push(`${source}: "${pattern}" matches no stack`);
   }
-  for (const id of skipped) if (!forced.has(id)) reasons.delete(id);
+  // Skipped stacks stay visible, with who skipped them
+  const skippedStacks: { id: string; source: string; reasons: string[] }[] = [];
+  for (const [id, source] of skipped) {
+    const list = reasons.get(id);
+    if (forced.has(id) || !list) continue;
+    skippedStacks.push({ id, source, reasons: list });
+    reasons.delete(id);
+  }
   warnings.push(...session.warnings);
 
   const graph = session.dependencyGraph(projects, stacks);
@@ -179,7 +198,12 @@ export function select(options: SelectOptions): SelectResult {
     head: head.label,
     stacks: selected,
     waves,
-    unaffected: stacks.filter((stack) => !reasons.has(stack.id)).map((stack) => stack.id),
+    unaffected: stacks
+      .filter(
+        (stack) => !reasons.has(stack.id) && !skippedStacks.some((skip) => skip.id === stack.id),
+      )
+      .map((stack) => stack.id),
+    skipped: skippedStacks,
     dependencies: Object.fromEntries(
       [...graph].map(([id, dependencies]) => [id, [...dependencies].sort()]),
     ),

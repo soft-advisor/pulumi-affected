@@ -1,11 +1,18 @@
 import { renderMarkdown } from '../render.ts';
-import { renderStackDetails, renderTable, splitComments, summaryLine } from '../run/report.ts';
+import {
+  code,
+  renderStackDetails,
+  renderTable,
+  safeText,
+  splitComments,
+  summaryLine,
+} from '../run/report.ts';
 import { runCommand } from '../run/index.ts';
 import type { Mode, StackRun } from '../run/runner.ts';
 import { splitPatterns } from '../patterns.ts';
-import { repoRootOf } from '../snapshot.ts';
+import { git, repoRootOf } from '../snapshot.ts';
 import { marker, syncComments } from './comments.ts';
-import { eventContext, pullRequestContext } from './context.ts';
+import { eventAllowsRun, eventContext, pullRequestContext } from './context.ts';
 import {
   appendSummary,
   booleanInput,
@@ -40,7 +47,9 @@ async function main() {
     throw new Error('The pull-request input needs the github-token input');
   const context =
     pullRequestNumber && api
-      ? await pullRequestContext(api, repoRoot, pullRequestNumber)
+      ? (await eventAllowsRun(event, repoRoot, api))
+        ? await pullRequestContext(api, repoRoot, pullRequestNumber)
+        : undefined
       : await eventContext(event, repoRoot, api);
   for (const message of context?.warnings ?? []) warning(message);
   if (context === undefined) {
@@ -49,6 +58,7 @@ async function main() {
     return;
   }
 
+  if (mode === 'preview') warnAboutReachableCredentials(repoRoot);
   const base = input('base') || context.base;
   if (!base && !booleanInput('all') && !context.all) {
     warning(
@@ -78,7 +88,13 @@ async function main() {
   const sections = runs
     .filter((run) => run.status !== 'no-changes')
     .map((run) => renderStackDetails(run, undefined, runUrl));
-  const intro = runs.length > 0 ? renderTable(runs) : 'No stacks affected.';
+  const skipped = selection.skipped
+    .map((stack) => `${code(stack.id)}, skipped by ${safeText(stack.source)}`)
+    .join('<br>');
+  const intro = [
+    runs.length > 0 ? renderTable(runs) : 'No stacks affected.',
+    skipped ? `\n**Skipped** although affected:<br>${skipped}` : '',
+  ].join('');
   appendSummary(limitSummary([heading, intro, ...sections].join('\n\n'), runUrl));
   if (runs.length === 0) appendSummary(renderMarkdown(selection));
 
@@ -112,6 +128,30 @@ async function main() {
   const failed = runs.filter((run) => run.status === 'failed');
   if (failed.length > 0) {
     throw new Error(`Failed: ${failed.map((run) => run.stack.id).join(', ')}`);
+  }
+}
+
+/**
+ * Previews run the pull request's code. Hiding variables from Pulumi doesn't stop code running as
+ * the same user from reaching the runner's OIDC endpoint or a token left in .git/config, so say
+ * when either is within reach.
+ */
+function warnAboutReachableCredentials(repoRoot: string) {
+  if (process.env.ACTIONS_ID_TOKEN_REQUEST_URL && !booleanInput('pass-oidc')) {
+    warning(
+      'This job can request GitHub OIDC tokens (id-token: write). The code under preview runs as the same user and can still reach them; preview untrusted changes in a job without id-token: write.',
+    );
+  }
+  let persisted = '';
+  try {
+    persisted = git(repoRoot, ['config', '--get-regexp', '^http\\..*\\.extraheader$']);
+  } catch {
+    // No such setting
+  }
+  if (persisted.trim()) {
+    warning(
+      "actions/checkout left this job's token in .git/config, where the code under preview can read it; check out with persist-credentials: false.",
+    );
   }
 }
 

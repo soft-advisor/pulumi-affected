@@ -1,7 +1,7 @@
 import type { Request } from '../select.ts';
 import { ensureCommit, git, isSha } from '../snapshot.ts';
 import { splitPatterns } from '../patterns.ts';
-import type { GitHubApi, GitHubEvent } from './github.ts';
+import type { Author, GitHubApi, GitHubEvent } from './github.ts';
 
 /*
  * What the triggering event means for selection: the revision to compare with, and stacks
@@ -34,7 +34,7 @@ export interface PullRequest {
 export interface Comment {
   id: number;
   body?: string;
-  user: { login: string } | null;
+  user: Author | null;
 }
 
 export interface Context {
@@ -71,14 +71,11 @@ export async function eventContext(
   if (event.name === 'pull_request' || event.name === 'pull_request_target') {
     const pullRequest = payload.pull_request as PullRequest;
     // pull_request_target runs with the base repository's secrets; running a fork's code there
-    // is the classic way to hand them over
-    if (
-      event.name === 'pull_request_target' &&
-      isFork(pullRequest) &&
-      headIs(repoRoot, pullRequest)
-    ) {
+    // is the classic way to hand them over, whichever ref is checked out (the head, or the merge
+    // commit that contains it), so forks are refused outright
+    if (event.name === 'pull_request_target' && isFork(pullRequest)) {
       throw new EventError(
-        "pull_request_target with a fork's code checked out would run it with this repository's secrets; use pull_request",
+        "pull_request_target doesn't run for pull requests from forks: their code would run with this repository's secrets; use pull_request",
       );
     }
     const warnings: string[] = [];
@@ -161,6 +158,19 @@ export async function eventContext(
 }
 
 /**
+ * Whether the event may run at all. Comment and pull_request_target events keep their gates
+ * even when the `pull-request` input names the pull request: false means do nothing.
+ */
+export async function eventAllowsRun(
+  event: GitHubEvent,
+  repoRoot: string,
+  api: GitHubApi | undefined,
+) {
+  if (event.name !== 'issue_comment' && event.name !== 'pull_request_target') return true;
+  return (await eventContext(event, repoRoot, api)) !== undefined;
+}
+
+/**
  * The context of a pull request named explicitly (the `pull-request` input) rather than by the
  * event: an open one is previewed against its merge base, a merged one is what a deploy reports
  * on.
@@ -171,6 +181,20 @@ export async function pullRequestContext(
   number: number,
 ): Promise<Context> {
   const pullRequest = await api.request<PullRequest>('GET', api.repo(`/pulls/${number}`));
+  if (!pullRequest.merged_at) {
+    // The same rules as a comment command: an open pull request's code only runs from this
+    // repository, and only as the commit the pull request is at
+    if (isFork(pullRequest)) {
+      throw new EventError(
+        "The pull-request input doesn't run pull requests from forks: their code would run with this workflow's credentials",
+      );
+    }
+    if (!headIs(repoRoot, pullRequest)) {
+      throw new EventError(
+        `The checkout isn't pull request #${number}'s head ${pullRequest.head.sha}; check it out first`,
+      );
+    }
+  }
   const warnings: string[] = [];
   const messages = [pullRequest.body ?? ''];
   const requests = await commandRequests(api, number, warnings);
@@ -266,9 +290,9 @@ async function replyIgnored(
   warnings: string[],
 ) {
   const marker = `<!-- pulumi-affected:ignored:${comment.id} -->`;
-  const self = await api.identity();
+  const isOwn = await api.ownComments();
   const replied = comments.some(
-    (existing) => existing.user?.login === self && existing.body?.startsWith(marker),
+    (existing) => isOwn(existing.user) && existing.body?.startsWith(marker),
   );
   if (replied) return;
   try {
