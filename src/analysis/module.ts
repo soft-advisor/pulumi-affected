@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import ts from 'typescript';
+import { stackReferences } from './references.ts';
 
 /*
  * A module is analysed as the JavaScript that actually runs: each file is transpiled the way
@@ -58,6 +59,10 @@ export interface Item {
 
 export interface StackReferenceUse {
   name: ts.Expression;
+  /** Its position among the module's `new StackReference(...)` expressions, in source order */
+  ordinal: number;
+  /** How many there are in the module */
+  total: number;
   /** Expressions naming the outputs read, or "all" when the reference is used in other ways */
   outputs: ts.Expression[] | 'all';
 }
@@ -593,6 +598,8 @@ function inspectCall(node: ts.CallExpression | ts.NewExpression, item: Item) {
     item.stackReferences.push({
       name: stackReferenceName(node) ?? firstArgument,
       outputs: outputsRead(node),
+      ordinal: stackReferences(node.getSourceFile()).indexOf(node),
+      total: stackReferences(node.getSourceFile()).length,
     });
   }
 }

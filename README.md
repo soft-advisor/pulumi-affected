@@ -75,20 +75,20 @@ Optional: `pulumi-affected.yaml` at the repository root. The [schema](schema.jso
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/soft-advisor/pulumi-affected/main/schema.json
 projects:
-  include: ['**'] # folders with a Pulumi.yaml to consider
-  exclude: ['examples/**']
+  include: ["**"] # folders with a Pulumi.yaml to consider
+  exclude: ["examples/**"]
 stacks: [site/preview] # stacks without a Pulumi.<stack>.yaml
 dependsOn:
   site/prod: [site/dev] # prod looks up dev's DNS zone in the cloud
 rules:
-  - when: ['scripts/pulumi.sh']
+  - when: ["scripts/pulumi.sh"]
     run: [all]
 always: [accounts/management]
 inputs:
-  lambdas/*: ['lambdas/src/**'] # files read from computed paths
-globalInputs: ['.nvmrc', '.node-version'] # the default
+  lambdas/*: ["lambdas/src/**"] # files read from computed paths
+globalInputs: [".nvmrc", ".node-version"] # the default
 packages:
-  ignore: ['@types/*']
+  ignore: ["@types/*"]
 classify:
   ignore: # preview differences that aren't real changes
     - type: pulumi:providers:aws
@@ -156,7 +156,7 @@ Selects like `select`, then previews each selected stack in parallel with `--sav
 
 - A stack is kept when its plan would change a resource or a stack output, or when it's new.
 - A selected stack that doesn't exist yet is **created, empty,** so Pulumi can plan it (with the secrets provider its config file names). Its passphrase encryption salt goes into the manifest, so `apply` works from a checkout where the salt isn't committed.
-- **Stacks that read outputs a plan changes.** A plan is made with the outputs other stacks have at planning time, so a stack reading outputs that another plan in the same change alters can't be planned correctly until that one is applied. The plan file says which outputs change, and the code says which outputs each stack reads (`getOutput`, `requireOutput`, `outputs.name` and the like, with names worked out from literals, constants, templates and config). When the names can't be worked out, or the dependency comes from `dependsOn`, the stack is assumed to read every output.
+- **Stacks that read outputs a plan changes.** A plan is made with the outputs other stacks have at planning time, so a stack reading outputs that another plan in the same change alters can't be planned correctly until that one is applied. The plan file says which outputs change, and the code says which outputs each stack reads (`getOutput`, `requireOutput`, `outputs.name` and the like). Names are worked out from literals, constants, templates and config, and the reference is followed through the whole program with TypeScript's type checker: exported and imported, passed to functions, or read through helpers whose output-name parameter is called with known names or typed as a union of them. When the names can't be worked out, or the dependency comes from `dependsOn`, the stack is assumed to read every output.
   - **It has no changes of its own:** the plan comment opens with a warning to plan it again after this change is applied, and the action warns too. `apply` repeats it and lists it in `needs-plan`. Opening that follow-up is up to you.
   - **It has changes of its own:** planning **fails** for it, so the change can't be applied as one: its code would be merged with a plan made against old values. Change the stack it reads first, then this stack in a later pull request (which is planned against the real, applied outputs). To merge anyway, leave it out with `Pulumi-Affected-Skip: <stack>`; the report then says it has undeployed changes to plan after this is applied.
 - A stack that fails to preview fails the action, after uploading and commenting. `apply` refuses a manifest with failures.
@@ -267,7 +267,7 @@ Selection compares with the base branch, so code merged but never deployed (a sk
     # for each stack: pulumi stack history --json --page-size 1 | jq -r '.[0].environment["git.head"]'
     echo 'bases={"site/prod":"<sha>"}' >> "$GITHUB_OUTPUT"
 - uses: soft-advisor/pulumi-affected/plan@<commit sha>
-  with: { bases: '${{ steps.bases.outputs.bases }}' }
+  with: { bases: "${{ steps.bases.outputs.bases }}" }
 ```
 
 ### Recovering from a refused or failed apply
@@ -281,7 +281,7 @@ Plans only guard against **Pulumi state** changing between planning and applying
 ```yaml
 # .github/workflows/drift.yml
 on:
-  schedule: [{ cron: '0 6 * * 1-5' }]
+  schedule: [{ cron: "0 6 * * 1-5" }]
   workflow_dispatch:
 jobs:
   drift:
@@ -295,7 +295,7 @@ jobs:
         uses: soft-advisor/pulumi-affected/select@<commit sha>
         with: { all: true, base: HEAD }
       - name: Fail on drift or undeployed changes
-        env: { STACKS: '${{ steps.select.outputs.stacks }}' }
+        env: { STACKS: "${{ steps.select.outputs.stacks }}" }
         run: |
           status=0
           while read -r stack; do

@@ -60,3 +60,54 @@ test('a reference used in ways that could read any output reads all of them', ()
     'all',
   );
 });
+
+const NET = "new pulumi.StackReference('organization/net/prod')";
+
+test('followed across files: a reference exported and imported, by name or namespace', () => {
+  assert.deepEqual(
+    readsOf(
+      `${header}import { network } from './refs';\nimport * as refs from './refs';\n` +
+        "export const a = network.getOutput('vpcId');\n" +
+        "export const b = refs.network.requireOutput('zone');\n",
+      { 'refs.ts': `${header}export const network = ${NET};\n` },
+    ),
+    ['vpcId', 'zone'],
+  );
+});
+
+test('followed into helpers: names passed as arguments, or typed as a union', () => {
+  assert.deepEqual(
+    readsOf(
+      `${header}const net = ${NET};\n` +
+        'const out = (name: string) => net.getOutput(name);\n' +
+        "export const a = out('vpcId');\nexport const b = out(`zone`);\n",
+    ),
+    ['vpcId', 'zone'],
+  );
+  assert.deepEqual(
+    readsOf(`${header}import { output } from './helpers';\nexport const a = output('cidr');\n`, {
+      'helpers.ts': `${header}const net = ${NET};\nexport function output(name: 'cidr' | 'subnets') {\n  return net.getOutput(name);\n}\n`,
+    }),
+    ['cidr', 'subnets'],
+  );
+});
+
+test('followed into functions the reference is passed to', () => {
+  assert.deepEqual(
+    readsOf(`${header}import { subnets } from './lib';\nexport const a = subnets(${NET});\n`, {
+      'lib.ts': `${header}export function subnets(ref: pulumi.StackReference) {\n  return ref.getOutput('privateSubnets');\n}\n`,
+    }),
+    ['privateSubnets'],
+  );
+});
+
+test('still all when a helper is called with a name that cannot be known', () => {
+  assert.equal(
+    readsOf(
+      `${header}const net = ${NET};\n` +
+        'const out = (name: string) => net.getOutput(name);\n' +
+        "export const a = out('vpcId');\nexport const b = out(process.env.NAME!);\n",
+    ),
+    'all',
+  );
+});

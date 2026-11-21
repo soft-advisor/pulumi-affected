@@ -7,6 +7,7 @@ import {
   type ModuleCache,
   type ProjectAnalysis,
 } from './analysis/program.ts';
+import { ProgramReferences } from './analysis/references.ts';
 import { findUp, parseJson } from './analysis/resolve.ts';
 import { type Config, loadConfig } from './config.ts';
 import { addEdge, CycleError, computeWaves, type DependencyGraph } from './graph.ts';
@@ -293,6 +294,23 @@ export class Session {
       this.changes.set(base, changed);
     }
     return changed;
+  }
+
+  private readonly references = new Map<string, ProgramReferences>();
+
+  /** The head program of a project, for following stack references across modules */
+  private programReferences(project: Project, analysis: ProjectAnalysis) {
+    let references = this.references.get(project.file);
+    if (!references) {
+      const files = new Map<string, string>();
+      for (const path of analysis.modules) {
+        const text = this.head.read(path);
+        if (text !== undefined) files.set(path, text);
+      }
+      references = new ProgramReferences(files, analysis.entry);
+      this.references.set(project.file, references);
+    }
+    return references;
   }
 
   analysis(snapshot: Snapshot, project: Project) {
@@ -593,24 +611,32 @@ export class Session {
             );
           }
           // Output names are worked out like stack names: constants, templates, config
-          const outputs: string[] | 'all' =
-            use.outputs === 'all'
-              ? 'all'
-              : (() => {
-                  const names: string[] = [];
-                  for (const expression of use.outputs) {
-                    const output = evaluateString(expression, module, {
-                      lookup: analysis.lookup,
-                      stack: stack.stack,
-                      project: project.name,
-                      config: readConfig,
-                      unknown: undefined,
-                    });
-                    if (output === undefined) return 'all';
-                    names.push(output);
-                  }
-                  return names;
-                })();
+          // Names this module shows are worked out like stack names (constants, templates,
+          // config); beyond that, the reference is followed through the whole program
+          const local = (() => {
+            if (use.outputs === 'all') return 'all';
+            const names: string[] = [];
+            for (const expression of use.outputs) {
+              const output = evaluateString(expression, module, {
+                lookup: analysis.lookup,
+                stack: stack.stack,
+                project: project.name,
+                config: readConfig,
+                unknown: undefined,
+              });
+              if (output === undefined) return 'all';
+              names.push(output);
+            }
+            return names;
+          })();
+          const outputs =
+            local !== 'all'
+              ? local
+              : this.programReferences(project, analysis).outputsRead(
+                  module.path,
+                  use.ordinal,
+                  use.total,
+                );
           for (const target of targets) {
             addEdge(graph, stack.id, target.id);
             this.recordReads(stack.id, target.id, outputs);
