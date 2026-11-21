@@ -9,7 +9,7 @@ import {
 } from './analysis/program.ts';
 import { findUp, parseJson } from './analysis/resolve.ts';
 import { type Config, loadConfig } from './config.ts';
-import { addEdge, computeWaves, type DependencyGraph } from './graph.ts';
+import { addEdge, CycleError, computeWaves, type DependencyGraph } from './graph.ts';
 import {
   findLockfile,
   hasPackage,
@@ -180,7 +180,15 @@ export function select(options: SelectOptions): SelectResult {
   const graph = session.dependencyGraph(projects, stacks);
   warnings.push(...session.graphWarnings);
   const selectedIds = stacks.filter((stack) => reasons.has(stack.id)).map((stack) => stack.id);
-  const waves = computeWaves(graph, selectedIds);
+  let waves: string[][];
+  try {
+    waves = computeWaves(graph, selectedIds);
+  } catch (error) {
+    if (!(error instanceof CycleError)) throw error;
+    // Run them all together rather than not at all; dependsOn can break the tie
+    warnings.push(`${error.message}; they run in one wave`);
+    waves = selectedIds.length > 0 ? [[...selectedIds].sort()] : [];
+  }
   const waveOf = new Map(waves.flatMap((wave, index) => wave.map((id) => [id, index] as const)));
 
   const selected: SelectedStack[] = [];
@@ -261,7 +269,8 @@ export class Session {
         else if (before !== this.head.hash(path)) changed.set(path, 'modified');
       }
       for (const path of baseSnapshot.paths) {
-        if (!this.head.has(path)) changed.set(path, 'removed');
+        // hash, not has: links and submodules are entries too, not just files
+        if (this.head.hash(path) === undefined) changed.set(path, 'removed');
       }
       this.changes.set(base, changed);
     }
@@ -323,18 +332,16 @@ export class Session {
       reasons.push(`${project.file} changed`);
     }
 
-    if (project.runtime !== 'nodejs') {
+    if (!isNodeRuntime(project)) {
       this.warnings.push(
         `${project.name}: runtime "${project.runtime}" isn't analysed; any change in ${project.dir || 'the repo'} selects it (list other folders it reads under inputs)`,
       );
       return [
         ...reasons,
-        ...this.folderChanges(
-          project,
-          changed,
-          'not a Node.js project',
-          yamlFileReferences(this.head, project),
-        ),
+        ...this.folderChanges(project, changed, 'not a Node.js project', [
+          ...yamlFileReferences(this.head, project),
+          ...moduleRoots(this.head, project),
+        ]),
       ];
     }
 
@@ -397,7 +404,7 @@ export class Session {
   ) {
     const gaps: Gap[] = [];
     const resolve = (snapshot: Snapshot, analysis: ProjectAnalysis) => {
-      const path = findLockfile(snapshot, project.dir);
+      const path = findLockfile(snapshot, analysis.programDir, this.warnings);
       const graph = path ? this.lockfile(snapshot, path) : undefined;
       const result = new Map<string, Set<string>>();
       if (!graph) return { result, path, graph };
@@ -433,7 +440,21 @@ export class Session {
 
     if (!old.path && !current.path) {
       // No lockfile: dependency ranges in the manifests are all there is to compare
-      const manifestPath = findUp(this.head, project.dir, 'package.json');
+      const manifestPath = findUp(this.head, after.programDir, 'package.json');
+      const declared = dependencyRanges(manifestPath ? this.head.read(manifestPath) : undefined);
+      const declaredNames = new Set(
+        Object.values(declared).flatMap((field) =>
+          field && typeof field === 'object' ? Object.keys(field) : [],
+        ),
+      );
+      for (const [name, files] of manifestPath ? after.packages : []) {
+        if (declaredNames.has(name) || name === '@pulumi/pulumi') continue;
+        const from = [...files][0];
+        gaps.push({
+          message: `${from} imports "${name}", which no package.json declares`,
+          dir: dirnameOf(from),
+        });
+      }
       if (manifestPath) {
         const ranges = (snapshot: Snapshot) => dependencyRanges(snapshot.read(manifestPath));
         if (!isDeepStrictEqual(ranges(baseSnapshot), ranges(this.head))) {
@@ -455,7 +476,15 @@ export class Session {
       return { reasons, gaps };
     }
     const names = new Set([...old.result.keys(), ...current.result.keys()]);
+    const direct = new Set([...before.packages.keys(), ...after.packages.keys(), '@pulumi/pulumi']);
+    const transitive: string[] = [];
     for (const name of [...names].sort()) {
+      if (!direct.has(name)) {
+        const from = [...(old.result.get(name) ?? [])].sort().join('\0');
+        const to = [...(current.result.get(name) ?? [])].sort().join('\0');
+        if (from !== to) transitive.push(name);
+        continue;
+      }
       const from = [...(old.result.get(name) ?? [])].sort();
       const to = [...(current.result.get(name) ?? [])].sort();
       if (from.join('\0') === to.join('\0')) continue;
@@ -466,6 +495,12 @@ export class Session {
       else if (label(from) === label(to))
         reasons.push(`package ${name} ${label(to)} changed source or patch`);
       else reasons.push(`package ${name} ${label(from)} → ${label(to)}`);
+    }
+    // Packages the program imports come first; what they depend on is summed up
+    if (transitive.length > 0) {
+      const shown = transitive.slice(0, 5).join(', ');
+      const more = transitive.length > 5 ? ` and ${transitive.length - 5} more` : '';
+      reasons.push(`${transitive.length} packages they depend on changed: ${shown}${more}`);
     }
     return { reasons, gaps };
   }
@@ -478,6 +513,11 @@ export class Session {
 
     const before = parseYamlFile(baseSnapshot, stack.configFile);
     const after = parseYamlFile(this.head, stack.configFile);
+    if (after && typeof after === 'object' && 'environment' in after) {
+      this.warnings.push(
+        `${stack.id} imports ESC environments, which change outside the repository; select it with always, a rule or Pulumi-Affected-Run when they do`,
+      );
+    }
     if (before === undefined && after !== undefined) reasons.push(`${stack.configFile} added`);
     else if (!isDeepStrictEqual(before, withoutNewSalt(before, after))) {
       reasons.push(`${stack.configFile} changed`);
@@ -502,14 +542,15 @@ export class Session {
   dependencyGraph(projects: Project[], stacks: Stack[]): DependencyGraph {
     const graph: DependencyGraph = new Map();
     for (const project of projects) {
-      if (project.runtime !== 'nodejs') continue;
+      if (!isNodeRuntime(project)) continue;
       const analysis = this.analysis(this.head, project);
       for (const stack of project.stacks) {
         const stackConfig = parseYamlFile(this.head, stack.configFile) as
           | { config?: Record<string, unknown> }
           | undefined;
+        const projectConfig = projectConfigValues(this.head, project);
         const readConfig = (namespace: string, key: string) => {
-          const values = stackConfig?.config ?? {};
+          const values = { ...projectConfig, ...(stackConfig?.config ?? {}) };
           const value =
             values[`${namespace}:${key}`] ?? (namespace === project.name ? values[key] : undefined);
           return typeof value === 'string' ? value : undefined;
@@ -545,15 +586,39 @@ export class Session {
 }
 
 /**
- * Matches a referenced stack name ("org/project/stack", "project/stack" or "stack" in the same
- * project; unknown parts are "*") to stacks in this repo.
+ * Matches a referenced stack name to stacks in this repo, the way Pulumi parses it:
+ * "org/project/stack", or "org/stack" and "stack" in the referencing project. Unknown parts are
+ * "*".
  */
 function stacksNamed(name: string, project: Project, stacks: Stack[]) {
   if (name === WILDCARD) return [];
   const parts = name.split('/');
   const stackPart = parts[parts.length - 1];
-  const projectPart = parts.length >= 2 ? parts[parts.length - 2] : project.name;
+  const projectPart = parts.length >= 3 ? parts[parts.length - 2] : project.name;
   return stacks.filter((stack) => glob(projectPart)(stack.project) && glob(stackPart)(stack.stack));
+}
+
+/** Projects analysed as JavaScript: Node.js, and Bun, which runs the same programs */
+function isNodeRuntime(project: Project) {
+  return project.runtime === 'nodejs' || project.runtime === 'bun';
+}
+
+/** Config values and defaults declared in Pulumi.yaml, which stack config files override */
+function projectConfigValues(snapshot: Snapshot, project: Project) {
+  const settings = parseYamlFile(snapshot, project.file) as
+    | { config?: Record<string, unknown> }
+    | undefined;
+  const values: Record<string, unknown> = {};
+  for (const [key, declared] of Object.entries(settings?.config ?? {})) {
+    if (declared && typeof declared === 'object' && !Array.isArray(declared)) {
+      const entry = declared as Record<string, unknown>;
+      if ('value' in entry) values[key] = entry.value;
+      else if ('default' in entry) values[key] = entry.default;
+    } else {
+      values[key] = declared;
+    }
+  }
+  return values;
 }
 
 /** Pulumi.yaml settings that affect the program; a new description doesn't */
@@ -615,6 +680,23 @@ function yamlFileReferences(snapshot: Snapshot, project: Project) {
   return dirs;
 }
 
+/**
+ * Where a Go or Python program's module lives: the folder of the nearest go.mod, pyproject.toml,
+ * requirements.txt or lockfile, which can be above the project and hold code it imports
+ */
+function moduleRoots(snapshot: Snapshot, project: Project) {
+  const markers: Record<string, string[]> = {
+    go: ['go.mod'],
+    python: ['pyproject.toml', 'requirements.txt', 'uv.lock', 'poetry.lock'],
+  };
+  const roots: string[] = [];
+  for (const marker of markers[project.runtime] ?? []) {
+    const found = findUp(snapshot, project.dir, marker);
+    if (found) roots.push(dirnameOf(found));
+  }
+  return roots;
+}
+
 /** Patch files (patch-package's patches/<name>+<version>.patch) by the package they patch */
 function patchFiles(snapshot: Snapshot, root: string) {
   const patches = new Map<string, string>();
@@ -637,6 +719,7 @@ function dependencyRanges(text: string | undefined) {
   const ranges: Record<string, unknown> = {};
   for (const field of [
     'dependencies',
+    'devDependencies',
     'optionalDependencies',
     'peerDependencies',
     'overrides',
@@ -693,6 +776,13 @@ export function describeFactChanges(before: ProjectAnalysis, after: ProjectAnaly
       reasons.push(`entry file changed from ${old} to ${current}`);
     } else if (kind === 'manifest') {
       reasons.push(`${subject}: type, main, imports or exports changed`);
+    } else if (kind === 'imports') {
+      reasons.push(`${subject}: what its imports refer to changed`);
+    } else if (kind === 'export') {
+      const hash = subject.lastIndexOf('#');
+      reasons.push(
+        `${subject.slice(0, hash)}: export \`${subject.slice(hash + 1)}\` ${old === undefined ? 'added' : current === undefined ? 'removed' : 'changed'}`,
+      );
     }
   }
   return reasons;

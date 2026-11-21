@@ -30,8 +30,8 @@ export interface Stack {
   configFile: string;
 }
 
-const PROJECT_FILE = /(^|\/)Pulumi\.ya?ml$/;
-const STACK_FILE = /^Pulumi\.(.+)\.(ya?ml)$/;
+const PROJECT_FILE = /(^|\/)Pulumi\.(ya?ml|json)$/;
+const STACK_FILE = /^Pulumi\.(.+)\.(ya?ml|json)$/;
 
 export class ProjectError extends Error {}
 
@@ -106,7 +106,7 @@ export function discoverProjects(
     const project = projects.find((p) => p.name === projectRef || (p.dir || '.') === projectRef);
     if (!project) throw new ProjectError(`stacks: no project matches "${projectRef}"`);
     if (!project.stacks.some((s) => s.stack === stack)) {
-      const extension = project.file.endsWith('.yml') ? 'yml' : 'yaml';
+      const extension = project.file.slice(project.file.lastIndexOf('.') + 1);
       project.stacks.push(makeStack(project, stack, `Pulumi.${stack}.${extension}`));
     }
   }
@@ -131,7 +131,7 @@ export function readProject(snapshot: Snapshot, file: string, warnings: string[]
   };
   // Pulumi reads stack files with the project file's own extension: Pulumi.dev.yml goes with
   // Pulumi.yml, and Pulumi.dev.yaml with Pulumi.yaml
-  const extension = file.endsWith('.yml') ? 'yml' : 'yaml';
+  const extension = file.slice(file.lastIndexOf('.') + 1);
   for (const path of snapshot.paths) {
     if (dirnameOf(path) !== stackConfigDir) continue;
     const match = STACK_FILE.exec(path.slice(path.lastIndexOf('/') + 1));
@@ -174,7 +174,11 @@ export function parseProjectFile(text: string, file: string): ProjectSettings {
   if (!raw || typeof raw.name !== 'string') {
     throw new ProjectError(`${file} has no project name`);
   }
-  if ('template' in raw) throw new ProjectError(`${file} is a project template`);
+  // A template's name is a placeholder; a real project may keep the template: section it was
+  // created from
+  if ('template' in raw && /\$\{|\{\{/.test(raw.name)) {
+    throw new ProjectError(`${file} is a project template`);
+  }
   const runtime = raw.runtime;
   const runtimeName =
     typeof runtime === 'string'

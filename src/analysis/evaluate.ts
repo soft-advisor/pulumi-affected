@@ -1,4 +1,5 @@
 import ts from 'typescript';
+import { dirnameOf } from '../snapshot.ts';
 import type { ModuleInfo } from './module.ts';
 
 /*
@@ -8,8 +9,36 @@ import type { ModuleInfo } from './module.ts';
  * functions. Anything else is unknown.
  */
 
-/** Stands for the folder of the module being evaluated */
-export const MODULE_DIR = '\u0000module';
+/**
+ * Marks a path as relative to a module's folder: `\0module:<folder>\0<rest>`. The folder is
+ * the module that wrote `__dirname`, which isn't always the one that reads the path: a constant
+ * imported from lib/paths.ts stays relative to lib/.
+ */
+const MODULE_DIR = '\u0000module:';
+
+export function moduleDir(module: ModuleInfo) {
+  return `${MODULE_DIR}${dirnameOf(module.path)}\u0000`;
+}
+
+/** Where a path evaluated from code is anchored, and the rest of it */
+export function anchorOf(
+  value: string,
+):
+  | { anchor: 'module'; dir: string; rest: string }
+  | { anchor: 'cwd'; rest: string }
+  | { anchor: 'none'; rest: string } {
+  if (value.startsWith(MODULE_DIR)) {
+    const end = value.indexOf('\u0000', MODULE_DIR.length);
+    return {
+      anchor: 'module',
+      dir: value.slice(MODULE_DIR.length, end),
+      rest: value.slice(end + 1),
+    };
+  }
+  if (value.startsWith(WORKING_DIR))
+    return { anchor: 'cwd', rest: value.slice(WORKING_DIR.length) };
+  return { anchor: 'none', rest: value };
+}
 /** Stands for the program's working directory: the project folder */
 export const WORKING_DIR = '\u0000cwd';
 /** Unknown parts of a stack name; stack names can't contain "*" */
@@ -68,7 +97,7 @@ export function evaluateString(
   }
 
   if (ts.isIdentifier(node)) {
-    if (node.text === '__dirname') return MODULE_DIR;
+    if (node.text === '__dirname') return moduleDir(module);
     // A parameter or local variable can hold anything; only module-level constants are known
     if (isLocallyBound(node)) return unknown;
     const target = context.lookup(module, node.text);
@@ -76,7 +105,8 @@ export function evaluateString(
   }
 
   if (ts.isPropertyAccessExpression(node)) {
-    if (ts.isMetaProperty(node.expression) && node.name.text === 'dirname') return MODULE_DIR;
+    if (ts.isMetaProperty(node.expression) && node.name.text === 'dirname')
+      return moduleDir(module);
     return unknown;
   }
 
@@ -91,7 +121,7 @@ export function evaluateString(
       ts.isMetaProperty(base.expression) &&
       base.name.text === 'url';
     const value = relative && recurse(relative);
-    if (isModuleUrl && value !== undefined) return `${MODULE_DIR}/${value}`;
+    if (isModuleUrl && value !== undefined) return `${moduleDir(module)}/${value}`;
   }
   return unknown;
 }

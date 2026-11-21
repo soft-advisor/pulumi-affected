@@ -163,6 +163,7 @@ test('a parameter that shadows a constant is not that constant', () => {
 test('tsconfig extends from a workspace package keeps its paths', () => {
   selects(
     {
+      'package.json': JSON.stringify({ name: 'root', workspaces: ['packages/*'] }),
       'packages/tsconfig/package.json': JSON.stringify({ name: '@org/tsconfig' }),
       'packages/tsconfig/base.json': JSON.stringify({
         compilerOptions: { baseUrl: '../..', paths: { '@lib/*': ['lib/*'] } },
@@ -298,10 +299,15 @@ test('a variable declared twice keeps both declarations', () => {
 test('getters and computed class keys run code', () => {
   selects(
     app({
-      'index.ts': "import { registry } from './registry';\nconst unused = registry.make;\n",
-      'registry.ts': "export const registry = { get make() { return String('a'); } };\n",
+      // A property of something imported counts as a constant (aws.ec2.InstanceType.T3_Micro);
+      // of a local object, reading it may run a getter
+      'index.ts':
+        "const registry = { get make() { return String('a'); } };\nconst unused = registry.make;\n",
     }),
-    { 'app/registry.ts': "export const registry = { get make() { return String('b'); } };\n" },
+    {
+      'app/index.ts':
+        "const registry = { get make() { return String('b'); } };\nconst unused = registry.make;\n",
+    },
   );
   selects(app({ 'index.ts': "class A { [String('a')]() {} }\n" }), {
     'app/index.ts': "class A { [String('b')]() {} }\n",

@@ -1,6 +1,8 @@
 import { builtinModules } from 'node:module';
 import ts from 'typescript';
-import { dirnameOf, joinPath, type Snapshot } from '../snapshot.ts';
+import { parse as parseYaml } from 'yaml';
+import { matchesAnyGlob } from '../patterns.ts';
+import { dirnameOf, isInside, joinPath, type Snapshot } from '../snapshot.ts';
 
 /*
  * Module resolution runs against a snapshot (a commit or the working tree), not the disk, so the
@@ -47,7 +49,7 @@ export class Resolver {
   private readonly cache = new Map<string, Resolution>();
   private readonly snapshot: Snapshot;
 
-  constructor(snapshot: Snapshot, projectDir: string, tsconfigPath?: string) {
+  constructor(snapshot: Snapshot, programDir: string, tsconfigPath?: string) {
     this.snapshot = snapshot;
     this.workspacePackages = workspacePackagesOf(snapshot);
     const real = (path: string) => {
@@ -71,12 +73,11 @@ export class Resolver {
         const relative = real(path);
         return relative === undefined ? path : toAbsolute(relative);
       },
-      getCurrentDirectory: () => toAbsolute(projectDir),
+      getCurrentDirectory: () => toAbsolute(programDir),
     };
-    this.tsconfig =
-      tsconfigPath && snapshot.has(tsconfigPath)
-        ? tsconfigPath
-        : findUp(snapshot, projectDir, 'tsconfig.json');
+    // Pulumi hands ts-node exactly one tsconfig (runtime.options.tsconfig, else tsconfig.json in
+    // the program's folder) and doesn't look further up; without one, ts-node's defaults apply
+    this.tsconfig = tsconfigPath && snapshot.has(tsconfigPath) ? tsconfigPath : undefined;
     this.options = this.tsconfig ? this.readCompilerOptions(this.tsconfig) : {};
   }
 
@@ -144,6 +145,9 @@ export class Resolver {
     const local = this.resolveWithTypeScript(specifier, from);
     if (local) return { kind: 'file', path: local };
     if (isRelative) {
+      // Node also tries .json for a path without an extension; TypeScript doesn't
+      const json = joinPath(dirnameOf(from), `${specifier}.json`);
+      if (this.snapshot.has(json)) return { kind: 'file', path: json };
       return {
         kind: 'unresolved',
         dir: this.existingAncestor(joinPath(dirnameOf(from), specifier)),
@@ -335,22 +339,72 @@ export function findUp(snapshot: Snapshot, dir: string, fileName: string) {
 
 const workspaceIndex = new WeakMap<Snapshot, Map<string, string>>();
 
-/** Every package.json name outside node_modules, mapped to its folder; built once per snapshot */
+/**
+ * Workspace packages by name, mapped to their folders; built once per snapshot. Only packages
+ * a workspace declares count (package.json `workspaces`, or pnpm-workspace.yaml `packages`):
+ * a package.json elsewhere (a fixture, a vendored copy) doesn't stand in for the npm package of
+ * the same name. The first of two with the same name wins.
+ */
 export function workspacePackagesOf(snapshot: Snapshot) {
   let packages = workspaceIndex.get(snapshot);
   if (!packages) {
     packages = new Map();
+    const globs: { root: string; patterns: string[] }[] = [];
+    for (const path of snapshot.paths) {
+      if (path.split('/').includes('node_modules')) continue;
+      const root = dirnameOf(path);
+      if (path === 'package.json' || path.endsWith('/package.json')) {
+        const workspaces = parseJson(snapshot.read(path))?.workspaces;
+        const list = Array.isArray(workspaces)
+          ? workspaces
+          : (workspaces as { packages?: unknown } | undefined)?.packages;
+        if (Array.isArray(list))
+          globs.push({ root, patterns: list.filter((item) => typeof item === 'string') });
+      } else if (path === 'pnpm-workspace.yaml' || path.endsWith('/pnpm-workspace.yaml')) {
+        const list = parsePnpmWorkspace(snapshot.read(path));
+        globs.push({ root, patterns: list });
+      }
+    }
     for (const path of snapshot.paths) {
       if (path !== 'package.json' && !path.endsWith('/package.json')) continue;
       if (path.split('/').includes('node_modules')) continue;
+      const dir = dirnameOf(path);
+      const member = globs.some(({ root, patterns }) => {
+        if (!isInside(dir, root) || dir === root) return false;
+        const relative = root === '' ? dir : dir.slice(root.length + 1);
+        const included = patterns.filter((pattern) => !pattern.startsWith('!'));
+        const excluded = patterns
+          .filter((pattern) => pattern.startsWith('!'))
+          .map((pattern) => pattern.slice(1));
+        return (
+          matchesAnyGlob(included.map(trimGlob), relative) &&
+          !matchesAnyGlob(excluded.map(trimGlob), relative)
+        );
+      });
+      if (!member) continue;
       const manifest = parseJson(snapshot.read(path));
       if (typeof manifest?.name === 'string' && !packages.has(manifest.name)) {
-        packages.set(manifest.name, dirnameOf(path));
+        packages.set(manifest.name, dir);
       }
     }
     workspaceIndex.set(snapshot, packages);
   }
   return packages;
+}
+
+function trimGlob(pattern: string) {
+  return pattern.replace(/^\.\//, '').replace(/\/$/, '');
+}
+
+function parsePnpmWorkspace(text: string | undefined) {
+  try {
+    const parsed = parseYaml(text ?? '') as { packages?: unknown } | null;
+    return Array.isArray(parsed?.packages)
+      ? parsed.packages.filter((item) => typeof item === 'string')
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 function manifestEntries(manifest: Record<string, unknown> | undefined) {

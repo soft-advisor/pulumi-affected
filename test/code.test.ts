@@ -229,8 +229,9 @@ test('functions called by a used function are followed', () => {
 
 test('tsconfig path aliases resolve to source', () => {
   const before = {
-    'tsconfig.json': JSON.stringify({
-      compilerOptions: { baseUrl: '.', paths: { '@lib/*': ['lib/*'] } },
+    // Pulumi reads the tsconfig in the program's folder only
+    'app/tsconfig.json': JSON.stringify({
+      compilerOptions: { baseUrl: '..', paths: { '@lib/*': ['lib/*'] } },
     }),
     'lib/names.ts': 'export function name() { return 1; }\n',
     ...project('app', 'app', ['dev'], {

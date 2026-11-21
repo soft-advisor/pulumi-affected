@@ -40,13 +40,37 @@ const LOCKFILES = [
 
 export class LockfileError extends Error {}
 
-/** Finds the lockfile serving `dir` (the nearest one in it or above it) */
-export function findLockfile(snapshot: Snapshot, dir: string) {
+const LOCKFILES_BY_MANAGER: Record<string, string[]> = {
+  pnpm: ['pnpm-lock.yaml'],
+  yarn: ['yarn.lock'],
+  npm: ['package-lock.json', 'npm-shrinkwrap.json'],
+  bun: ['bun.lock', 'bun.lockb'],
+};
+
+/**
+ * Finds the lockfile serving `dir`: the nearest folder in or above it with one. When a folder
+ * has several (a leftover yarn.lock next to package-lock.json), `packageManager` in its
+ * package.json decides; without it, the choice is reported.
+ */
+export function findLockfile(snapshot: Snapshot, dir: string, warnings: string[] = []) {
   let current = dir;
   while (true) {
-    for (const name of LOCKFILES) {
-      const candidate = joinPath(current, name);
-      if (snapshot.has(candidate)) return candidate;
+    const present = LOCKFILES.map((name) => joinPath(current, name)).filter((path) =>
+      snapshot.has(path),
+    );
+    if (present.length === 1) return present[0];
+    if (present.length > 1) {
+      const manifest = parseJson(snapshot.read(joinPath(current, 'package.json')));
+      const manager =
+        typeof manifest?.packageManager === 'string' ? manifest.packageManager.split('@')[0] : '';
+      const chosen = present.find((path) =>
+        (LOCKFILES_BY_MANAGER[manager] ?? []).some((name) => path.endsWith(name)),
+      );
+      if (chosen) return chosen;
+      warnings.push(
+        `${present.join(' and ')} are both present; using ${present[0]} (set packageManager in package.json to choose)`,
+      );
+      return present[0];
     }
     if (current === '') return undefined;
     current = dirnameOf(current);
@@ -65,9 +89,20 @@ export function readLockfile(snapshot: Snapshot, path: string): LockGraph {
   return readNpm(path, dir, text);
 }
 
-/** True when the lockfile resolves a package of this name anywhere */
+/** True when the lockfile resolves a package of this name anywhere, under its name or an alias */
 export function hasPackage(graph: LockGraph, name: string) {
-  return nodesNamed(graph, name).length > 0;
+  if (nodesNamed(graph, name).length > 0) return true;
+  for (const importer of graph.importers.values()) if (importer.has(name)) return true;
+  return false;
+}
+
+/**
+ * A registry tarball: "<registry>/<name>/-/<name>-<version>.tgz". Registry versions never change
+ * once published, so for these the version is the identity; the URL and checksum change when a
+ * mirror or the checksum format does, which mustn't select every project.
+ */
+function isRegistryTarball(resolved: unknown) {
+  return typeof resolved === 'string' && /^https?:\/\/.*\/-\/[^/]+\.tgz(#.*)?$/.test(resolved);
 }
 
 function identityOf(version: unknown, ...sources: unknown[]) {
@@ -175,7 +210,9 @@ function readNpm(path: string, dir: string, text: string): LockGraph {
     graph.nodes.set(location, {
       name,
       version: String(entry.version),
-      identity: identityOf(entry.version, entry.resolved, entry.integrity),
+      identity: isRegistryTarball(entry.resolved)
+        ? identityOf(entry.version)
+        : identityOf(entry.version, entry.resolved, entry.integrity),
       dependencies,
     });
   }
@@ -207,11 +244,14 @@ function readYarn(snapshot: Snapshot, path: string, dir: string, text: string): 
       name,
       version: String(entry.version),
       // Berry's resolution carries patch hashes and git commits; classic has resolved URLs
-      identity: identityOf(
-        entry.version,
-        resolution ?? entry.resolved,
-        entry.checksum ?? entry.integrity,
-      ),
+      identity:
+        (resolution !== undefined && /@npm:/.test(resolution)) || isRegistryTarball(entry.resolved)
+          ? identityOf(entry.version, resolution)
+          : identityOf(
+              entry.version,
+              resolution ?? entry.resolved,
+              entry.checksum ?? entry.integrity,
+            ),
       dependencies: [],
     });
   }
@@ -303,14 +343,18 @@ function readPnpm(path: string, dir: string, text: string): LockGraph {
       .filter((resolved): resolved is string => resolved !== undefined);
     // The id carries peers and patch hashes; the resolution pins tarballs and git commits
     const resolution = (packageInfo[key] ?? packageInfo[key.split('(')[0]] ?? {}).resolution ?? {};
-    const identity = identityOf(
-      version,
-      id,
-      resolution.integrity,
-      resolution.tarball,
-      resolution.commit,
-      resolution.repo,
-    );
+    // From the registry, a resolution is only a checksum
+    const fromRegistry = !resolution.tarball && !resolution.commit && !resolution.repo;
+    const identity = fromRegistry
+      ? identityOf(version, id)
+      : identityOf(
+          version,
+          id,
+          resolution.integrity,
+          resolution.tarball,
+          resolution.commit,
+          resolution.repo,
+        );
     graph.nodes.set(id, { name, version, identity, dependencies });
   }
 
@@ -375,8 +419,11 @@ function readBun(path: string, dir: string, text: string): LockGraph {
   }
   for (const [workspaceDir, workspace] of Object.entries(lock.workspaces ?? {})) {
     const importer = new Map<string, string>();
+    // A workspace's own copy of a dependency is keyed under the workspace's package name
+    const workspaceName =
+      typeof workspace.name === 'string' && workspaceDir !== '' ? workspace.name : '';
     for (const name of Object.keys(dependencyNames(workspace, true))) {
-      const resolved = resolveFrom('', name);
+      const resolved = resolveFrom(workspaceName, name);
       if (resolved && graph.nodes.has(resolved)) importer.set(name, resolved);
     }
     graph.importers.set(joinPath(dir, workspaceDir), importer);
