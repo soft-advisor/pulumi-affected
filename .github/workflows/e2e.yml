@@ -87,8 +87,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node tool/e2e/driver.ts prepare "$INDEX" "$FIXTURE"
 
+      # Some scenarios fail a stack on purpose; the checks below decide whether the run is right
       - id: preview
         uses: ./tool/run
+        continue-on-error: true
         with:
           mode: preview
           pull-request: ${{ steps.prepare.outputs.pull-request }}
@@ -99,12 +101,33 @@ jobs:
           RESULTS: ${{ steps.preview.outputs.results }}
         run: node tool/e2e/driver.ts assert-preview "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
 
+      - name: Push a second change
+        if: matrix.scenario.second
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tool/e2e/driver.ts push-second "$INDEX" "$FIXTURE"
+      - id: second-preview
+        if: matrix.scenario.second
+        uses: ./tool/run
+        continue-on-error: true
+        with:
+          mode: preview
+          pull-request: ${{ steps.prepare.outputs.pull-request }}
+          working-directory: ${{ env.FIXTURE }}
+      - name: Check the second preview
+        if: matrix.scenario.second
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULTS: ${{ steps.second-preview.outputs.results }}
+        run: node tool/e2e/driver.ts assert-second-preview "$INDEX" "${{ steps.prepare.outputs.pull-request }}"
+
       - name: Merge the pull request
         env:
           GH_TOKEN: ${{ github.token }}
         run: node tool/e2e/driver.ts merge "$INDEX" "${{ steps.prepare.outputs.pull-request }}" "$FIXTURE"
       - id: deploy
         uses: ./tool/run
+        continue-on-error: true
         with:
           mode: up
           pull-request: ${{ steps.prepare.outputs.pull-request }}

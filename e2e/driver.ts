@@ -20,8 +20,18 @@ interface Scenario {
   name: string;
   changes: Record<string, string | null>;
   body?: string;
+  /** A comment posted on the pull request before the preview, as the workflow's bot */
+  comment?: string;
+  /** The comment is a command from someone without write access, so it gets a reply */
+  expectReply?: boolean;
   expected: string[];
+  /** Status per stack in the preview, when it matters (changes, no-changes, failed) */
+  previewStatuses?: Record<string, string>;
+  /** Pushed after the first preview, to check the comment is edited, not duplicated */
+  second?: Record<string, string | null>;
+  secondExpected?: string[];
   deployed: string[];
+  deployStatuses?: Record<string, string>;
 }
 
 const E2E = import.meta.dirname;
@@ -128,16 +138,7 @@ function prepare(index: number, dir: string) {
   const baseSha = commitAll(dir, 'Commit the encryption salts Pulumi wrote');
   retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${base}`]);
 
-  for (const [path, content] of Object.entries(scenario.changes)) {
-    mkdirSync(dirname(join(dir, path)), { recursive: true });
-    execFileSync(
-      'sh',
-      ['-c', content === null ? `rm -f "$1"` : `cat > "$1"`, 'sh', join(dir, path)],
-      {
-        input: content ?? '',
-      },
-    );
-  }
+  writeChanges(dir, scenario.changes);
   commitAll(dir, scenario.name);
   retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${change}`]);
 
@@ -156,8 +157,32 @@ function prepare(index: number, dir: string) {
     '--body',
     scenario.body ?? `End-to-end scenario "${scenario.name}"; closed automatically.`,
   ]);
-  output('pull-request', url.split('/').pop() ?? '');
+  const number = url.split('/').pop() ?? '';
+  if (scenario.comment) {
+    retried(dir, 'gh', ['pr', 'comment', number, '--repo', repository, '--body', scenario.comment]);
+  }
+  output('pull-request', number);
   output('base-sha', baseSha);
+}
+
+function writeChanges(dir: string, changes: Record<string, string | null>) {
+  for (const [path, content] of Object.entries(changes)) {
+    mkdirSync(dirname(join(dir, path)), { recursive: true });
+    execFileSync(
+      'sh',
+      ['-c', content === null ? `rm -f "$1"` : `cat > "$1"`, 'sh', join(dir, path)],
+      {
+        input: content ?? '',
+      },
+    );
+  }
+}
+
+function pushSecond(index: number, dir: string) {
+  const scenario = scenarios[index];
+  writeChanges(dir, scenario.second ?? {});
+  commitAll(dir, `${scenario.name}, again`);
+  retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${branches(index).change}`]);
 }
 
 function comments(number: string) {
@@ -183,9 +208,28 @@ function ids(results: string, statusFilter?: (status: string) => boolean) {
     .sort();
 }
 
-function assertRuns(kind: string, actual: string[], expected: string[], results: string) {
-  const failed = ids(results, (status) => status === 'failed' || status === 'skipped');
-  check(failed.length === 0, `${kind}: failed or skipped stacks: ${failed.join(', ')}`);
+function assertRuns(
+  kind: string,
+  actual: string[],
+  expected: string[],
+  results: string,
+  statuses: Record<string, string> = {},
+) {
+  const runs = JSON.parse(results || '[]') as { id: string; status: string }[];
+  console.log(
+    `${kind}: ${JSON.stringify(Object.fromEntries(runs.map((run) => [run.id, run.status])))}`,
+  );
+  for (const run of runs) {
+    const wanted = statuses[run.id];
+    if (wanted) {
+      check(run.status === wanted, `${kind}: ${run.id} is ${run.status}, expected ${wanted}`);
+    } else {
+      check(
+        run.status !== 'failed' && run.status !== 'skipped',
+        `${kind}: ${run.id} is ${run.status}`,
+      );
+    }
+  }
   check(
     JSON.stringify(actual) === JSON.stringify([...expected].sort()),
     `${kind} ran ${JSON.stringify(actual)}, expected ${JSON.stringify([...expected].sort())}`,
@@ -194,7 +238,16 @@ function assertRuns(kind: string, actual: string[], expected: string[], results:
 
 function assertPreview(index: number, number: string, results: string) {
   const scenario = scenarios[index];
-  assertRuns('preview', ids(results), scenario.expected, results);
+  assertRuns('preview', ids(results), scenario.expected, results, scenario.previewStatuses);
+  if (scenario.expectReply) {
+    const replies = comments(number).filter((body) =>
+      body.startsWith('<!-- pulumi-affected:ignored:'),
+    );
+    check(
+      replies.length === 1,
+      `expected one reply to the ignored command, found ${replies.length}`,
+    );
+  }
   const previews = comments(number).filter((body) =>
     body.startsWith('<!-- pulumi-affected:preview:'),
   );
@@ -209,7 +262,7 @@ function assertPreview(index: number, number: string, results: string) {
 
 function assertDeploy(index: number, number: string, results: string) {
   const scenario = scenarios[index];
-  assertRuns('deploy', ids(results), scenario.deployed, results);
+  assertRuns('deploy', ids(results), scenario.deployed, results, scenario.deployStatuses);
   const deploys = comments(number).filter((body) =>
     body.startsWith('<!-- pulumi-affected:deploy-'),
   );
@@ -221,6 +274,25 @@ function assertDeploy(index: number, number: string, results: string) {
   );
   for (const id of scenario.deployed)
     check(deploys[0].includes(`<code>${id}</code>`), `the deploy comment doesn't mention ${id}`);
+}
+
+function assertSecondPreview(index: number, number: string, results: string) {
+  const scenario = scenarios[index];
+  const expected = scenario.secondExpected ?? [];
+  assertRuns('second preview', ids(results), expected, results);
+  const previews = comments(number).filter((body) =>
+    body.startsWith('<!-- pulumi-affected:preview:'),
+  );
+  check(
+    previews.length === 1,
+    `expected the preview comment to be edited, found ${previews.length}`,
+  );
+  for (const id of expected) {
+    check(
+      previews[0].includes(`<code>${id}</code>`),
+      `the edited preview comment doesn't mention ${id}`,
+    );
+  }
 }
 
 function merge(index: number, number: string, dir: string) {
@@ -249,9 +321,17 @@ function cleanup(index: number, number: string | undefined) {
 
 const [command, indexText, ...rest] = process.argv.slice(2);
 const index = Number(indexText);
-if (command === 'list')
-  console.log(JSON.stringify(scenarios.map((scenario, i) => ({ index: i, name: scenario.name }))));
-else if (command === 'prepare') prepare(index, rest[0]);
+if (command === 'list') {
+  const list = scenarios.map((scenario, i) => ({
+    index: i,
+    name: scenario.name,
+    second: Boolean(scenario.second),
+  }));
+  console.log(JSON.stringify(list));
+} else if (command === 'push-second') pushSecond(index, rest[0]);
+else if (command === 'assert-second-preview') {
+  assertSecondPreview(index, rest[0], process.env.RESULTS ?? '');
+} else if (command === 'prepare') prepare(index, rest[0]);
 else if (command === 'assert-preview') assertPreview(index, rest[0], process.env.RESULTS ?? '');
 else if (command === 'merge') merge(index, rest[0], rest[1]);
 else if (command === 'assert-deploy') assertDeploy(index, rest[0], process.env.RESULTS ?? '');
