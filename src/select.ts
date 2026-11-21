@@ -410,7 +410,12 @@ export class Session {
       const patches = patchFiles(snapshot, dirnameOf(graph.path));
       for (const id of packageClosure(graph, roots)) {
         const node = graph.nodes.get(id);
-        if (!node || matchesAnyGlob(this.config.packages.ignore, node.name)) continue;
+        if (
+          !node ||
+          isTypesOnly(node.name) ||
+          matchesAnyGlob(this.config.packages.ignore, node.name)
+        )
+          continue;
         const patch = patches.get(`${node.name}@${node.version}`) ?? patches.get(node.name);
         const identity = patch ? `${node.identity} patched ${patch}` : node.identity;
         const set = result.get(node.name) ?? new Set();
@@ -581,6 +586,14 @@ function stacksNamed(name: string, project: Project, stacks: Stack[]) {
   const stackPart = parts[parts.length - 1];
   const projectPart = parts.length >= 3 ? parts[parts.length - 2] : project.name;
   return stacks.filter((stack) => glob(projectPart)(stack.project) && glob(stackPart)(stack.stack));
+}
+
+/**
+ * Type declaration packages (@types/*) hold no code that runs, even when a runtime dependency
+ * lists one, as protobufjs does @types/node
+ */
+function isTypesOnly(name: string) {
+  return name.startsWith('@types/');
 }
 
 /** Projects analysed as JavaScript: Node.js, and Bun, which runs the same programs */

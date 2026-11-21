@@ -1,5 +1,13 @@
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 
 /*
@@ -35,6 +43,37 @@ interface Scenario {
   applied: string[];
   /** A line printed before Pulumi's output, like a wrapper's banner */
   banner?: string;
+  /** The package manager the fixtures use; npm when absent */
+  packageManager?: PackageManager;
+  /** Changed files taken from e2e/package-managers: repository path → path there */
+  changesFrom?: Record<string, string>;
+}
+
+type PackageManager = 'npm' | 'yarn-classic' | 'yarn-berry' | 'pnpm';
+
+/** How each package manager installs exactly what its lockfile says, without install scripts */
+const INSTALL: Record<PackageManager, string[]> = {
+  npm: ['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'],
+  'yarn-classic': ['corepack', 'yarn', 'install', '--frozen-lockfile', '--ignore-scripts'],
+  'yarn-berry': ['corepack', 'yarn', 'install', '--immutable', '--mode=skip-build'],
+  pnpm: ['corepack', 'pnpm', 'install', '--frozen-lockfile', '--ignore-scripts'],
+};
+
+/** The scenario's changes, including files from e2e/package-managers */
+export function scenarioChanges(scenario: Scenario) {
+  const changes: Record<string, string | null> = { ...scenario.changes };
+  for (const [path, from] of Object.entries(scenario.changesFrom ?? {})) {
+    changes[path] = readFileSync(join(E2E, 'package-managers', from), 'utf8');
+  }
+  return changes;
+}
+
+/** Puts a package manager's base manifest and lockfile in place of npm's */
+function usePackageManager(dir: string, manager: PackageManager) {
+  if (manager === 'npm') return;
+  rmSync(join(dir, 'package-lock.json'), { force: true });
+  const base = join(E2E, 'package-managers', manager, 'base');
+  for (const file of readdirSync(base)) cpSync(join(base, file), join(dir, file));
 }
 
 const E2E = import.meta.dirname;
@@ -118,11 +157,14 @@ function prepare(index: number, dir: string) {
     mkdirSync(dirname(join(dir, file)), { recursive: true });
     cpSync(join(fixtures, file), join(dir, file));
   }
+  const manager = scenario.packageManager ?? 'npm';
+  usePackageManager(dir, manager);
   sh(dir, 'git', ['init', '-q', '-b', 'main']);
   sh(dir, 'git', ['config', 'user.name', 'github-actions[bot]']);
   sh(dir, 'git', ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com']);
   commitAll(dir, 'Fixtures');
-  sh(dir, 'npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund']);
+  const [installer, ...installArgs] = INSTALL[manager];
+  sh(dir, installer, installArgs);
 
   // Every stack starts deployed, in dependency order, as in a real repository
   const all = JSON.parse(
@@ -148,7 +190,7 @@ function prepare(index: number, dir: string) {
   const baseSha = commitAll(dir, 'Commit the encryption salts Pulumi wrote');
   retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${base}`]);
 
-  writeChanges(dir, scenario.changes);
+  writeChanges(dir, scenarioChanges(scenario));
   const head = commitAll(dir, scenario.message ?? scenario.name);
   retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${change}`]);
 

@@ -101,5 +101,131 @@
     "skipped": ["fixture-accounts/shop"],
     "changed": [],
     "applied": []
+  },
+  {
+    "name": "a package a program loads (npm)",
+    "packageManager": "npm",
+    "changes": {},
+    "changesFrom": {
+      "package.json": "npm/loaded/package.json",
+      "package-lock.json": "npm/loaded/package-lock.json"
+    },
+    "expected": ["fixture-dns/prod"],
+    "changed": [],
+    "applied": []
+  },
+  {
+    "name": "a package no program loads (npm)",
+    "packageManager": "npm",
+    "changes": {},
+    "changesFrom": {
+      "package.json": "npm/unloaded/package.json",
+      "package-lock.json": "npm/unloaded/package-lock.json"
+    },
+    "expected": [],
+    "changed": [],
+    "applied": []
+  },
+  {
+    "name": "one stack's config (yarn classic)",
+    "packageManager": "yarn-classic",
+    "changes": {
+      "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
+    },
+    "expected": ["fixture-accounts/shop"],
+    "changed": ["fixture-accounts/shop"],
+    "applied": ["fixture-accounts/shop"]
+  },
+  {
+    "name": "a package a program loads (yarn classic)",
+    "packageManager": "yarn-classic",
+    "changes": {},
+    "changesFrom": {
+      "package.json": "yarn-classic/loaded/package.json",
+      "yarn.lock": "yarn-classic/loaded/yarn.lock"
+    },
+    "expected": ["fixture-dns/prod"],
+    "changed": [],
+    "applied": []
+  },
+  {
+    "name": "a package no program loads (yarn classic)",
+    "packageManager": "yarn-classic",
+    "changes": {},
+    "changesFrom": {
+      "package.json": "yarn-classic/unloaded/package.json",
+      "yarn.lock": "yarn-classic/unloaded/yarn.lock"
+    },
+    "expected": [],
+    "changed": [],
+    "applied": []
+  },
+  {
+    "name": "one stack's config (yarn berry)",
+    "packageManager": "yarn-berry",
+    "changes": {
+      "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
+    },
+    "expected": ["fixture-accounts/shop"],
+    "changed": ["fixture-accounts/shop"],
+    "applied": ["fixture-accounts/shop"]
+  },
+  {
+    "name": "a package a program loads (yarn berry)",
+    "packageManager": "yarn-berry",
+    "changes": {},
+    "changesFrom": {
+      "package.json": "yarn-berry/loaded/package.json",
+      "yarn.lock": "yarn-berry/loaded/yarn.lock"
+    },
+    "expected": ["fixture-dns/prod"],
+    "changed": [],
+    "applied": []
+  },
+  {
+    "name": "a package no program loads (yarn berry)",
+    "packageManager": "yarn-berry",
+    "changes": {},
+    "changesFrom": {
+      "package.json": "yarn-berry/unloaded/package.json",
+      "yarn.lock": "yarn-berry/unloaded/yarn.lock"
+    },
+    "expected": [],
+    "changed": [],
+    "applied": []
+  },
+  {
+    "name": "one stack's config (pnpm)",
+    "packageManager": "pnpm",
+    "changes": {
+      "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
+    },
+    "expected": ["fixture-accounts/shop"],
+    "changed": ["fixture-accounts/shop"],
+    "applied": ["fixture-accounts/shop"]
+  },
+  {
+    "name": "a package a program loads (pnpm)",
+    "packageManager": "pnpm",
+    "changes": {},
+    "changesFrom": {
+      "package.json": "pnpm/loaded/package.json",
+      "pnpm-lock.yaml": "pnpm/loaded/pnpm-lock.yaml"
+    },
+    "expected": ["fixture-dns/prod"],
+    "changed": [],
+    "applied": []
+  },
+  {
+    "name": "a package no program loads (pnpm)",
+    "packageManager": "pnpm",
+    "changes": {},
+    "changesFrom": {
+      "package.json": "pnpm/unloaded/package.json",
+      "pnpm-lock.yaml": "pnpm/unloaded/pnpm-lock.yaml"
+    },
+    "expected": [],
+    "changed": [],
+    "applied": []
   }
 ]
