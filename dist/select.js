@@ -98,6 +98,7 @@ export function select(options) {
         reasons.delete(id);
     }
     warnings.push(...session.warnings);
+    warnings.push(...requestsFor(defaultBase).malformed);
     const graph = session.dependencyGraph(projects, stacks);
     warnings.push(...session.graphWarnings);
     const selectedIds = stacks.filter((stack) => reasons.has(stack.id)).map((stack) => stack.id);
@@ -765,12 +766,18 @@ function readRequests(repoRoot, base, options) {
     const run = [];
     const skip = [];
     const create = [];
+    const malformed = [];
     const scan = (text, source) => {
         for (const line of text.split('\n')) {
-            const creation = /^\s*Pulumi-Affected-Create-Stacks\s*:\s*(plan|apply)\b(.*)$/i.exec(line);
-            if (creation) {
-                const mode = creation[1].toLowerCase();
-                create.push({ mode, patterns: splitPatterns(creation[2]), source });
+            if (/^\s*Pulumi-Affected-Create-Stacks\s*:/i.test(line)) {
+                const creation = /^\s*Pulumi-Affected-Create-Stacks\s*:\s*(plan|apply)(?:\s+(.*))?\s*$/i.exec(line);
+                if (creation) {
+                    const mode = creation[1].toLowerCase();
+                    create.push({ mode, patterns: splitPatterns(creation[2] ?? ''), source });
+                }
+                else {
+                    malformed.push(`${source}: "${line.trim()}" isn't "Pulumi-Affected-Create-Stacks: plan|apply [stacks]"`);
+                }
                 continue;
             }
             const match = /^\s*(Pulumi-Affected-(?:Run|Skip))\s*:\s*(.+)$/i.exec(line);
@@ -782,7 +789,8 @@ function readRequests(repoRoot, base, options) {
         }
     };
     const headRev = options.head ?? 'HEAD';
-    const log = git(repoRoot, ['log', '--format=%h%x00%B%x01', `${base}..${headRev}`]);
+    // Oldest first, so later lines (newer commits, then the pull request) take precedence
+    const log = git(repoRoot, ['log', '--reverse', '--format=%h%x00%B%x01', `${base}..${headRev}`]);
     for (const entry of log.split('\u0001')) {
         const [sha, body] = entry.trim().split('\u0000');
         if (body)
@@ -796,7 +804,7 @@ function readRequests(repoRoot, base, options) {
         run.push({ pattern, source: '--run' });
     for (const pattern of options.skip ?? [])
         skip.push({ pattern, source: '--skip' });
-    return { run, skip, create };
+    return { run, skip, create, malformed };
 }
 /** The stacks in the repo and how they depend on each other, as of `head` */
 export function readDependencyGraph(options) {

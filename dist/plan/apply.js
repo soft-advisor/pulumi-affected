@@ -14,7 +14,7 @@ import { mapConcurrently } from "./concurrency.js";
 import { hashText, readManifest } from "./manifest.js";
 import { initArgs, pulumiVersion, unknownReadersWarning, writeSalt } from "./plan.js";
 import { describeRead, staleReads } from "./outputs.js";
-import { relaxPlan, stackOutputChanges, unknownOutputChanges } from "./planfile.js";
+import { createsOnlyTheStack, relaxPlan, stackOutputChanges, unknownOutputChanges, } from "./planfile.js";
 export class ApplyError extends Error {
 }
 /** Tags the update with the plan and the code it's for, so a rerun recognises it */
@@ -201,7 +201,15 @@ async function applyStack(stack, context) {
             error: "the stack's state changed since it was planned; plan it again",
         };
         if (stack.createOnApply) {
+            // The manifest comes from the plan job; that the plan creates nothing is checked here
+            const plan = readFileSync(join(context.directory, stack.plan), 'utf8');
+            if (!createsOnlyTheStack(plan)) {
+                return fail("it's created when applying, but its plan has resources; plan it again");
+            }
+            const configPath = join(context.repoRoot, context.configFile);
             if (current.kind === 'missing') {
+                // With the salt the plan's secrets were encrypted with, if it carries any
+                writeSalt(configPath, stack.encryptionSalt);
                 const init = await runner.run(stack, initArgs(context.repoRoot, context.configFile));
                 if (init.code !== 0)
                     return fail(`couldn't create the stack: ${errorText(init)}`);
@@ -220,6 +228,10 @@ async function applyStack(stack, context) {
                     ...refused,
                     error: "it was created since it was planned, and isn't empty; plan it again",
                 };
+            }
+            else {
+                // Created by an earlier run of this plan: its salt is the one to use
+                writeSalt(configPath, current.salt ?? stack.encryptionSalt);
             }
         }
         else {

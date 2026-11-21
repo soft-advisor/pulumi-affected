@@ -395,6 +395,98 @@ outputs:
       assert.equal(created?.created, true);
     });
 
+    test('a new stack whose plan holds secrets applies with the salt it was planned with', async () => {
+      const secret = 'name: secretive\nruntime: yaml\noutputs:\n  token:\n    fn::secret: hello\n';
+      const { dir, base, runner, plans } = setup({ 'Pulumi.yaml': secret });
+      commit(dir, { 'Pulumi.prod.yaml': 'config: {}\n' });
+      const manifest = await planStacks({
+        select: { cwd: dir, base },
+        directory: plans,
+        runner,
+        concurrency: 1,
+        createStacks: 'apply',
+      });
+      assert.deepEqual(manifest.failed, []);
+      assert.match(manifest.stacks[0]?.encryptionSalt ?? '', /^v1:/);
+      const clone = temporary('clone');
+      run(tmpdir(), 'git', ['clone', '-q', dir, clone]);
+      const result = await apply(clone, plans, commandRunner(DEFAULT_COMMAND, clone));
+      assert.deepEqual(result.stacks, [{ id: 'secretive/prod', outcome: 'applied' }]);
+
+      // Without the passphrase, the secrets couldn't be carried, so planning says so
+      const passphrase = process.env.PULUMI_CONFIG_PASSPHRASE;
+      delete process.env.PULUMI_CONFIG_PASSPHRASE;
+      try {
+        commit(dir, { 'Pulumi.qa.yaml': 'config: {}\n' });
+        const without = await planStacks({
+          select: { cwd: dir, base, run: ['secretive/qa'] },
+          directory: temporary('plans'),
+          runner,
+          concurrency: 1,
+          createStacks: 'apply',
+        });
+        assert.match(
+          without.failed.find((stack) => stack.id === 'secretive/qa')?.error ?? '',
+          /its plan holds secrets/,
+        );
+      } finally {
+        process.env.PULUMI_CONFIG_PASSPHRASE = passphrase;
+      }
+    });
+
+    test('a command template that ignores the temporary backend fails before touching the real one', async () => {
+      const { dir, base, plans } = setup({ 'Pulumi.yaml': empty('fresh') });
+      const real = process.env.PULUMI_BACKEND_URL ?? '';
+      const wrapper = join(temporary('wrapper'), 'pulumi.sh');
+      writeFileSync(wrapper, `#!/bin/sh\nPULUMI_BACKEND_URL='${real}' exec pulumi "$@"\n`);
+      commit(dir, { 'Pulumi.prod.yaml': 'config: {}\n' });
+      const manifest = await planStacks({
+        select: { cwd: dir, base },
+        directory: plans,
+        runner: commandRunner(`sh ${wrapper} --cwd {dir} --stack {stack}`, dir),
+        concurrency: 1,
+        createStacks: 'apply',
+      });
+      assert.match(manifest.failed[0]?.error ?? '', /doesn't use the temporary backend/);
+      assert.doesNotMatch(run(dir, 'pulumi', ['stack', 'ls', '--json']), /"name":\s*"prod"/);
+    });
+
+    test('apply refuses a stack marked as new whose plan has resources', async () => {
+      const { dir, base, runner, plans } = setup();
+      commit(dir, { 'Pulumi.prod.yaml': 'config: {}\n' });
+      await planStacks({
+        select: { cwd: dir, base, run: ['words/prod'] },
+        directory: plans,
+        runner,
+        concurrency: 1,
+      });
+      // As a tampered plan job could write it, for a stack apply would create
+      const path = join(plans, 'manifest.json');
+      const manifest = JSON.parse(readFileSync(path, 'utf8'));
+      for (const stack of manifest.stacks) {
+        stack.createOnApply = true;
+        stack.created = false;
+        delete stack.fingerprint;
+      }
+      writeFileSync(path, JSON.stringify(manifest));
+      run(dir, 'pulumi', [
+        'stack',
+        'rm',
+        '--yes',
+        '--force',
+        '--preserve-config',
+        '--stack',
+        'prod',
+      ]);
+      run(dir, 'git', ['checkout', '-q', '--', '.']);
+      const result = await apply(dir, plans, runner);
+      assert.match(
+        result.stacks.find((stack) => stack.id === 'words/prod')?.error ?? '',
+        /its plan has resources/,
+      );
+      assert.doesNotMatch(run(dir, 'pulumi', ['stack', 'ls', '--json']), /"name":\s*"prod"/);
+    });
+
     test('a new stack that reads another stack previews with that stack copied in', async () => {
       const { dir, runner, plans } = setup({
         'up/Pulumi.yaml': 'name: up\nruntime: yaml\noutputs:\n  zone: example.com\n',

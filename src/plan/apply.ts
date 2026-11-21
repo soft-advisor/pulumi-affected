@@ -20,7 +20,12 @@ import { mapConcurrently } from './concurrency.ts';
 import { hashText, type Manifest, type PlannedStack, readManifest } from './manifest.ts';
 import { initArgs, pulumiVersion, unknownReadersWarning, writeSalt } from './plan.ts';
 import { describeRead, type StaleRead, staleReads } from './outputs.ts';
-import { relaxPlan, stackOutputChanges, unknownOutputChanges } from './planfile.ts';
+import {
+  createsOnlyTheStack,
+  relaxPlan,
+  stackOutputChanges,
+  unknownOutputChanges,
+} from './planfile.ts';
 
 /*
  * Applies the plans `plan` wrote, exactly: `pulumi up --plan` for each, in dependency order, and
@@ -314,7 +319,15 @@ async function applyStack(stack: PlannedStack, context: StackContext): Promise<S
       error: "the stack's state changed since it was planned; plan it again",
     };
     if (stack.createOnApply) {
+      // The manifest comes from the plan job; that the plan creates nothing is checked here
+      const plan = readFileSync(join(context.directory, stack.plan), 'utf8');
+      if (!createsOnlyTheStack(plan)) {
+        return fail("it's created when applying, but its plan has resources; plan it again");
+      }
+      const configPath = join(context.repoRoot, context.configFile);
       if (current.kind === 'missing') {
+        // With the salt the plan's secrets were encrypted with, if it carries any
+        writeSalt(configPath, stack.encryptionSalt);
         const init = await runner.run(stack, initArgs(context.repoRoot, context.configFile));
         if (init.code !== 0) return fail(`couldn't create the stack: ${errorText(init)}`);
         current = await stateFingerprint(runner, stack);
@@ -331,6 +344,9 @@ async function applyStack(stack: PlannedStack, context: StackContext): Promise<S
           ...refused,
           error: "it was created since it was planned, and isn't empty; plan it again",
         };
+      } else {
+        // Created by an earlier run of this plan: its salt is the one to use
+        writeSalt(configPath, current.salt ?? stack.encryptionSalt);
       }
     } else {
       if (current.kind === 'missing') return fail('the stack no longer exists');

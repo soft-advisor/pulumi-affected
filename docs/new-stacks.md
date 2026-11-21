@@ -2,14 +2,14 @@
 
 Pulumi can only plan for a stack that exists. When a change adds a stack (a new `Pulumi.<stack>.yaml`, or a new project), something has to create it, and that can happen in one of two places:
 
-|                                             | `plan` (the default)                          | `apply`                                                      |
-| ------------------------------------------- | --------------------------------------------- | ------------------------------------------------------------ |
-| Who creates the stack                       | The plan job, on the pull request             | The apply job, after merge                                   |
-| What the first change may contain           | Anything: the stack is planned like any other | No resources: the change that adds the stack leaves it empty |
-| Pull requests to get a stack with resources | One                                           | Two: one adds the stack, the next its resources              |
-| Credentials the plan job needs              | Permission to create stacks in the backend    | Read only                                                    |
-| Backends                                    | Any                                           | Any                                                          |
-| An abandoned pull request leaves            | An empty stack behind                         | Nothing                                                      |
+|                                             | `plan` (the default)                          | `apply`                                                                             |
+| ------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Who creates the stack                       | The plan job, on the pull request             | The apply job, after merge                                                          |
+| What the first change may contain           | Anything: the stack is planned like any other | No resources: the change that adds the stack leaves it empty                        |
+| Pull requests to get a stack with resources | One                                           | Two: one adds the stack, the next its resources                                     |
+| Credentials the plan job needs              | Permission to create stacks in the backend    | Read only                                                                           |
+| Backends                                    | Any                                           | Any, with [limits](#limits) when the first change has secrets or reads other stacks |
+| An abandoned pull request leaves            | An empty stack behind                         | Nothing                                                                             |
 
 Choose `plan` when the plan job can create stacks: it's simpler. Choose `apply` when previews must stay read-only, for example when the plan job's role may only write Pulumi's lock files.
 
@@ -27,8 +27,8 @@ The plan job can't create the stack, so it can't plan its resources either. Inst
 
    > It doesn't exist yet, and it's created when applying (create-stacks: apply), so the change that adds it must give it no resources; this one would create 3: aws:s3/bucket:Bucket site, …
 
-   If it creates nothing, that (empty) plan is kept, and the plan comment shows the stack as new.
-2. **Apply.** After merge, `apply` runs `pulumi stack init`, then `pulumi up --plan` with the empty plan. Pulumi refuses to create anything the plan doesn't have, so the stack can't get resources here even if the code changed. Code and state agree: the stack exists, with nothing in it (and any constant outputs the program exports).
+   If it creates nothing, that (empty) plan is kept, and the plan comment shows the stack as "new stack, created empty when applied".
+2. **Apply.** After merge, `apply` checks the plan really creates nothing but the stack (the manifest comes from the plan job, so it isn't taken on trust), then runs `pulumi stack init` and `pulumi up --plan` with the empty plan. Pulumi refuses to create anything the plan doesn't have, so the stack can't get resources here even if the code changed. Code and state agree: the stack exists, with nothing in it (and any outputs the program exports).
 3. **The next change** adds the resources. It selects the stack like any change to its code, and plans it against the real, existing stack: its real secrets provider, the real stacks it references, the real organization.
 
 ### Making a program empty for a new stack
@@ -40,24 +40,28 @@ Most programs create the same resources for every stack. To add a stack before i
 
 ### The temporary backend
 
-The preview runs your `command` template with `PULUMI_BACKEND_URL` pointing at a folder on the runner, which is deleted afterwards. Your wrapper script must leave that variable as it's given; if the stack doesn't appear in the temporary backend, planning fails rather than touch the real one.
+The preview runs your `command` template with `PULUMI_BACKEND_URL` pointing at a folder on the runner, which is deleted afterwards. Your wrapper script must leave that variable as it's given. Before creating anything, `pulumi about` is run through the template, and the backend it reports must be that folder; otherwise planning fails without having touched the real backend.
 
-The stacks the new stack references (from the dependency analysis and `dependsOn`) are copied into the temporary backend first, with `pulumi stack export` from the real backend and `pulumi stack import`, so a program that reads them at the top level previews as it will run. Copying needs read access to those stacks, which the plan job has. Their secrets stay encrypted as they are.
+The temporary stack always uses passphrase secrets, whatever its config file names. If the stack really uses passphrase secrets and `PULUMI_CONFIG_PASSPHRASE` is set, the salt the temporary stack got is recorded in the manifest, and `apply` creates the real stack with it, so any secrets in the plan (a `pulumi.secret(...)` output, a secret read from another stack) decrypt. Otherwise a throwaway passphrase is used, and a plan that holds any secret fails planning, since nothing could decrypt it when applying.
 
-The config files Pulumi writes encryption salts into while doing this are restored afterwards, so the checkout is left as it was.
+The stacks the new stack references (from the dependency analysis and `dependsOn`) are copied into the temporary backend first, with `pulumi stack export` from the real backend and `pulumi stack import`, so a program that reads them at the top level previews as it will run. Copying needs read access to those stacks, which the plan job has. Their secrets stay encrypted as they are. A referenced stack that doesn't exist yet either is skipped; any other export error fails planning.
+
+The config files Pulumi writes encryption salts into while doing this are restored afterwards, so the checkout is left as it was. New stacks are previewed one at a time, since two of them can reference the same stack.
 
 ### Limits
 
-The temporary backend is a self-managed backend. For a program with no resources that rarely matters, but on **Pulumi Cloud**:
+The temporary backend is a self-managed backend with passphrase secrets. For a program with no resources that rarely matters, but:
 
-- a stack reference names a real organization (`acme/network/prod`), which a local backend doesn't have, so a new stack that reads another stack at the top level can't be previewed there;
-- `pulumi.getOrganization()` returns `organization` instead of the real one.
+- **Secrets in the first change** only carry over with passphrase secrets and `PULUMI_CONFIG_PASSPHRASE` set (above). With Pulumi Cloud's own secrets or a cloud KMS, a first change whose plan holds a secret fails planning.
+- **Reading other stacks on Pulumi Cloud:** a stack reference names a real organization (`acme/network/prod`), which a local backend doesn't have, and stacks using Pulumi Cloud's secrets can't be read outside it, so a new stack that reads another stack at the top level can't be previewed there.
+- **`pulumi.getOrganization()`** returns `organization` instead of the real one.
+- **References analysis can't see** (stacks outside the repository, names it can't work out, and no `dependsOn`) aren't copied in, so reading them fails the preview.
 
-Planning then fails with Pulumi's error. Create such a stack when planning instead; see [choosing per stack or per change](#choosing-per-stack-or-per-change).
+Planning then fails with an explanation or Pulumi's error. Create such a stack when planning instead; see [choosing per stack or per change](#choosing-per-stack-or-per-change).
 
 ### Encryption salts
 
-When `apply` creates a passphrase stack, Pulumi writes its encryption salt into the apply job's copy of `Pulumi.<stack>.yaml`, not into git. Pulumi only reads the salt from that file: without it, a later run makes a new salt, and the stack's secrets no longer decrypt. So both `plan` and `apply` write the salt recorded in the stack's state into any checkout whose config file has none. Committing the salt is still the tidy option.
+When `apply` creates a passphrase stack, Pulumi writes its encryption salt into the apply job's copy of `Pulumi.<stack>.yaml`, not into git. Pulumi only reads the salt from that file: without it, a later run makes a new salt, and the stack's secrets no longer decrypt. So both `plan` and `apply` write the salt recorded in the stack's state into any checkout whose config file has none (after checking it's a well-formed salt). Committing the salt is still the tidy option.
 
 ## Choosing per stack or per change
 
@@ -70,7 +74,7 @@ The setting comes from, in order (the first that applies wins):
    Pulumi-Affected-Create-Stacks: plan accounts/newco, site/*
    ```
 
-   When several lines name a stack, the last one counts. The plan workflow should run on `edited` pull requests for a description change to take effect.
+   When several lines name a stack, the last one counts: commits from oldest to newest, then the pull request description. A malformed line is reported as a warning. The plan workflow should run on `edited` pull requests for a description change to take effect.
 2. **The config,** `pulumi-affected.yaml`: patterns per mode, and a default:
 
    ```yaml

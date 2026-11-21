@@ -255,3 +255,28 @@ test('an encryption salt Pulumi adds is not a change, but a changed salt is', ()
   });
   assert.deepEqual(selectedIds(changed), ['org-accounts/business']);
 });
+
+test('Pulumi-Affected-Create-Stacks lines: newer commits and then the pull request win', () => {
+  const { dir, base } = createRepo(ACCOUNTS);
+  commit(dir, {}, 'First\n\nPulumi-Affected-Create-Stacks: plan');
+  commit(
+    dir,
+    {},
+    'Second\n\nPulumi-Affected-Create-Stacks: apply org-accounts/*\nPulumi-Affected-Create-Stacks: apply-later',
+  );
+  const result = select({ cwd: dir, base });
+  assert.deepEqual(
+    result.createStacks.map((request) => [request.mode, request.patterns]),
+    [
+      ['plan', []],
+      ['apply', ['org-accounts/*']],
+    ],
+  );
+  assert.ok(result.warnings.some((warning) => warning.includes('apply-later')));
+  const withPullRequest = select({
+    cwd: dir,
+    base,
+    messages: ['Pulumi-Affected-Create-Stacks: plan'],
+  });
+  assert.equal(withPullRequest.createStacks.at(-1)?.source, 'the pull request');
+});

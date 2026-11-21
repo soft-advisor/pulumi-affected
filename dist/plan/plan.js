@@ -1,17 +1,18 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { classify } from "../classify.js";
 import { loadConfig } from "../config.js";
 import { matchesAnyStack, matchesStack } from "../patterns.js";
-import { errorText, onCancel } from "../pulumi/runner.js";
+import { errorText, isMissingStack, onCancel, parseLastJsonObject, } from "../pulumi/runner.js";
 import { secretsProviderOf, stateFingerprint } from "../pulumi/stack.js";
 import { readDependencyGraph, select, } from "../select.js";
 import { git, repoRootOf, WorktreeSnapshot } from "../snapshot.js";
 import { mapConcurrently } from "./concurrency.js";
 import { describeRead, staleReads } from "./outputs.js";
-import { stackOutputChanges, unknownOutputChanges } from "./planfile.js";
+import { planHasSecrets, stackOutputChanges, unknownOutputChanges } from "./planfile.js";
 import { hashFile, planFileNames, writeManifest, } from "./manifest.js";
 export async function planStacks(options) {
     const repoRoot = repoRootOf(options.select.cwd);
@@ -139,12 +140,17 @@ async function planStack(stack, context) {
     let fingerprint;
     let created = false;
     let createOnApply = false;
+    let encryptionSalt;
+    let secretsCarried = false;
     let preview;
     try {
         let current = await stateFingerprint(context.runner, stack);
         if (current.kind === 'missing' && context.createMode === 'apply') {
             createOnApply = true;
-            preview = await previewInTemporaryBackend(context, stack, planPath);
+            const temporary = await previewInTemporaryBackend(context, stack, planPath);
+            preview = temporary.result;
+            encryptionSalt = temporary.salt;
+            secretsCarried = temporary.secretsCarried;
         }
         else {
             if (current.kind === 'missing') {
@@ -183,6 +189,9 @@ async function planStack(stack, context) {
     catch (error) {
         return fail(error instanceof Error ? error.message : String(error));
     }
+    if (createOnApply && !secretsCarried && planHasSecrets(readFileSync(planPath, 'utf8'))) {
+        return fail(`It doesn't exist yet, and it's created when applying (create-stacks: apply), but its plan holds secrets, which can only be carried to the real stack with passphrase secrets and PULUMI_CONFIG_PASSPHRASE set. Create it when planning with Pulumi-Affected-Create-Stacks: plan ${stack.id}`);
+    }
     if (createOnApply && classification.changes.length > 0) {
         const resources = classification.changes.map((change) => `${change.type} ${change.name}`);
         return fail(`It doesn't exist yet, and it's created when applying (create-stacks: apply), so the change that adds it must give it no resources; this one would create ${resources.length}: ${resources.slice(0, 10).join(', ')}${resources.length > 10 ? ', …' : ''}. Add the stack first, empty, and its resources in a later pull request; or create it when planning with Pulumi-Affected-Create-Stacks: plan ${stack.id}`);
@@ -205,7 +214,7 @@ async function planStack(stack, context) {
             created,
             encryptionSalt: created
                 ? encryptionSaltOf(join(context.repoRoot, stack.configFile))
-                : undefined,
+                : encryptionSalt,
             plan: files.plan,
             preview: files.preview,
             planHash: hashFile(planPath),
@@ -235,73 +244,115 @@ export function initArgs(repoRoot, configFile) {
  * Previews a stack that doesn't exist yet in a temporary local backend, so nothing is written to
  * the real one. The stacks it references are copied in from the real backend first, so a
  * program that reads them previews as it will run. Creating stacks there writes encryption
- * salts into their config files; those are restored afterwards. The command template runs with
- * PULUMI_BACKEND_URL pointing at the temporary backend, and the stack is checked to have been
- * created there, so a wrapper that picks its own backend fails instead of touching the real one.
+ * salts into their config files; those are restored afterwards.
+ *
+ * The command template runs with PULUMI_BACKEND_URL pointing at the temporary backend; before
+ * anything is created, `pulumi whoami` through the template must report that backend, so a
+ * wrapper that picks its own backend fails here instead of touching the real one.
+ *
+ * Secrets: the temporary stack uses passphrase secrets. When the stack really does too, and the
+ * passphrase is set, its salt is returned so `apply` creates the real stack with it and the
+ * plan's secrets decrypt. Otherwise a throwaway passphrase is used, and a plan holding secrets
+ * fails, since nothing could decrypt them when applying.
  */
 async function previewInTemporaryBackend(context, stack, planPath) {
-    const backend = mkdtempSync(join(tmpdir(), 'pulumi-affected-backend-'));
-    const references = context.references();
-    const configs = new Map();
-    for (const target of [stack, ...references]) {
-        const path = join(context.repoRoot, target.configFile);
-        configs.set(path, existsSync(path) ? readFileSync(path, 'utf8') : undefined);
-    }
-    const restore = () => {
-        for (const [path, original] of configs) {
-            if (original === undefined)
-                rmSync(path, { force: true });
-            else
-                writeFileSync(path, original);
+    // One at a time: previews of new stacks that reference the same stack touch its config file
+    return serially(async () => {
+        const backend = mkdtempSync(join(tmpdir(), 'pulumi-affected-backend-'));
+        const references = context.references();
+        const configs = new Map();
+        for (const target of [stack, ...references]) {
+            const path = join(context.repoRoot, target.configFile);
+            configs.set(path, existsSync(path) ? readFileSync(path, 'utf8') : undefined);
         }
-        rmSync(backend, { recursive: true, force: true });
-    };
-    const unregister = onCancel(restore);
-    const env = { PULUMI_BACKEND_URL: `file://${backend}` };
-    const temporary = (target, args) => context.runner.run(target, args, env);
-    try {
-        for (const reference of references) {
-            const exported = await context.runner.run(reference, ['stack', 'export']);
-            if (exported.code !== 0)
-                continue; // Doesn't exist yet either
-            const file = join(backend, `${reference.id.replace('/', '+')}.export.json`);
-            writeFileSync(file, exported.stdout);
-            const init = await temporary(reference, initArgs(context.repoRoot, reference.configFile));
+        const restore = () => {
+            for (const [path, original] of configs) {
+                if (original === undefined)
+                    rmSync(path, { force: true });
+                else
+                    writeFileSync(path, original);
+            }
+            rmSync(backend, { recursive: true, force: true });
+        };
+        const unregister = onCancel(restore);
+        const configPath = join(context.repoRoot, stack.configFile);
+        const original = configs.get(configPath);
+        const secretsCarried = secretsProviderOf(original) === undefined &&
+            process.env.PULUMI_CONFIG_PASSPHRASE !== undefined;
+        const env = {
+            PULUMI_BACKEND_URL: `file://${backend}`,
+            ...(secretsCarried ? {} : { PULUMI_CONFIG_PASSPHRASE: randomUUID() }),
+        };
+        const temporary = (target, args) => context.runner.run(target, args, env);
+        const failed = (stderr) => ({
+            result: { code: 1, stdout: '', stderr },
+            secretsCarried,
+        });
+        try {
+            // `about` takes --stack, which templates pass, and reports the backend even for a new stack
+            const about = await temporary(stack, ['about', '--json']);
+            const url = parseLastJsonObject(about.stdout)
+                ?.backend?.url;
+            if (!url || !sameFolder(url, backend)) {
+                return failed(`the command template doesn't use the temporary backend it's given in PULUMI_BACKEND_URL (it reports ${url ?? 'nothing'}), so this stack can't be previewed without touching the real backend`);
+            }
+            for (const reference of references) {
+                const exported = await context.runner.run(reference, ['stack', 'export']);
+                if (isMissingStack(exported))
+                    continue; // New too; the preview reports it if it's read
+                if (exported.code !== 0)
+                    return { result: exported, secretsCarried };
+                const file = join(backend, `${reference.id.replace('/', '+')}.export.json`);
+                writeFileSync(file, exported.stdout);
+                const init = await temporary(reference, TEMPORARY_INIT);
+                if (init.code !== 0)
+                    return { result: init, secretsCarried };
+                const imported = await temporary(reference, ['stack', 'import', '--file', file]);
+                if (imported.code !== 0)
+                    return { result: imported, secretsCarried };
+            }
+            // Its own config may name another secrets provider; here it's always a passphrase
+            const init = await temporary(stack, TEMPORARY_INIT);
             if (init.code !== 0)
-                return init;
-            const imported = await temporary(reference, ['stack', 'import', '--file', file]);
-            if (imported.code !== 0)
-                return imported;
+                return { result: init, secretsCarried };
+            const stacks = join(backend, '.pulumi', 'stacks');
+            const created = [
+                join(stacks, stack.project, `${stack.stack}.json`),
+                join(stacks, stack.project, `${stack.stack}.json.gz`),
+                join(stacks, `${stack.stack}.json`),
+                join(stacks, `${stack.stack}.json.gz`),
+            ].some((path) => existsSync(path));
+            if (!created)
+                return failed("the stack wasn't created in the temporary backend");
+            const salt = secretsCarried ? encryptionSaltOf(configPath) : undefined;
+            const result = await temporary(stack, previewArgs(planPath));
+            return { result, salt, secretsCarried };
         }
-        const init = await temporary(stack, initArgs(context.repoRoot, stack.configFile));
-        if (init.code !== 0)
-            return init;
-        if (!hasStackFile(join(backend, '.pulumi'), stack.stack)) {
-            return {
-                code: 1,
-                stdout: '',
-                stderr: `the stack wasn't created in the temporary backend: the command template must leave PULUMI_BACKEND_URL as it's given`,
-            };
+        finally {
+            unregister();
+            restore();
         }
-        return await temporary(stack, previewArgs(planPath));
+    });
+}
+const TEMPORARY_INIT = ['stack', 'init', '--non-interactive'];
+/** Whether a file:// backend URL names this folder */
+function sameFolder(url, folder) {
+    if (!url.startsWith('file://'))
+        return false;
+    const path = decodeURI(url.slice('file://'.length).split('?')[0]).replace(/\/+$/, '');
+    try {
+        return realpathSync(path) === realpathSync(folder);
     }
-    finally {
-        unregister();
-        restore();
+    catch {
+        return false;
     }
 }
-/** Whether a file backend holds a stack of this name */
-function hasStackFile(folder, name) {
-    if (!existsSync(folder))
-        return false;
-    for (const entry of readdirSync(folder, { withFileTypes: true })) {
-        if (entry.isDirectory() && hasStackFile(join(folder, entry.name), name))
-            return true;
-        if (entry.isFile() && (entry.name === `${name}.json` || entry.name === `${name}.json.gz`)) {
-            return true;
-        }
-    }
-    return false;
+let queue = Promise.resolve();
+/** Runs tasks one after another */
+function serially(task) {
+    const run = queue.then(task, task);
+    queue = run.catch(() => undefined);
+    return run;
 }
 /**
  * Writes a passphrase stack's encryption salt into its config file when the file has none.
@@ -309,8 +360,10 @@ function hasStackFile(folder, name) {
  * without the salt (one Pulumi wrote on another runner) couldn't decrypt the stack's secrets.
  */
 export function writeSalt(configPath, salt) {
-    if (!salt || encryptionSaltOf(configPath) !== undefined)
+    // The state is trusted, but a salt is only ever one line of these characters
+    if (!salt || !/^v1:[A-Za-z0-9+/=:]+$/.test(salt) || encryptionSaltOf(configPath) !== undefined) {
         return;
+    }
     const config = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
     if (secretsProviderOf(config) !== undefined)
         return;
