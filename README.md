@@ -13,16 +13,32 @@ It works with TypeScript and JavaScript Pulumi programs, and npm, yarn (classic 
 
 For each project, at the base revision and at the head revision:
 
-1. **The program.** Each file is transpiled the way Pulumi runs it (types erased, unused imports elided, comments dropped) and split into top-level items. Starting from the entry file, the tool follows what runs: every statement of every loaded module, and the functions and constants those use, transitively, through relative imports, `tsconfig` path aliases, workspace packages, re-exports and namespace imports. The entry file's exports count, because they're stack outputs. A project is affected when any of that differs.
-2. **Files the program reads.** Paths passed to `readFileSync`, `readdirSync`, `FileAsset`, `FileArchive` and friends, including `path.join(__dirname, …)` and constants.
-3. **Packages.** The lockfile is read into a graph. A project is affected when a package it loads, or anything that package depends on, resolves to a different version. The Pulumi SDK counts for every program.
-4. **Settings.** `Pulumi.yaml` (except `description`), compiler options that change the output, and the `type`/`main`/`imports`/`exports` fields of `package.json`, all compared by value, not text.
+1. **The program.** Each file is transpiled the way Pulumi runs it (types erased, unused imports elided, comments dropped) and split into top-level items. Starting from the entry file, the tool follows what runs: every statement of every loaded module, and the functions and constants those use, transitively.
+   - It follows relative imports, `import x = require()`, `tsconfig` path aliases (including through `extends` from a workspace package), `package.json` `imports` (`#alias`), workspace packages (through their `exports`, and from build output back to source), re-exports and namespace imports, plus files preloaded through `runtime.options.nodeargs`.
+   - The entry file's exports count, because they're stack outputs.
+   - Statement order counts too: import order, and declarations used before they're assigned.
+   - A project is affected when any of that differs.
+2. **Files and folders the program uses.**
+   - Paths passed to any function of `fs`, `fs/promises`, `fs-extra` or the glob packages, under any name.
+   - Paths given to `FileAsset`, `FileArchive` and `require.resolve`, and `.env` for dotenv.
+   - Path-like values that name something in the repository: a `context`, `dockerfile`, `path`, `dir`, `location`, `cwd`, `source` or `file` property, or any `./` or `../` string. That covers Docker build contexts, Lambda folders and the like.
+   - Paths can use `path.join(__dirname, …)`, `process.cwd()` (the folder Pulumi runs the program in) and constants.
+3. **Packages.** The lockfile (npm, yarn classic or berry, pnpm 6+, or `bun.lock`) is read into a graph. A project is affected when a package it loads, or anything that package depends on, resolves differently: another version, another git commit or tarball, another checksum, or a changed patch, including patch-package's `patches/`.
+   - The Pulumi SDK counts for every program, as do npm packages the tsconfig extends.
+   - Without a lockfile, the dependency ranges in `package.json` are compared instead.
+   - A lockfile that can't be read counts as changed whenever its text changes.
+4. **Settings.** These are compared by value, with YAML scalars kept as written (so `1.10` and `1.1` differ):
+   - `Pulumi.yaml`, except `description`, including `runtime.options.tsconfig`
+   - compiler options that change the output, including strict mode
+   - the `type`/`main`/`imports`/`exports` fields of `package.json`
 
-A stack is affected when its project is, or when its `Pulumi.<stack>.yaml` differs by value.
+A stack is affected when its project is, or when its `Pulumi.<stack>.yaml` differs by value. An encryption salt Pulumi adds to a stack's config file doesn't count, but a changed one does. Stack files follow the project file's extension (`Pulumi.dev.yml` belongs with `Pulumi.yml`).
+
+Symbolic links are followed while they stay inside the repository. A submodule counts as changed when it moves to another commit.
 
 Every selected stack comes with its reasons, for example ``lib/naming.ts: `zoneName` changed (via dns/index.ts)``.
 
-**When analysis can't be complete,** for example a `require()` with a computed path or a file read from a path that can't be worked out, the project falls back to "any change in its folder counts", and a warning says why. List such files under `inputs` in the config to keep the precision.
+**When analysis can't be complete,** the stack is selected by any change in its project's folder and in the folder where the missing piece most likely lives, and a warning says why. Examples: a `require()` with a computed path, `eval`, a file read from a path that can't be worked out, build output that isn't committed, an import the lockfile doesn't resolve. To keep the precision, list such files under `inputs` in the config. Projects in other languages are watched folder by folder; for Pulumi YAML, folders read with `fn::readFile` and friends count too.
 
 **Dependencies between stacks** come from `new StackReference(name)` in code. Names built from constants, `pulumi.getStack()`, `getProject()`, `getOrganization()` and stack config values are resolved per stack. Dependencies that don't appear in code, such as a stack that looks up another stack's resources in the cloud, go under `dependsOn`. A dependency only orders stacks; it never selects one. When a stack's config changes, the stacks reading its outputs aren't previewed, because a preview reads the outputs as they are now and would show nothing.
 
@@ -166,7 +182,12 @@ jobs:
 
 **Preview** runs every selected stack in parallel. A stack that doesn't exist yet is previewed in a temporary local backend with its config, so nothing is written to the real backend before merge. There, other stacks (`StackReference`), ESC environments and secrets encrypted by the real backend aren't available, so such a preview fails with an explanation. `run.newStacks: skip` leaves new stacks out of previews instead.
 
-**Up** compares each stack with the commit it was last deployed from (Pulumi records it as `git.head` in the stack's history), so a stack whose deploy failed, or that was never deployed, runs again on the next push. Stacks run after the ones they depend on. When a deploy changes a stack's outputs, the stacks that depend on it are deployed too, with the reason. A failure skips the stacks that depend on the failed one, lets the others finish, and fails the job at the end (`fail-fast` stops early instead).
+**Up** compares each stack with the commit it was last deployed from (Pulumi records it as `git.head` in the stack's history), so a stack whose deploy failed, or that was never deployed, runs again on the next push.
+
+- A stack whose latest deploy failed is selected, with that reason.
+- A stack whose last deploy recorded no commit, or used `--target`, is selected too.
+- A destroyed stack counts as never deployed.
+- A deploy from a working tree with uncommitted changes keeps its commit, with a warning. Stacks run after the ones they depend on. When a deploy changes a stack's outputs, the stacks that depend on it are deployed too, with the reason. A failure skips the stacks that depend on the failed one, lets the others finish, and fails the job at the end (`fail-fast` stops early instead).
 
 **Comments.** A preview posts one comment on the pull request and edits it on every push: a table of stacks with their result and why they ran, then each stack's resource changes. A push that selects nothing rewrites an earlier comment rather than adding one. A deploy comments its results on the pull requests the push merged. GitHub limits a comment to 65,536 characters, so a long report continues in further comments, split between stacks. Resource changes show types, names and changed property names, never values; a failed stack shows the error Pulumi printed. Pull requests from forks can't be commented on with the default token; the job summary has everything.
 

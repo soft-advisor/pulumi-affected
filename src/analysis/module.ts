@@ -34,6 +34,20 @@ export interface Item {
   refs: Ref[];
   /** Path expressions passed to file reads and Pulumi file assets/archives */
   assets: ts.Expression[];
+  /**
+   * Calls whose callee is a plain or member name, with their first argument: a call to any
+   * function of an imported file-system module reads a path (resolved once imports are known)
+   */
+  calls: { object?: string; name: string; argument: ts.Expression }[];
+  /**
+   * Values that look like paths: path-like properties (`context`, `dir`, …) and "./" or "../"
+   * strings. They count as inputs when they name something in the repository.
+   */
+  pathCandidates: ts.Expression[];
+  /** `require.resolve(...)` arguments: a path relative to the module, or a package */
+  resolved: ts.Expression[];
+  /** Other declarations of the same name (`var x` twice): using one uses all */
+  siblings: Item[];
   /** Name expressions of `new StackReference(...)` */
   stackReferences: ts.Expression[];
   /** Why this item can't be analysed precisely, e.g. a `require` with a computed path */
@@ -67,6 +81,11 @@ export interface ModuleInfo {
   itemsByName: Map<string, Item>;
   /** The transpiled source; kept for evaluating constants */
   source: ts.SourceFile;
+  /**
+   * The module's top-level sequence: "load <specifier>" for each import, then item keys, in source
+   * order. Import order and declaration order both change what runs first.
+   */
+  order: string[];
 }
 
 const ASSET_READERS = new Set([
@@ -77,7 +96,32 @@ const ASSET_READERS = new Set([
   'readdir',
   'FileAsset',
   'FileArchive',
+  'existsSync',
+  'statSync',
+  'lstatSync',
+  'readJson',
+  'readJsonSync',
+  'globSync',
+  'glob',
 ]);
+
+/** Properties whose string value is usually a path: Docker build contexts, archive folders, … */
+const PATH_PROPERTIES = new Set([
+  'context',
+  'dockerfile',
+  'path',
+  'dir',
+  'directory',
+  'location',
+  'cwd',
+  'source',
+  'root',
+  'file',
+  'filename',
+  'codePath',
+]);
+
+const RELATIVE_PATH = /^\.\.?\//;
 
 export function parseModule(path: string, text: string, options: ts.CompilerOptions): ModuleInfo {
   if (path.endsWith('.json')) return parseJsonModule(path, text);
@@ -94,7 +138,9 @@ export function parseModule(path: string, text: string, options: ts.CompilerOpti
       useDefineForClassFields:
         options.useDefineForClassFields ??
         (options.target ?? ts.ScriptTarget.ES5) >= ts.ScriptTarget.ES2022,
-      module: ts.ModuleKind.ESNext,
+      // ESM syntax stays as written, and `import x = require()` and `export =` become the
+      // require() and module.exports they are at runtime
+      module: ts.ModuleKind.Preserve,
       removeComments: true,
       sourceMap: false,
       inlineSourceMap: false,
@@ -120,12 +166,25 @@ export function parseModule(path: string, text: string, options: ts.CompilerOpti
     items: [],
     itemsByName: new Map(),
     source,
+    order: [],
   };
-  const anonymous = new Map<string, number>();
+  const keys = new Map<string, number>();
   const addItem = (item: Item) => {
     if (module.opaque) item.eager = true;
+    // `var x` declared twice is one variable: both declarations count wherever x is used
+    const seen = (keys.get(item.key) ?? 0) + 1;
+    keys.set(item.key, seen);
+    if (seen > 1) item.key = `${item.key}.${seen}`;
+    for (const name of item.names) {
+      const earlier = module.itemsByName.get(name);
+      if (earlier && earlier !== item) {
+        earlier.siblings.push(item);
+        item.siblings.push(earlier);
+      }
+      if (!earlier) module.itemsByName.set(name, item);
+    }
     module.items.push(item);
-    for (const name of item.names) module.itemsByName.set(name, item);
+    module.order.push(item.key);
   };
 
   for (const statement of source.statements) {
@@ -133,6 +192,7 @@ export function parseModule(path: string, text: string, options: ts.CompilerOpti
       const specifier = stringValue(statement.moduleSpecifier);
       if (specifier === undefined) continue;
       module.loads.push(specifier);
+      module.order.push(`load ${specifier}`);
       const clause = statement.importClause;
       if (clause?.name) module.imports.set(clause.name.text, { specifier, imported: 'default' });
       const bindings = clause?.namedBindings;
@@ -149,7 +209,10 @@ export function parseModule(path: string, text: string, options: ts.CompilerOpti
 
     if (ts.isExportDeclaration(statement)) {
       const specifier = statement.moduleSpecifier && stringValue(statement.moduleSpecifier);
-      if (specifier !== undefined) module.loads.push(specifier);
+      if (specifier !== undefined) {
+        module.loads.push(specifier);
+        module.order.push(`load ${specifier}`);
+      }
       const clause = statement.exportClause;
       if (!clause) {
         if (specifier !== undefined) module.starExports.push(specifier);
@@ -206,10 +269,7 @@ export function parseModule(path: string, text: string, options: ts.CompilerOpti
     // Keyed by content rather than position, so inserting a statement doesn't make every later
     // one look changed; the module's statement order is compared separately
     const item = makeItem('', [], true, statement);
-    const contentKey = `#${createHash('sha256').update(item.code).digest('hex').slice(0, 10)}`;
-    const occurrence = (anonymous.get(contentKey) ?? 0) + 1;
-    anonymous.set(contentKey, occurrence);
-    item.key = occurrence === 1 ? contentKey : `${contentKey}.${occurrence}`;
+    item.key = `#${createHash('sha256').update(item.code).digest('hex').slice(0, 10)}`;
     addItem(item);
   }
   return module;
@@ -223,6 +283,10 @@ function makeItem(key: string, names: string[], eager: boolean, node: ts.Node, p
     code: `${prefix} ${normalizeCode(node)}`.trim(),
     refs: [],
     assets: [],
+    calls: [],
+    pathCandidates: [],
+    resolved: [],
+    siblings: [],
     stackReferences: [],
     unanalysable: [],
   };
@@ -275,6 +339,9 @@ function collectRefs(root: ts.Node, item: Item, ownNames: Set<string>) {
   };
 
   function visit(node: ts.Node): void {
+    if (ts.isStringLiteralLike(node) && RELATIVE_PATH.test(node.text) && !isModuleSpecifier(node)) {
+      item.pathCandidates.push(node);
+    }
     if (ts.isIdentifier(node)) {
       addName(node.text);
       return;
@@ -302,6 +369,9 @@ function collectRefs(root: ts.Node, item: Item, ownNames: Set<string>) {
     }
     if (ts.isPropertyAssignment(node)) {
       visitPropertyName(node.name);
+      const property =
+        ts.isIdentifier(node.name) || ts.isStringLiteral(node.name) ? node.name.text : '';
+      if (PATH_PROPERTIES.has(property)) item.pathCandidates.push(node.initializer);
       visit(node.initializer);
       return;
     }
@@ -383,16 +453,59 @@ function inspectCall(node: ts.CallExpression | ts.NewExpression, item: Item) {
     return;
   }
 
+  // require.resolve("./file") names a file next to the module, or a package
+  const isRequireResolve =
+    ts.isPropertyAccessExpression(callee) &&
+    ts.isIdentifier(callee.expression) &&
+    callee.expression.text === 'require' &&
+    callee.name.text === 'resolve';
+  if (isRequireResolve && firstArgument) {
+    item.resolved.push(firstArgument);
+    return;
+  }
+
   const name = ts.isIdentifier(callee)
     ? callee.text
     : ts.isPropertyAccessExpression(callee)
       ? callee.name.text
       : undefined;
+  // Code built from strings, and requires made by createRequire, can't be followed
+  // Only the globals: `new aws.lambda.Function(...)` is a resource, not code from a string
+  const isGlobal = ts.isIdentifier(callee);
+  if (isGlobal && (name === 'eval' || name === 'Function')) {
+    item.unanalysable.push(
+      `${name === 'eval' ? 'eval()' : 'new Function()'} runs code that can't be analysed`,
+    );
+  }
+  if (name === 'createRequire') {
+    item.unanalysable.push("createRequire() makes requires that can't be followed");
+  }
   if (!name || !firstArgument) return;
   if (ASSET_READERS.has(name)) item.assets.push(firstArgument);
+  const object =
+    ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)
+      ? callee.expression.text
+      : undefined;
+  if (ts.isIdentifier(callee) || object !== undefined) {
+    item.calls.push({ object, name, argument: firstArgument });
+  }
   if (name === 'StackReference' && ts.isNewExpression(node)) {
     item.stackReferences.push(stackReferenceName(node) ?? firstArgument);
   }
+}
+
+/** A string that names a module to load rather than a file to read */
+function isModuleSpecifier(node: ts.Node) {
+  const parent = node.parent;
+  if (!parent || !ts.isCallExpression(parent) || parent.arguments[0] !== node) return false;
+  const callee = parent.expression;
+  if (callee.kind === ts.SyntaxKind.ImportKeyword) return true;
+  if (ts.isIdentifier(callee)) return callee.text === 'require';
+  return (
+    ts.isPropertyAccessExpression(callee) &&
+    ts.isIdentifier(callee.expression) &&
+    callee.expression.text === 'require'
+  );
 }
 
 /** `new StackReference(resourceName, { name })` refers to `name` when it's given */
@@ -465,10 +578,7 @@ export function isPure(node: ts.Expression): boolean {
   if (ts.isConditionalExpression(node)) {
     return isPure(node.condition) && isPure(node.whenTrue) && isPure(node.whenFalse);
   }
-  if (ts.isPropertyAccessExpression(node)) return isPure(node.expression);
-  if (ts.isElementAccessExpression(node)) {
-    return isPure(node.expression) && isPure(node.argumentExpression);
-  }
+  // Reading a property can run a getter, so it isn't pure
   return false;
 }
 
@@ -480,6 +590,10 @@ function isPureClass(node: ts.ClassLikeDeclaration) {
   }
   return node.members.every((member) => {
     if (ts.isClassStaticBlockDeclaration(member)) return false;
+    // Computed member names are evaluated when the class is defined
+    if (member.name && ts.isComputedPropertyName(member.name) && !isPure(member.name.expression)) {
+      return false;
+    }
     if (ts.canHaveDecorators(member) && ts.getDecorators(member)?.length) return false;
     const modifiers = ts.canHaveModifiers(member) ? ts.getModifiers(member) : undefined;
     const isStatic = modifiers?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword);
@@ -567,6 +681,10 @@ function parseJsonModule(path: string, text: string): ModuleInfo {
     code,
     refs: [],
     assets: [],
+    calls: [],
+    pathCandidates: [],
+    resolved: [],
+    siblings: [],
     stackReferences: [],
     unanalysable: [],
   };
@@ -580,5 +698,6 @@ function parseJsonModule(path: string, text: string): ModuleInfo {
     items: [item],
     itemsByName: new Map([['default', item]]),
     source,
+    order: ['default'],
   };
 }

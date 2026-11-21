@@ -21,15 +21,38 @@ export interface ProjectAnalysis {
   packages: Map<string, Set<string>>;
   stackReferences: { module: ModuleInfo; expression: ts.Expression }[];
   /**
-   * Why analysis may have missed inputs (a computed `require`, an unresolvable import, a file
-   * read whose path can't be worked out). Selection then falls back to watching every file in
-   * the project folder.
+   * Where analysis may have missed inputs (a computed `require`, an unresolvable import, a file
+   * read whose path can't be worked out). Selection then also counts any change in the project
+   * folder and in each gap's folder.
    */
-  gaps: string[];
+  gaps: Gap[];
   entry: string | undefined;
+  /** The folder Pulumi runs the program in: `main` when it's a folder, else the project's */
+  programDir: string;
   /** Finds constants in this snapshot's modules, for evaluating stack reference names */
   lookup: EvaluationContext['lookup'];
 }
+
+export interface Gap {
+  message: string;
+  /** The folder where whatever analysis couldn't see most likely lives */
+  dir: string;
+}
+
+/** Modules whose functions all take a path first */
+const FILE_SYSTEM_MODULES = new Set([
+  'fs',
+  'node:fs',
+  'fs/promises',
+  'node:fs/promises',
+  'fs-extra',
+  'glob',
+  'fast-glob',
+  'globby',
+  'tinyglobby',
+]);
+
+const GLOB_CHARACTERS = /[*?[{]/;
 
 /** Parsed modules shared across projects and snapshots, keyed by content and compiler options */
 export type ModuleCache = Map<string, ModuleInfo>;
@@ -61,6 +84,10 @@ const EMIT_OPTIONS = [
   'resolveJsonModule',
   'moduleSuffixes',
   'customConditions',
+  // These decide whether modules get "use strict"
+  'strict',
+  'alwaysStrict',
+  'noImplicitUseStrict',
 ] as const;
 
 export function analyzeProject(
@@ -68,16 +95,30 @@ export function analyzeProject(
   project: Project,
   cache: ModuleCache,
 ): ProjectAnalysis {
-  const resolver = new Resolver(snapshot, project.dir);
+  const runtimeTsconfig = stringOption(project, 'tsconfig');
+  const resolver = new Resolver(
+    snapshot,
+    project.dir,
+    runtimeTsconfig ? joinPath(project.dir, runtimeTsconfig) : undefined,
+  );
+  const programDir =
+    project.main && !snapshot.has(joinPath(project.dir, project.main))
+      ? joinPath(project.dir, project.main)
+      : project.dir;
   const analysis: ProjectAnalysis = {
     facts: new Map(),
     chains: new Map(),
     packages: new Map(),
     stackReferences: [],
     gaps: [],
-    entry: findEntry(snapshot, project, resolver),
+    entry: findEntry(snapshot, project, programDir, resolver),
+    programDir,
     lookup: () => undefined,
   };
+  const addGap = (message: string, dir: string) => analysis.gaps.push({ message, dir });
+  for (const extendsPackage of resolver.configPackages) {
+    addPackageReference(extendsPackage, resolver.tsconfig ?? project.file);
+  }
   const facts = analysis.facts;
   const optionsKey = JSON.stringify(pick(resolver.options, EMIT_OPTIONS));
   facts.set('compilerOptions', optionsKey);
@@ -85,7 +126,7 @@ export function analyzeProject(
   recordManifestFact(snapshot, project, facts);
 
   if (!analysis.entry) {
-    analysis.gaps.push('no entry file found');
+    addGap('no entry file found', programDir);
     return analysis;
   }
 
@@ -110,11 +151,7 @@ export function analyzeProject(
     return module;
   };
 
-  const addPackage = (name: string, from: string) => {
-    const files = analysis.packages.get(name) ?? new Set();
-    files.add(from);
-    analysis.packages.set(name, files);
-  };
+  const addPackage = addPackageReference;
 
   /** Resolves a specifier; returns the module file, or undefined for packages and builtins */
   const follow = (specifier: string, from: string) => {
@@ -122,7 +159,7 @@ export function analyzeProject(
     if (resolution.kind === 'file') return resolution.path;
     if (resolution.kind === 'package') addPackage(resolution.name, from);
     if (resolution.kind === 'unresolved') {
-      analysis.gaps.push(`${from}: can't resolve "${specifier}"`);
+      addGap(`${from}: can't resolve "${specifier}"`, resolution.dir ?? dirnameOf(from));
     }
     return undefined;
   };
@@ -134,7 +171,7 @@ export function analyzeProject(
     analysis.chains.set(path, [...parentChain, path]);
     const module = getModule(path);
     if (!module) {
-      analysis.gaps.push(`${path} is imported but missing`);
+      addGap(`${path} is imported but missing`, dirnameOf(path));
       return;
     }
     for (const specifier of module.loads) {
@@ -142,13 +179,6 @@ export function analyzeProject(
       if (target) markLoaded(target, path);
     }
     for (const item of module.items) if (item.eager) markItem(module, item);
-    facts.set(
-      `order:${path}`,
-      module.items
-        .filter((item) => item.eager)
-        .map((item) => item.key)
-        .join(' '),
-    );
   };
 
   const markWhole = (path: string, from: string) => {
@@ -161,7 +191,9 @@ export function analyzeProject(
     if (reachable.has(item)) return;
     reachable.add(item);
     facts.set(`code:${module.path}#${item.key}`, item.code);
-    for (const reason of item.unanalysable) analysis.gaps.push(`${module.path}: ${reason}`);
+    for (const sibling of item.siblings) markItem(module, sibling);
+    for (const reason of item.unanalysable)
+      addGap(`${module.path}: ${reason}`, dirnameOf(module.path));
     for (const ref of item.refs) {
       if (ref.kind === 'module') {
         const target = follow(ref.specifier, module.path);
@@ -180,7 +212,12 @@ export function analyzeProject(
         binding.imported === '*' && ref.kind === 'member' ? ref.property : binding.imported;
       markImport(module.path, binding.specifier, imported);
     }
-    for (const asset of item.assets) recordAsset(module, asset);
+    for (const asset of item.assets) recordPath(module, asset, 'read');
+    for (const call of item.calls) {
+      if (readsThroughFileSystemModule(module, call)) recordPath(module, call.argument, 'read');
+    }
+    for (const candidate of item.pathCandidates) recordPath(module, candidate, 'candidate');
+    for (const expression of item.resolved) recordResolved(module, expression);
     for (const expression of item.stackReferences) {
       analysis.stackReferences.push({ module, expression });
     }
@@ -240,44 +277,181 @@ export function analyzeProject(
     });
   analysis.lookup = lookup;
 
-  const recordAsset = (module: ModuleInfo, expression: ts.Expression) => {
+  /**
+   * Records a path the program uses. A `read` must be worked out, or it's a gap; a `candidate`
+   * (a path-like value) counts only if it names something in the repository.
+   */
+  const recordPath = (
+    module: ModuleInfo,
+    expression: ts.Expression,
+    kind: 'read' | 'candidate',
+  ) => {
     const value = evaluateString(expression, module, { lookup, unknown: undefined });
     if (value === undefined) {
-      analysis.gaps.push(`${module.path}: a file is read from a path that can't be worked out`);
+      if (kind === 'read') {
+        addGap(
+          `${module.path}: a file is read from a path that can't be worked out`,
+          dirnameOf(module.path),
+        );
+      }
       return;
     }
-    const programDir = dirnameOf(analysis.entry as string);
-    const candidates = value.startsWith(MODULE_DIR)
-      ? [joinPath(dirnameOf(module.path), value.slice(MODULE_DIR.length))]
-      : value.startsWith(WORKING_DIR)
-        ? [joinPath(project.dir, value.slice(WORKING_DIR.length))]
-        : value.startsWith('/')
-          ? []
-          : [joinPath(project.dir, value), joinPath(programDir, value)];
-    if (candidates.length === 0) {
-      analysis.gaps.push(`${module.path}: reads absolute path ${value}`);
+    // A glob reads everything under its fixed part
+    const globAt = value.search(GLOB_CHARACTERS);
+    const path = globAt === -1 ? value : value.slice(0, value.lastIndexOf('/', globAt) + 1);
+    const candidates = pathCandidates(path, module.path, kind);
+    if (candidates === undefined) {
+      if (kind === 'read')
+        addGap(`${module.path}: reads absolute path ${value}`, dirnameOf(module.path));
       return;
     }
     for (const candidate of candidates) {
-      if (snapshot.isDirectory(candidate)) {
-        for (const file of snapshot.paths) {
-          if (isInside(file, candidate)) facts.set(`asset:${file}`, snapshot.hash(file) ?? '');
-        }
-        return;
-      }
-      if (snapshot.has(candidate)) {
-        facts.set(`asset:${candidate}`, snapshot.hash(candidate) ?? '');
-        return;
-      }
+      if (recordExisting(candidate)) return;
     }
-    // Missing in this snapshot; it may exist in the other one
-    facts.set(`asset:${candidates[0]}`, '(missing)');
+    if (kind === 'read') {
+      // Missing in this snapshot: perhaps build output that isn't committed, built from sources
+      // near it, or a file the other snapshot has
+      facts.set(`asset:${candidates[0]}`, '(missing)');
+      addGap(
+        `${module.path}: reads ${candidates[0]}, which isn't in the repository (build output?)`,
+        existingAncestor(candidates[0]),
+      );
+    }
+  };
+
+  const pathCandidates = (value: string, modulePath: string, kind: 'read' | 'candidate') => {
+    if (value.startsWith(MODULE_DIR))
+      return [joinPath(dirnameOf(modulePath), value.slice(MODULE_DIR.length))];
+    if (value.startsWith(WORKING_DIR))
+      return [joinPath(programDir, value.slice(WORKING_DIR.length))];
+    if (value.startsWith('/')) return undefined;
+    const list = [joinPath(programDir, value), joinPath(project.dir, value)];
+    // A path-like value may also be relative to the module that holds it
+    if (kind === 'candidate') list.push(joinPath(dirnameOf(modulePath), value));
+    // The whole repository is never one input
+    return [...new Set(list)].filter((candidate) => candidate !== '');
+  };
+
+  const recordExisting = (candidate: string) => {
+    if (snapshot.isDirectory(candidate)) {
+      // Through any links, so a linked folder's files count
+      const real = snapshot.realPath(candidate) ?? candidate;
+      for (const file of snapshot.paths) {
+        if (isInside(file, real)) facts.set(`asset:${file}`, snapshot.hash(file) ?? '');
+      }
+      return true;
+    }
+    if (snapshot.has(candidate)) {
+      facts.set(`asset:${candidate}`, snapshot.hash(candidate) ?? '');
+      return true;
+    }
+    return false;
+  };
+
+  const existingAncestor = (path: string) => {
+    let current = dirnameOf(path);
+    while (current !== '' && !snapshot.isDirectory(current)) current = dirnameOf(current);
+    return current === '' ? project.dir : current;
+  };
+
+  /** require.resolve("./file") is a file next to the module; require.resolve("pkg") a package */
+  const recordResolved = (module: ModuleInfo, expression: ts.Expression) => {
+    const value = evaluateString(expression, module, { lookup, unknown: undefined });
+    if (value === undefined) {
+      addGap(`${module.path}: require.resolve() with a computed path`, dirnameOf(module.path));
+    } else if (value.startsWith('.') || value.startsWith(MODULE_DIR)) {
+      const relative = value.startsWith(MODULE_DIR) ? value.slice(MODULE_DIR.length) : value;
+      const path = joinPath(dirnameOf(module.path), relative);
+      if (!recordExisting(path)) {
+        addGap(
+          `${module.path}: resolves ${path}, which isn't in the repository`,
+          existingAncestor(path),
+        );
+      }
+    } else if (!value.startsWith('/')) {
+      follow(value, module.path);
+    }
+  };
+
+  /** fs.readFileSync(p), readFile(p) imported from fs, glob(p), fse.readJson(p), … */
+  const readsThroughFileSystemModule = (
+    module: ModuleInfo,
+    call: { object?: string; name: string },
+  ) => {
+    const binding = module.imports.get(call.object ?? call.name);
+    return binding !== undefined && FILE_SYSTEM_MODULES.has(binding.specifier);
   };
 
   markLoaded(analysis.entry, undefined);
   // A program's exports are its stack outputs, so they matter even if nothing uses them
   markExport(analysis.entry, '*');
+  for (const preload of nodeargsFiles(project)) {
+    // Node loads these before the program: `-r ./setup.js`, `--import ./register.mjs`
+    if (preload.kind === 'env-file') {
+      if (!recordExisting(joinPath(programDir, preload.path))) {
+        addGap(`nodeargs reads ${preload.path}, which isn't in the repository`, programDir);
+      }
+    } else if (/^\.\.?\//.test(preload.path)) {
+      const file = resolver.findSource(joinPath(programDir, preload.path));
+      if (file) markLoaded(file, undefined);
+      else addGap(`nodeargs loads ${preload.path}, which can't be found`, programDir);
+    } else {
+      addPackage(packageNameOf(preload.path), project.file);
+    }
+  }
+  // dotenv reads .env from the working directory
+  if (analysis.packages.has('dotenv')) recordExisting(joinPath(programDir, '.env'));
+
+  // Statement order matters: imports run in order, and a `var` used before its assignment is
+  // undefined. Only loads and reachable statements count, so moving unused code changes nothing.
+  for (const path of loaded) {
+    const module = modules.get(path);
+    if (!module) continue;
+    const reachableKeys = new Set(
+      module.items.filter((item) => reachable.has(item)).map((item) => item.key),
+    );
+    const order = module.order.filter(
+      (entry) => entry.startsWith('load ') || reachableKeys.has(entry),
+    );
+    facts.set(`order:${path}`, order.join(' '));
+  }
   return analysis;
+
+  function addPackageReference(name: string, from: string) {
+    const files = analysis.packages.get(name) ?? new Set();
+    files.add(from);
+    analysis.packages.set(name, files);
+  }
+}
+
+function stringOption(project: Project, name: string) {
+  const value = project.runtimeOptions[name];
+  return typeof value === 'string' ? value : undefined;
+}
+
+/** Files and packages named by `runtime.options.nodeargs` */
+function nodeargsFiles(project: Project) {
+  const nodeargs = stringOption(project, 'nodeargs') ?? '';
+  const tokens = nodeargs.split(/\s+/).filter(Boolean);
+  const files: { kind: 'module' | 'env-file'; path: string }[] = [];
+  const modules = ['--require', '-r', '--import', '--loader', '--experimental-loader'];
+  for (let index = 0; index < tokens.length; index++) {
+    const [flag, inline] = tokens[index].split(/=(.*)/s);
+    const value = inline ?? tokens[index + 1];
+    if (modules.includes(flag) && value) {
+      files.push({ kind: 'module', path: value });
+      if (inline === undefined) index++;
+    } else if (flag === '--env-file' && value) {
+      files.push({ kind: 'env-file', path: value });
+      if (inline === undefined) index++;
+    }
+  }
+  return files;
+}
+
+function packageNameOf(specifier: string) {
+  const parts = specifier.split('/');
+  return specifier.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0];
 }
 
 /** Finds the initializer of a top-level constant, following imports to where it's declared */
@@ -311,17 +485,21 @@ function lookupConstant(
 }
 
 /**
- * Pulumi runs `main` from Pulumi.yaml (a file, or a folder with a package.json or index file),
- * or else the project folder's package.json `main`, or else its index file.
+ * What Pulumi runs: `main` from Pulumi.yaml when it's a file. Otherwise, in the program folder
+ * (`main` when it's a folder, else the project folder), the `main` of the nearest package.json
+ * (resolved from that package.json's folder), or else the folder's index file.
  */
-function findEntry(snapshot: Snapshot, project: Project, resolver: Resolver) {
-  const programDir = project.main ? joinPath(project.dir, project.main) : project.dir;
-  if (project.main && snapshot.has(programDir)) return programDir;
-  const manifest = parseJson(snapshot.read(joinPath(programDir, 'package.json')));
-  if (typeof manifest?.main === 'string') {
-    const main = joinPath(programDir, manifest.main);
+function findEntry(snapshot: Snapshot, project: Project, programDir: string, resolver: Resolver) {
+  if (project.main && snapshot.has(joinPath(project.dir, project.main))) {
+    return joinPath(project.dir, project.main);
+  }
+  const manifestPath = findUp(snapshot, programDir, 'package.json');
+  const manifest = manifestPath ? parseJson(snapshot.read(manifestPath)) : undefined;
+  if (manifestPath && typeof manifest?.main === 'string') {
+    const main = joinPath(dirnameOf(manifestPath), manifest.main);
     const found =
       resolver.findSource(main) ??
+      resolver.findSource(resolver.sourceForOutput(main) ?? main) ??
       resolver.findSource(main.replace(/(^|\/)(dist|lib|build|out|bin)\//, '$1'));
     if (found) return found;
   }

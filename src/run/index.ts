@@ -3,7 +3,7 @@ import type { DependencyGraph } from '../graph.ts';
 import { discoverProjects } from '../projects.ts';
 import { type Request, type SelectResult, select } from '../select.ts';
 import { ensureCommit, GitSnapshot, repoRootOf, resolveCommit } from '../snapshot.ts';
-import { commandRunner, lastDeployedCommit } from './pulumi.ts';
+import { commandRunner, deployHistory } from './pulumi.ts';
 import { mapConcurrently, type Mode, runStacks, type StackRun } from './runner.ts';
 
 export interface RunCommandOptions {
@@ -51,20 +51,29 @@ export async function runCommand(options: RunCommandOptions): Promise<RunCommand
   const allStacks = discoverProjects(head, config).flatMap((project) => project.stacks);
 
   let bases: Record<string, string | null> | undefined;
+  const reasons: Record<string, string> = {};
   if (options.mode === 'up') {
     bases = {};
-    const commits = await mapConcurrently(allStacks, concurrency, (stack) =>
-      lastDeployedCommit(runner, stack),
+    const histories = await mapConcurrently(allStacks, concurrency, (stack) =>
+      deployHistory(runner, stack),
     );
     allStacks.forEach((stack, index) => {
-      const commit = commits[index];
-      if (commit === null) (bases as Record<string, string | null>)[stack.id] = null;
-      else if (commit && ensureCommit(repoRoot, commit)) {
-        (bases as Record<string, string | null>)[stack.id] = commit;
-      } else if (commit) {
-        options.onWarning?.(
-          `${stack.id} was last deployed from ${commit}, which isn't in this checkout; comparing with ${options.base} instead`,
-        );
+      const history = histories[index];
+      const stackBases = bases as Record<string, string | null>;
+      if (history.kind === 'never') {
+        stackBases[stack.id] = null;
+      } else if (history.kind === 'unknown') {
+        reasons[stack.id] = history.why;
+      } else if (ensureCommit(repoRoot, history.sha)) {
+        stackBases[stack.id] = history.sha;
+        if (history.lastFailed) reasons[stack.id] = 'its last deploy failed';
+        if (history.dirty && !history.lastFailed) {
+          options.onWarning?.(
+            `${stack.id} was last deployed from ${history.sha.slice(0, 7)} with uncommitted changes; anything never committed isn't compared`,
+          );
+        }
+      } else {
+        reasons[stack.id] = `its last deploy was from ${history.sha}, which isn't in this checkout`;
       }
     });
   }
@@ -79,6 +88,7 @@ export async function runCommand(options: RunCommandOptions): Promise<RunCommand
     all: options.all,
     messages: options.messages,
     requests: options.requests,
+    reasons,
     config,
   });
   const graph: DependencyGraph = new Map(

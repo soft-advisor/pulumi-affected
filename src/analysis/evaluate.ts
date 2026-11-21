@@ -69,6 +69,8 @@ export function evaluateString(
 
   if (ts.isIdentifier(node)) {
     if (node.text === '__dirname') return MODULE_DIR;
+    // A parameter or local variable can hold anything; only module-level constants are known
+    if (isLocallyBound(node)) return unknown;
     const target = context.lookup(module, node.text);
     return target ? evaluateString(target.node, target.module, context, depth + 1) : unknown;
   }
@@ -163,6 +165,62 @@ function evaluateConfigRead(
     ? evaluateString(namespaceArgument, receiverModule, { ...context, unknown: undefined })
     : context.project;
   return namespace === undefined ? undefined : context.config(namespace, key);
+}
+
+/** True when the name refers to a parameter or variable of an enclosing function or block */
+function isLocallyBound(identifier: ts.Identifier) {
+  const name = identifier.text;
+  for (
+    let node: ts.Node | undefined = identifier.parent;
+    node && !ts.isSourceFile(node);
+    node = node.parent
+  ) {
+    if (ts.isFunctionLike(node)) {
+      if (node.parameters.some((parameter) => bindsName(parameter.name, name))) return true;
+    }
+    if (
+      ts.isCatchClause(node) &&
+      node.variableDeclaration &&
+      bindsName(node.variableDeclaration.name, name)
+    ) {
+      return true;
+    }
+    if (
+      (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) &&
+      node.initializer &&
+      ts.isVariableDeclarationList(node.initializer) &&
+      node.initializer.declarations.some((declaration) => bindsName(declaration.name, name))
+    ) {
+      return true;
+    }
+    if (
+      ts.isBlock(node) ||
+      ts.isModuleBlock(node) ||
+      ts.isCaseClause(node) ||
+      ts.isDefaultClause(node)
+    ) {
+      for (const statement of node.statements) {
+        if (ts.isVariableStatement(statement)) {
+          const declarations = statement.declarationList.declarations;
+          if (declarations.some((declaration) => bindsName(declaration.name, name))) return true;
+        }
+        if (
+          (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+          statement.name?.text === name
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function bindsName(binding: ts.BindingName, name: string): boolean {
+  if (ts.isIdentifier(binding)) return binding.text === name;
+  return binding.elements.some(
+    (element) => !ts.isOmittedExpression(element) && bindsName(element.name, name),
+  );
 }
 
 function calleeName(callee: ts.Expression) {
