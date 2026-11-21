@@ -75,12 +75,18 @@ export async function applyPlans(options: ApplyOptions): Promise<ApplyResult> {
       `The plans are for tree ${manifest.tree}, but the checkout is ${tree}; check out the planned code or plan again`,
     );
   }
-  const modified = git(repoRoot, ['status', '--porcelain', '--untracked-files=no']).trim();
-  if (modified)
-    throw new ApplyError(`The checkout has changes the plans weren't made from:\n${modified}`);
-
   // The manifest's stacks must be ones this code defines, in the folders it defines them in
   const { stacks: known } = readDependencyGraph({ cwd: repoRoot });
+  // Pulumi itself writes encryption salts into stack config files, so those may differ
+  const configFiles = new Set(known.map((stack) => stack.configFile));
+  const modified = git(repoRoot, ['diff', '--name-only', '-z', 'HEAD'])
+    .split('\0')
+    .filter((path) => path && !configFiles.has(path));
+  if (modified.length > 0) {
+    throw new ApplyError(
+      `The checkout has changes the plans weren't made from: ${modified.join(', ')}`,
+    );
+  }
   const byId = new Map(known.map((stack) => [stack.id, stack]));
   for (const stack of manifest.stacks) {
     const match = byId.get(stack.id);

@@ -165,7 +165,8 @@ describe('plan and apply', { skip: !hasPulumi && 'pulumi is not installed' }, ()
     const prod = manifest.stacks.find((stack) => stack.id === 'words/prod');
     assert.equal(prod?.created, true);
     assert.equal(prod?.state.kind, 'exists');
-    run(dir, 'git', ['checkout', '-q', '--', '.']);
+    // Pulumi wrote an encryption salt into the config file; that doesn't stop applying
+    assert.notEqual(run(dir, 'git', ['status', '--porcelain']), '');
     const result = await applyPlans({ cwd: dir, directory: plans, runner, concurrency: 1 });
     assert.deepEqual(
       result.stacks.filter((stack) => stack.id === 'words/prod'),
