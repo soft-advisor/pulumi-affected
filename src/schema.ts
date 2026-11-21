@@ -98,37 +98,6 @@ export const configSchema = {
         },
       },
     },
-    run: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        command: {
-          description:
-            'How to run Pulumi for a stack; the run action appends preview or up arguments. Placeholders: {dir}, {stack}, {project}, {id}. Default: pulumi --cwd {dir} --stack {stack}',
-          type: 'string',
-        },
-        concurrency: {
-          description: 'How many stacks run at once. Default: 4',
-          type: 'integer',
-          minimum: 1,
-        },
-        newStacks: {
-          description:
-            "Stacks that don't exist yet: preview them in a temporary local backend, where StackReferences, ESC environments and the real backend's secrets aren't available, or skip them. Default: preview",
-          enum: ['preview', 'skip'],
-        },
-        createStacks: {
-          description:
-            "Whether deploys create stacks that don't exist yet. Default: true; a stack whose config already has an encryption salt or key is never created again, since that points at the wrong backend.",
-          type: 'boolean',
-        },
-        failFast: {
-          description:
-            'Stop starting stacks after the first failure. Default: false, which keeps going and fails at the end',
-          type: 'boolean',
-        },
-      },
-    },
     packages: {
       type: 'object',
       additionalProperties: false,

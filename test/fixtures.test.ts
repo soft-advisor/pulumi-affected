@@ -14,8 +14,10 @@ const E2E = join(import.meta.dirname, '../e2e');
 interface Scenario {
   name: string;
   changes: Files;
-  body?: string;
+  /** The commit message of the change, for Pulumi-Affected-Run/Skip lines */
+  message?: string;
   expected: string[];
+  skipped?: string[];
   waves?: string[][];
 }
 
@@ -35,10 +37,12 @@ const scenarios: Scenario[] = JSON.parse(readFileSync(join(E2E, 'scenarios.json'
 
 for (const scenario of scenarios) {
   test(`scenario: ${scenario.name}`, () => {
-    const result = selectChange(fixtures, scenario.changes, {
-      messages: scenario.body ? [scenario.body] : [],
-    });
+    const result = selectChange(fixtures, scenario.changes, { message: scenario.message });
     assert.deepEqual(selectedIds(result), scenario.expected);
+    assert.deepEqual(
+      result.skipped.map((skip) => skip.id),
+      scenario.skipped ?? [],
+    );
     if (scenario.waves) assert.deepEqual(result.waves, scenario.waves);
     assert.deepEqual(result.warnings, []);
   });

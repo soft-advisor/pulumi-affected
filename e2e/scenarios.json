@@ -5,13 +5,8 @@
       "org/lib/naming.ts": "export function accountName(alias: string) {\n  return `acme-${alias}`;\n}\n\nexport function zoneName(domain: string) {\n  return `${domain.toLowerCase()}.`;\n}\n"
     },
     "expected": ["fixture-dns/prod"],
-    "deployed": ["fixture-dns/prod"],
-    "previewStatuses": {
-      "fixture-dns/prod": "no-changes"
-    },
-    "deployStatuses": {
-      "fixture-dns/prod": "changes"
-    }
+    "changed": [],
+    "applied": []
   },
   {
     "name": "shared function used by a multi-stack project",
@@ -19,22 +14,8 @@
       "org/lib/naming.ts": "export function accountName(alias: string) {\n  return `acme-co-${alias}`;\n}\n\nexport function zoneName(domain: string) {\n  return domain.toLowerCase();\n}\n"
     },
     "expected": ["fixture-accounts/business", "fixture-accounts/shop"],
-    "deployed": [
-      "fixture-access/prod",
-      "fixture-accounts/business",
-      "fixture-accounts/shop",
-      "fixture-dns/prod"
-    ],
-    "previewStatuses": {
-      "fixture-accounts/business": "changes",
-      "fixture-accounts/shop": "changes"
-    },
-    "deployStatuses": {
-      "fixture-access/prod": "changes",
-      "fixture-accounts/business": "changes",
-      "fixture-accounts/shop": "changes",
-      "fixture-dns/prod": "changes"
-    }
+    "changed": ["fixture-accounts/business", "fixture-accounts/shop"],
+    "applied": ["fixture-accounts/business", "fixture-accounts/shop"]
   },
   {
     "name": "comment-only change",
@@ -42,7 +23,8 @@
       "org/lib/naming.ts": "/** Account names are prefixed with the company */\nexport function accountName(alias: string): string {\n  return `acme-${alias}`;\n}\n\nexport function zoneName(domain: string): string {\n  return domain.toLowerCase();\n}\n"
     },
     "expected": [],
-    "deployed": []
+    "changed": [],
+    "applied": []
   },
   {
     "name": "one stack's config",
@@ -50,14 +32,8 @@
       "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
     },
     "expected": ["fixture-accounts/shop"],
-    "deployed": ["fixture-access/prod", "fixture-accounts/shop"],
-    "previewStatuses": {
-      "fixture-accounts/shop": "changes"
-    },
-    "deployStatuses": {
-      "fixture-accounts/shop": "changes",
-      "fixture-access/prod": "changes"
-    }
+    "changed": ["fixture-accounts/shop"],
+    "applied": ["fixture-accounts/shop"]
   },
   {
     "name": "file read by the program",
@@ -65,12 +41,9 @@
       "site/site/index.html": "<h1>Hello, world</h1>\n"
     },
     "expected": ["fixture-site/dev", "fixture-site/prod"],
-    "waves": [["fixture-site/dev"], ["fixture-site/prod"]],
-    "deployed": ["fixture-site/dev", "fixture-site/prod"],
-    "deployStatuses": {
-      "fixture-site/dev": "changes",
-      "fixture-site/prod": "changes"
-    }
+    "changed": [],
+    "applied": [],
+    "waves": [["fixture-site/dev"], ["fixture-site/prod"]]
   },
   {
     "name": "docs only",
@@ -78,20 +51,16 @@
       "site/README.md": "# Site\n"
     },
     "expected": [],
-    "deployed": []
+    "changed": [],
+    "applied": []
   },
   {
-    "name": "requested in the pull request description",
+    "name": "requested in a commit message",
     "changes": {},
-    "body": "Checking for drift.\n\nPulumi-Affected-Run: fixture-dns/prod\n",
     "expected": ["fixture-dns/prod"],
-    "deployed": ["fixture-dns/prod"],
-    "previewStatuses": {
-      "fixture-dns/prod": "no-changes"
-    },
-    "deployStatuses": {
-      "fixture-dns/prod": "no-changes"
-    }
+    "message": "Check dns\n\nPulumi-Affected-Run: fixture-dns/prod\n",
+    "changed": [],
+    "applied": []
   },
   {
     "name": "a stack that fails",
@@ -99,15 +68,9 @@
       "org/accounts/index.ts": "import * as pulumi from '@pulumi/pulumi';\nimport * as random from '@pulumi/random';\nimport { accountName } from '../lib/naming';\n\nconst config = new pulumi.Config();\nconst name = accountName(config.require('alias'));\nif (config.require('alias') === 'shop') throw new Error('broken on purpose');\n\nexport const accountId = new random.RandomInteger(name, { min: 100000, max: 999999 }).result;\n"
     },
     "expected": ["fixture-accounts/business", "fixture-accounts/shop"],
-    "deployed": ["fixture-accounts/business", "fixture-accounts/shop"],
-    "previewStatuses": {
-      "fixture-accounts/business": "no-changes",
-      "fixture-accounts/shop": "failed"
-    },
-    "deployStatuses": {
-      "fixture-accounts/business": "no-changes",
-      "fixture-accounts/shop": "failed"
-    }
+    "failing": ["fixture-accounts/shop"],
+    "changed": [],
+    "applied": []
   },
   {
     "name": "a new stack",
@@ -115,70 +78,28 @@
       "org/accounts/Pulumi.newco.yaml": "config:\n  fixture-accounts:alias: newco\n"
     },
     "expected": ["fixture-accounts/newco"],
-    "deployed": ["fixture-access/prod", "fixture-accounts/newco"],
-    "previewStatuses": {
-      "fixture-accounts/newco": "changes"
-    },
-    "deployStatuses": {
-      "fixture-accounts/newco": "changes",
-      "fixture-access/prod": "no-changes"
-    }
-  },
-  {
-    "name": "a command from someone without write access",
-    "changes": {
-      "site/README.md": "# Site\n"
-    },
-    "comment": "/pulumi-affected preview fixture-site/dev",
-    "expectReply": true,
-    "expected": [],
-    "deployed": []
-  },
-  {
-    "name": "a second push edits the preview comment",
-    "changes": {
-      "org/lib/naming.ts": "export function accountName(alias: string) {\n  return `acme-${alias}`;\n}\n\nexport function zoneName(domain: string) {\n  return `${domain.toLowerCase()}.`;\n}\n"
-    },
-    "expected": ["fixture-dns/prod"],
-    "second": {
-      "site/site/index.html": "<h1>Hello again</h1>\n"
-    },
-    "secondExpected": ["fixture-dns/prod", "fixture-site/dev", "fixture-site/prod"],
-    "deployed": ["fixture-dns/prod", "fixture-site/dev", "fixture-site/prod"],
-    "deployStatuses": {
-      "fixture-dns/prod": "changes",
-      "fixture-site/dev": "changes",
-      "fixture-site/prod": "changes"
-    }
+    "changed": ["fixture-accounts/newco"],
+    "applied": ["fixture-accounts/newco"]
   },
   {
     "name": "a wrapper that prints before Pulumi does",
-    "command": "echo 'Assuming role {deploy} for {stack}'; pulumi --cwd {dir} --stack {stack}",
     "changes": {
       "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
     },
     "expected": ["fixture-accounts/shop"],
-    "previewStatuses": {
-      "fixture-accounts/shop": "changes"
-    },
-    "deployed": ["fixture-access/prod", "fixture-accounts/shop"],
-    "deployStatuses": {
-      "fixture-accounts/shop": "changes",
-      "fixture-access/prod": "changes"
-    }
+    "banner": "Assuming role {deploy}",
+    "changed": ["fixture-accounts/shop"],
+    "applied": ["fixture-accounts/shop"]
   },
   {
-    "name": "a skip in the description holds back the preview, not the deploy",
+    "name": "a skip in a commit message",
     "changes": {
       "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
     },
-    "body": "Skipping the preview on purpose.\n\nPulumi-Affected-Skip: fixture-accounts/shop\n",
     "expected": [],
-    "deployed": ["fixture-access/prod", "fixture-accounts/shop"],
-    "deployStatuses": {
-      "fixture-accounts/shop": "changes",
-      "fixture-access/prod": "changes"
-    },
-    "expectSkipped": ["fixture-accounts/shop"]
+    "message": "Not yet\n\nPulumi-Affected-Skip: fixture-accounts/shop\n",
+    "skipped": ["fixture-accounts/shop"],
+    "changed": [],
+    "applied": []
   }
 ]

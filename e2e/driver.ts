@@ -1,41 +1,40 @@
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, cpSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 /*
- * Drives the end-to-end test of one scenario in this repository, as the e2e workflow's steps:
+ * Drives the end-to-end test of one scenario in this repository, as the e2e workflow's steps.
+ * The workflow between them is the example from the README: select on the pull request, preview
+ * the selected stacks with --save-plan, keep only the plans with changes, and after merge apply
+ * exactly those plans.
  *
- *   prepare  copies e2e/fixtures into a repository of its own, deploys every stack, pushes it as
- *            a throwaway base branch, pushes the scenario's change as a second branch, and opens
- *            a draft pull request between them
- *   assert-preview / assert-deploy  check what the run action did, and its comments
- *   merge    squash-merges the pull request and checks out the result
- *   cleanup  closes the pull request and deletes both branches
- *
- * Pull requests opened with GITHUB_TOKEN don't trigger workflows, so the workflow calls the run
- * action itself, naming the pull request with the `pull-request` input.
+ *   prepare        copies e2e/fixtures into a repository of its own, deploys every stack, pushes
+ *                  it as a throwaway base branch, pushes the scenario's change as a second branch,
+ *                  and opens a draft pull request between them
+ *   assert-select  checks the selection
+ *   assert-plans   checks which stacks previewed with changes, or failed
+ *   merge          squash-merges the pull request and checks out the result
+ *   assert-apply   checks which plans were applied
+ *   cleanup        closes the pull request and deletes both branches
  */
 
 interface Scenario {
   name: string;
   changes: Record<string, string | null>;
-  body?: string;
-  /** A comment posted on the pull request before the preview, as the workflow's bot */
-  comment?: string;
-  /** The comment is a command from someone without write access, so it gets a reply */
-  expectReply?: boolean;
+  /** The change's commit message, for Pulumi-Affected-Run/Skip lines */
+  message?: string;
+  /** Stacks selected */
   expected: string[];
-  /** Status per stack in the preview, when it matters (changes, no-changes, failed) */
-  previewStatuses?: Record<string, string>;
-  /** Pushed after the first preview, to check the comment is edited, not duplicated */
-  second?: Record<string, string | null>;
-  secondExpected?: string[];
-  deployed: string[];
-  deployStatuses?: Record<string, string>;
-  /** Stacks the preview must show as skipped */
-  expectSkipped?: string[];
-  /** run.command for the action, e.g. a wrapper that prints a banner first */
-  command?: string;
+  /** Stacks a Pulumi-Affected-Skip line left out */
+  skipped?: string[];
+  /** Selected stacks whose preview fails */
+  failing?: string[];
+  /** Selected stacks whose preview has changes, so whose plan is kept */
+  changed: string[];
+  /** Stacks whose plan is applied after merge */
+  applied: string[];
+  /** A line printed before Pulumi's output, like a wrapper's banner */
+  banner?: string;
 }
 
 const E2E = import.meta.dirname;
@@ -125,25 +124,32 @@ function prepare(index: number, dir: string) {
   commitAll(dir, 'Fixtures');
   sh(dir, 'npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund']);
 
-  // Every stack starts deployed, as in a real repository
-  const deploy = sh(dir, 'node', [
-    join(TOOL, 'src/cli.ts'),
-    'run',
-    '--mode',
-    'up',
-    '--base',
-    'HEAD',
-    '--all',
-  ]);
-  const failed = (JSON.parse(deploy) as { status: string }[]).filter(
-    (run) => run.status === 'failed',
-  );
-  if (failed.length > 0) throw new Error(`The initial deploy failed: ${deploy}`);
+  // Every stack starts deployed, in dependency order, as in a real repository
+  const all = JSON.parse(
+    sh(dir, 'node', [join(TOOL, 'src/cli.ts'), 'select', '--base', 'HEAD', '--all']),
+  ) as { waves: string[][]; stacks: { id: string; dir: string; stack: string }[] };
+  for (const wave of all.waves) {
+    for (const id of wave) {
+      const stack = all.stacks.find((candidate) => candidate.id === id);
+      if (!stack) continue;
+      sh(dir, 'pulumi', ['--cwd', stack.dir, 'stack', 'init', stack.stack, '--non-interactive']);
+      sh(dir, 'pulumi', [
+        '--cwd',
+        stack.dir,
+        '--stack',
+        stack.stack,
+        'up',
+        '--yes',
+        '--non-interactive',
+        '--skip-preview',
+      ]);
+    }
+  }
   const baseSha = commitAll(dir, 'Commit the encryption salts Pulumi wrote');
   retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${base}`]);
 
   writeChanges(dir, scenario.changes);
-  commitAll(dir, scenario.name);
+  const head = commitAll(dir, scenario.message ?? scenario.name);
   retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${change}`]);
 
   const url = retried(dir, 'gh', [
@@ -159,14 +165,12 @@ function prepare(index: number, dir: string) {
     '--title',
     `e2e: ${scenario.name}`,
     '--body',
-    scenario.body ?? `End-to-end scenario "${scenario.name}"; closed automatically.`,
+    `End-to-end scenario "${scenario.name}"; closed automatically.`,
   ]);
-  const number = url.split('/').pop() ?? '';
-  if (scenario.comment) {
-    retried(dir, 'gh', ['pr', 'comment', number, '--repo', repository, '--body', scenario.comment]);
-  }
-  output('pull-request', number);
+  output('pull-request', url.split('/').pop() ?? '');
   output('base-sha', baseSha);
+  output('head-sha', head);
+  output('banner', scenario.banner ?? '');
 }
 
 function writeChanges(dir: string, changes: Record<string, string | null>) {
@@ -182,161 +186,87 @@ function writeChanges(dir: string, changes: Record<string, string | null>) {
   }
 }
 
-function pushSecond(index: number, number: string, dir: string) {
-  const scenario = scenarios[index];
-  writeChanges(dir, scenario.second ?? {});
-  const sha = commitAll(dir, `${scenario.name}, again`);
-  retried(dir, 'git', ['push', '-q', remote(), `HEAD:refs/heads/${branches(index).change}`]);
-  // GitHub updates the pull request's head a moment after the push; the action checks it
-  for (let attempt = 0; attempt < 30; attempt++) {
-    const head = sh(dir, 'gh', ['api', `repos/${repository}/pulls/${number}`, '--jq', '.head.sha']);
-    if (head === sha) return;
-    execFileSync('sleep', ['2']);
-  }
-  throw new Error(`Pull request #${number} never showed the pushed commit ${sha}`);
-}
-
-function comments(number: string) {
-  const raw = retried(TOOL, 'gh', [
-    'api',
-    '--paginate',
-    `repos/${repository}/issues/${number}/comments`,
-  ]);
-  return (JSON.parse(raw.replace(/\]\s*\[/g, ',')) as { body: string }[]).map(
-    (comment) => comment.body,
-  );
-}
-
 function check(condition: boolean, message: string) {
   if (!condition) throw new Error(message);
 }
 
-function ids(results: string, statusFilter?: (status: string) => boolean) {
-  const runs = JSON.parse(results || '[]') as { id: string; status: string }[];
-  return runs
-    .filter((run) => !statusFilter || statusFilter(run.status))
-    .map((run) => run.id)
-    .sort();
-}
-
-function assertRuns(
-  kind: string,
-  actual: string[],
-  expected: string[],
-  results: string,
-  statuses: Record<string, string> = {},
-) {
-  // The action itself must have worked: failing only when a stack fails on purpose, and never
-  // crashing, which would otherwise look like "nothing selected"
-  const outcome = process.env.OUTCOME;
-  const shouldFail = Object.values(statuses).includes('failed');
-  if (outcome !== undefined) {
-    check(
-      outcome === (shouldFail ? 'failure' : 'success'),
-      `${kind}: the action's outcome was ${outcome}, expected ${shouldFail ? 'failure' : 'success'}`,
-    );
-  }
-  check(results !== '', `${kind}: the action wrote no results`);
-  const runs = JSON.parse(results) as { id: string; status: string }[];
-  console.log(
-    `${kind}: ${JSON.stringify(Object.fromEntries(runs.map((run) => [run.id, run.status])))}`,
-  );
-  for (const run of runs) {
-    const wanted = statuses[run.id];
-    if (wanted) {
-      check(run.status === wanted, `${kind}: ${run.id} is ${run.status}, expected ${wanted}`);
-    } else {
-      check(
-        run.status !== 'failed' && run.status !== 'skipped',
-        `${kind}: ${run.id} is ${run.status}`,
-      );
-    }
-  }
+function same(actual: string[], expected: string[], what: string) {
+  const a = [...actual].sort();
+  const e = [...expected].sort();
   check(
-    JSON.stringify(actual) === JSON.stringify([...expected].sort()),
-    `${kind} ran ${JSON.stringify(actual)}, expected ${JSON.stringify([...expected].sort())}`,
+    JSON.stringify(a) === JSON.stringify(e),
+    `${what}: got ${JSON.stringify(a)}, expected ${JSON.stringify(e)}`,
   );
 }
 
-function assertPreview(index: number, number: string, results: string) {
-  const scenario = scenarios[index];
-  assertRuns('preview', ids(results), scenario.expected, results, scenario.previewStatuses);
-  if (scenario.expectReply) {
-    const replies = comments(number).filter((body) =>
-      body.startsWith('<!-- pulumi-affected:ignored:'),
-    );
-    check(
-      replies.length === 1,
-      `expected one reply to the ignored command, found ${replies.length}`,
-    );
-  }
-  const previews = comments(number).filter((body) =>
-    body.startsWith('<!-- pulumi-affected:preview:'),
+/** Stack ids from plan or preview file names: "plans/fixture-accounts__shop.preview.json" */
+function idsOf(files: string[]) {
+  return files.map((file) =>
+    file
+      .slice(file.lastIndexOf('/') + 1)
+      .split('.')[0]
+      .replace('__', '/'),
   );
-  const skipped = scenario.expectSkipped ?? [];
-  if (scenario.expected.length === 0 && skipped.length === 0) {
-    check(previews.length === 0, 'a preview comment was posted although no stack was selected');
-    return;
-  }
-  // Skipped stacks are shown, so a skip in a description can't go unnoticed
-  for (const id of skipped) {
-    check(
-      previews.length === 1 && previews[0].includes(`<code>${id}</code>, skipped by`),
-      `the preview comment doesn't show that ${id} was skipped`,
-    );
-  }
-  if (scenario.expected.length === 0) return;
-  check(previews.length === 1, `expected one preview comment, found ${previews.length}`);
-  for (const id of scenario.expected)
-    check(previews[0].includes(`<code>${id}</code>`), `the preview comment doesn't mention ${id}`);
 }
 
-function assertDeploy(index: number, number: string, results: string) {
+function assertSelect(index: number, file: string) {
   const scenario = scenarios[index];
-  assertRuns('deploy', ids(results), scenario.deployed, results, scenario.deployStatuses);
-  const deploys = comments(number).filter((body) =>
-    body.startsWith('<!-- pulumi-affected:deploy-'),
+  const selection = JSON.parse(readFileSync(file, 'utf8')) as {
+    stacks: { id: string }[];
+    skipped: { id: string }[];
+    warnings: string[];
+  };
+  same(
+    selection.stacks.map((stack) => stack.id),
+    scenario.expected,
+    'selected',
   );
-  // Nothing deployed means no deploy comment
-  const expectedComments = scenario.deployed.length > 0 ? 1 : 0;
+  same(
+    selection.skipped.map((stack) => stack.id),
+    scenario.skipped ?? [],
+    'skipped',
+  );
+  check(selection.warnings.length === 0, `warnings: ${selection.warnings.join('; ')}`);
+}
+
+function assertPlans(index: number) {
+  const scenario = scenarios[index];
+  // The plan step fails only when a stack fails to preview, which some scenarios want
+  const expectedOutcome = scenario.failing?.length ? 'failure' : 'success';
   check(
-    deploys.length === expectedComments,
-    `expected ${expectedComments} deploy comments, found ${deploys.length}`,
+    process.env.PLAN_OUTCOME === expectedOutcome,
+    `the plan step was ${process.env.PLAN_OUTCOME}, expected ${expectedOutcome}`,
   );
-  for (const id of scenario.deployed)
-    check(deploys[0].includes(`<code>${id}</code>`), `the deploy comment doesn't mention ${id}`);
+  same(idsOf(JSON.parse(process.env.FAILED || '[]')), scenario.failing ?? [], 'failed previews');
+  same(idsOf(JSON.parse(process.env.CHANGED || '[]')), scenario.changed, 'previews with changes');
 }
 
-function assertSecondPreview(index: number, number: string, results: string) {
-  const scenario = scenarios[index];
-  const expected = scenario.secondExpected ?? [];
-  assertRuns('second preview', ids(results), expected, results);
-  const previews = comments(number).filter((body) =>
-    body.startsWith('<!-- pulumi-affected:preview:'),
-  );
-  check(
-    previews.length === 1,
-    `expected the preview comment to be edited, found ${previews.length}`,
-  );
-  for (const id of expected) {
-    check(
-      previews[0].includes(`<code>${id}</code>`),
-      `the edited preview comment doesn't mention ${id}`,
-    );
-  }
-}
-
-function merge(index: number, number: string, dir: string) {
+function merge(number: string, index: number, dir: string, planned: string) {
   retried(TOOL, 'gh', ['pr', 'ready', number, '--repo', repository]);
   retried(TOOL, 'gh', ['pr', 'merge', number, '--repo', repository, '--squash']);
   retried(dir, 'git', ['fetch', '-q', remote(), branches(index).base]);
   sh(dir, 'git', ['checkout', '-q', 'FETCH_HEAD']);
+  // The plans are only valid for exactly the code they were made from
+  const mergedTree = sh(dir, 'git', ['rev-parse', 'HEAD^{tree}']);
+  const plannedTree = sh(dir, 'git', ['rev-parse', `${planned}^{tree}`]);
+  check(
+    mergedTree === plannedTree,
+    `the merged tree ${mergedTree} isn't the planned ${plannedTree}`,
+  );
+}
+
+function assertApply(index: number) {
+  const scenario = scenarios[index];
+  const applied = existsSync('applied.txt')
+    ? readFileSync('applied.txt', 'utf8').split('\n').filter(Boolean)
+    : [];
+  same(applied, scenario.applied, 'applied');
 }
 
 function cleanup(index: number, number: string | undefined) {
   if (number) {
     try {
-      sh(TOOL, 'gh', ['pr', 'close', number, '--repo', repository]);
+      retried(TOOL, 'gh', ['pr', 'close', number, '--repo', repository]);
     } catch {
       // Already merged or closed
     }
@@ -353,19 +283,11 @@ function cleanup(index: number, number: string | undefined) {
 const [command, indexText, ...rest] = process.argv.slice(2);
 const index = Number(indexText);
 if (command === 'list') {
-  const list = scenarios.map((scenario, i) => ({
-    index: i,
-    name: scenario.name,
-    second: Boolean(scenario.second),
-    command: scenario.command ?? '',
-  }));
-  console.log(JSON.stringify(list));
-} else if (command === 'push-second') pushSecond(index, rest[0], rest[1]);
-else if (command === 'assert-second-preview') {
-  assertSecondPreview(index, rest[0], process.env.RESULTS ?? '');
+  console.log(JSON.stringify(scenarios.map((scenario, i) => ({ index: i, name: scenario.name }))));
 } else if (command === 'prepare') prepare(index, rest[0]);
-else if (command === 'assert-preview') assertPreview(index, rest[0], process.env.RESULTS ?? '');
-else if (command === 'merge') merge(index, rest[0], rest[1]);
-else if (command === 'assert-deploy') assertDeploy(index, rest[0], process.env.RESULTS ?? '');
+else if (command === 'assert-select') assertSelect(index, rest[0]);
+else if (command === 'assert-plans') assertPlans(index);
+else if (command === 'merge') merge(rest[0], index, rest[1], rest[2]);
+else if (command === 'assert-apply') assertApply(index);
 else if (command === 'cleanup') cleanup(index, rest[0]);
 else throw new Error(`Unknown command ${command}`);

@@ -1,10 +1,9 @@
 name: Publish
 
 # Publishes the package when its package.json version isn't on npm yet, and tags the commit so
-# the actions can be pinned to it. Bump the version in a PR; merging it publishes.
+# the actions can be pinned to it.
+# Manual only until npm publishing is set up; then add `push: branches: [main]` back
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 # Never publish twice at once

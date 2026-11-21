@@ -3,8 +3,6 @@ import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { classify } from './classify.ts';
 import { ConfigError, defaultConfig, parseConfig } from './config.ts';
-import { runCommand } from './run/index.ts';
-import { renderStackDetails, renderTable, resultText, summaryLine } from './run/report.ts';
 import { dependentsOf } from './graph.ts';
 import { matchesStack } from './patterns.ts';
 import { renderMarkdown } from './render.ts';
@@ -19,8 +17,6 @@ const USAGE = `Usage:
                          [--format json|markdown] [--config <file>]
   pulumi-affected dependents <stack> [--transitive] [--head <rev>] [--config <file>]
   pulumi-affected classify [<file>]
-  pulumi-affected run --mode preview|up --base <rev> [select options] [--command <template>]
-                      [--concurrency <n>] [--fail-fast]
 
 select    Prints the stacks a change affects, why, and the waves to run them in.
           --base      revision to compare against, e.g. the pull request's merge base
@@ -33,8 +29,6 @@ select    Prints the stacks a change affects, why, and the waves to run them in.
 dependents  Prints the stacks that depend on <stack>.
 classify  Reads \`pulumi preview --json\` output (a file, or stdin) and prints whether it changes
           anything; exits 0 with changes, 3 without.
-run       Selects stacks, then previews or deploys them in dependency order. Sign in to Pulumi
-          and your cloud first. Up compares each stack with the commit it was last deployed from.
 
 Stack patterns are "<project>/<stack>", where <project> is the project's name or folder, or a
 bare "<stack>"; both parts may be globs.`;
@@ -54,10 +48,6 @@ async function main(argv: string[]) {
       format: { type: 'string', default: 'json' },
       config: { type: 'string' },
       transitive: { type: 'boolean' },
-      mode: { type: 'string' },
-      command: { type: 'string' },
-      concurrency: { type: 'string' },
-      'fail-fast': { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -112,48 +102,10 @@ async function main(argv: string[]) {
     return result.changed ? 0 : NO_CHANGES_EXIT_CODE;
   }
 
-  if (command === 'run') {
-    if (values.mode !== 'preview' && values.mode !== 'up')
-      throw new UsageError('run needs --mode preview or --mode up');
-    if (!values.base) throw new UsageError('run needs --base');
-    const { runs } = await runCommand({
-      cwd: process.cwd(),
-      mode: values.mode,
-      base: values.base,
-      head: values.head,
-      run: values.run,
-      skip: values.skip,
-      all: values.all,
-      messages: values.message?.map((path) => readFileSync(path, 'utf8')),
-      config,
-      command: values.command,
-      concurrency: concurrencyOption(values.concurrency),
-      failFast: values['fail-fast'],
-      onFinish: (run) => console.error(`${run.stack.id}: ${resultText(run) || run.status}`),
-      onWarning: (message) => console.error(`warning: ${message}`),
-    });
-    if (values.format === 'markdown') {
-      console.log(`### ${summaryLine(values.mode, runs)}\n\n${renderTable(runs)}`);
-      for (const run of runs)
-        if (run.status !== 'no-changes') console.log(`\n${renderStackDetails(run)}`);
-    } else {
-      console.log(JSON.stringify(runs, null, 2));
-    }
-    return runs.some((run) => run.status === 'failed') ? 1 : 0;
-  }
   throw new UsageError(`unknown command "${command}"`);
 }
 
 class UsageError extends Error {}
-
-function concurrencyOption(text: string | undefined) {
-  if (text === undefined) return undefined;
-  const value = Number(text);
-  if (!Number.isInteger(value) || value < 1) {
-    throw new UsageError(`--concurrency must be a whole number of at least 1, not "${text}"`);
-  }
-  return value;
-}
 
 main(process.argv.slice(2)).then(
   (code) => {

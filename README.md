@@ -1,13 +1,15 @@
 # pulumi-affected
 
-Works out which Pulumi stacks a change affects, so CI previews and deploys only those. It follows what each stack's program actually runs, down to individual functions, instead of looking at which folders changed.
+Works out which Pulumi stacks a change affects, so CI plans only those. It follows what each stack's program actually runs, down to individual functions, instead of looking at which folders changed.
 
 - A change to a shared function selects only the projects that call it.
 - A dependency upgrade selects only the projects that load the package, directly or through other packages.
 - Comments, formatting, types and docs select nothing.
-- Stacks that read other stacks' outputs run after them, in waves.
+- Stacks that read other stacks' outputs are ordered after them, in waves.
 
 It works with TypeScript and JavaScript Pulumi programs, and npm, yarn (classic and berry) and pnpm. It needs no Pulumi Cloud features and works with any backend.
+
+**It selects; it doesn't deploy.** The tool answers two questions: which stacks does this change affect (`select`), and, given their previews, which would actually change (`classify`). Running Pulumi, storing plans, commenting on pull requests and deciding when to apply stay in your own workflow, where you control credentials and approvals. [Example workflows](#example-workflows) show the usual patterns: plan on the pull request, apply exactly those plans after merge, or apply from a comment.
 
 ## How detection works
 
@@ -55,19 +57,16 @@ Every selected stack comes with its reasons, for example ``lib/naming.ts: `zoneN
 
 ## Forcing a stack
 
-| How                                                                      | Example                                                                                     |
-| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| Touch a force file next to the stack's config: any edit, even whitespace | `accounts/Pulumi.business.force`, or `accounts/Pulumi.force` for every stack of the project |
-| A line in a commit message or the pull request description               | `Pulumi-Affected-Run: dns/prod, accounts/*` (or `all`)                                      |
-| A pull request comment, from someone with write access                   | `/pulumi-affected preview dns/prod`                                                         |
-| Config                                                                   | `rules`, `always` (below)                                                                   |
-| CLI / action input                                                       | `--run dns/prod`, `--all`                                                                   |
+| How                                                                      | Example                                                                                                                                     |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Touch a force file next to the stack's config: any edit, even whitespace | `accounts/Pulumi.business.force`, or `accounts/Pulumi.force` for every stack of the project                                                 |
+| A line in a commit message or the pull request description               | `Pulumi-Affected-Run: dns/prod, accounts/*` (or `all`)                                                                                      |
+| Config                                                                   | `rules`, `always` (below)                                                                                                                   |
+| CLI / action input                                                       | `--run dns/prod`, `--all`; a workflow can fill the `run` input from anything, such as a `workflow_dispatch` input or a pull request comment |
 
-`Pulumi-Affected-Skip: <patterns>` leaves stacks out, unless something also requests them.
+`Pulumi-Affected-Skip: <patterns>` leaves stacks out, unless something also requests them. Skipped stacks are listed in the output with what skipped them, so a skip is never silent.
 
 Stack patterns are `<project>/<stack>`, where `<project>` is the project's name or its folder, or a bare `<stack>` for that stack in every project. Both parts may be globs.
-
-Stacks forced in a pull request, by its description or a comment, are also selected when it merges.
 
 ## Configuration
 
@@ -94,180 +93,180 @@ classify:
   ignore: # preview differences that aren't real changes
     - type: pulumi:providers:aws
       properties: [assumeRole, assumeRoles] # previews run with a read-only role
-run:
-  command: scripts/pulumi.sh {stack} # default: pulumi --cwd {dir} --stack {stack}
-  concurrency: 4
-  failFast: false
-  newStacks: preview # or skip
-  createStacks: true # whether deploys create stacks that don't exist yet
 ```
 
 ## GitHub Actions
 
-Two actions share the same selection:
-
-- **`run`** previews or deploys the selected stacks in one job, in dependency order, and comments on pull requests. Use it when one set of credentials can reach every stack.
-- **`select`** only outputs the selection, for a matrix of your own jobs, for example when stacks need different roles.
-
-Both take the comparison base from the event:
-
-| Event                                             | Compared with                                                       |
-| ------------------------------------------------- | ------------------------------------------------------------------- |
-| `pull_request`                                    | the merge base with the target branch                               |
-| `push`                                            | the push's previous commit; a new branch selects everything         |
-| `issue_comment` with `/pulumi-affected preview …` | the pull request's merge base; check out `refs/pull/<n>/head` first |
-| anything else                                     | the `base` input                                                    |
-
-Pin the actions to a commit SHA: jobs that preview and deploy usually hold credentials for your cloud accounts.
-
-## Security
-
-A preview runs the pull request's Pulumi program, so whoever can open a pull request can run code in a preview job. Plan credentials with that in mind:
-
-- **Previews get read-only credentials; deploys get the rest.** Deploy only on pushes to protected branches, in a separate job or workflow, ideally behind a GitHub environment.
-- **Forks.** `pull_request` runs from forks get no secrets, so their previews can't sign in. `pull_request_target` refuses pull requests from forks whatever is checked out, and so does the `pull-request` input; comment commands never run them either.
-- **Comment commands** run only for people with write access, only on pull requests from this repository, and only for new comments. The action checks this itself, but also gate the job, so it doesn't even start for others:
-
-  ```yaml
-  on:
-    issue_comment:
-      types: [created]
-  jobs:
-    preview:
-      if: >-
-        github.event.issue.pull_request &&
-        startsWith(github.event.comment.body, '/pulumi-affected') &&
-        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
-      steps:
-        - uses: actions/checkout@v4
-          with:
-            ref: refs/pull/${{ github.event.issue.number }}/head
-            fetch-depth: 0
-            persist-credentials: false
-        # read-only sign-in, then the run action with mode: preview
-  ```
-
-  A comment-triggered run's OIDC token says `ref: refs/heads/<default branch>`, so cloud trust policies for deploy roles should also check `event_name` or the workflow, not only the branch.
-- **What Pulumi sees, and its limits.** Pulumi runs without the job token, the runner's internal tokens, the files that set later steps' environment and, unless `pass-oidc: true`, the variables for requesting GitHub OIDC tokens. That keeps them out of logs and out of honest code, but it isn't isolation: the code under preview runs as the same user as the action and can read the runner process's environment. So:
-  - Don't give a job that previews untrusted changes `id-token: write`, or credentials you wouldn't hand to the pull request's author. The action warns when it could request OIDC tokens.
-  - Check out with `persist-credentials: false`, or the job's token stays in `.git/config`; the action warns about that too.
-  - New stacks are previewed with plain `pulumi` in a temporary backend, not through `run.command`, so a wrapper that narrows credentials per stack doesn't apply to them; set `run.newStacks: skip` if that matters.
-- **Names.** Project and stack names that Pulumi wouldn't accept, and folders whose names contain quotes, `$`, backticks or newlines, are skipped with a warning. Wrapper scripts should still quote their arguments, or use the `PULUMI_AFFECTED_DIR`, `PULUMI_AFFECTED_STACK`, `PULUMI_AFFECTED_PROJECT` and `PULUMI_AFFECTED_ID` variables the command gets.
-- **Skipping.** `Pulumi-Affected-Skip` lines in commit messages and pull request descriptions are honoured in previews, which list what they skipped and who asked. Deploys ignore them, so no pull request can hold a change back; only the `skip` input counts there.
-- **Comments and logs** show resource types, names and changed property names, never values, with anything from the repository escaped so it can't add links, images or mentions. A failed stack shows Pulumi's error diagnostics. With a GitHub App token, the action recognises its own comments as a bot's.
-
-**Cancelling** a run interrupts Pulumi so it can stop cleanly and release its lock, and restores files a new-stack preview changed.
-
-**Concurrency.** Two deploys of the same stacks at once fight over stack locks on Pulumi Cloud, or apply out of order; self-managed backends only lock when `PULUMI_SELF_MANAGED_STATE_LOCKING` is set. Previews of the same pull request duplicate comments. Use concurrency groups:
-
-```yaml
-concurrency:
-  # Deploys: one at a time, never cancelled midway
-  group: pulumi-deploy
-  cancel-in-progress: false
-```
-
-```yaml
-concurrency:
-  # Previews: the latest push of a pull request wins
-  group: pulumi-preview-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: true
-```
-
-### `run`
-
-```yaml
-on:
-  pull_request:
-  push:
-    branches: [main]
-
-jobs:
-  pulumi:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      id-token: write # your cloud sign-in
-      pull-requests: write # comments
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # history for the merge base and each stack's last deploy
-          persist-credentials: false # keep the job's token out of reach of the code under preview
-      # your own Pulumi and cloud sign-in
-      - uses: soft-advisor/pulumi-affected/run@<commit sha>
-        with:
-          mode: ${{ github.event_name == 'push' && 'up' || 'preview' }}
-```
-
-**Preview** runs every selected stack in parallel. A stack that doesn't exist yet is previewed in a temporary local backend with its config, so nothing is written to the real backend before merge. There, other stacks (`StackReference`), ESC environments and secrets encrypted by the real backend aren't available, so such a preview fails with an explanation. `run.newStacks: skip` leaves new stacks out of previews instead.
-
-**Up** compares each stack with the commit it was last deployed from (Pulumi records it as `git.head` in the stack's history), so a stack whose deploy failed, or that was never deployed, runs again on the next push.
-
-- A stack whose latest deploy failed is selected, with that reason.
-- A stack whose last deploy recorded no commit, or covered only some resources (`--target`, `--exclude`, `--target-replace`), is selected too, as is one with resources imported since, a destroy that failed partway, or no successful deploy in its last 2,000 history entries.
-- A destroyed stack counts as never deployed, and is created again.
-- A stack that doesn't exist is created, unless `run.createStacks` is false, or its config file has an encryption salt or key: that means it was created against some backend before, so a missing stack points at the wrong backend or organisation, and creating it again would duplicate every resource.
-- A deploy from a working tree with uncommitted changes keeps its commit, with a warning. Stacks run after the ones they depend on. When a deploy changes a stack's outputs, the stacks that depend on it are deployed too, with the reason. A failure skips the stacks that depend on the failed one, lets the others finish, and fails the job at the end (`fail-fast` stops early instead).
-
-**Comments.** A preview posts one comment on the pull request and edits it on every push: a table of stacks with their result and why they ran, then each stack's resource changes. A push that selects nothing rewrites an earlier comment rather than adding one. A deploy comments its results on the pull requests the push merged. GitHub limits a comment to 65,536 characters, so a long report continues in further comments, split between stacks. Resource changes show types, names and changed property names, never values; a failed stack shows the error Pulumi printed. Pull requests from forks can't be commented on with the default token; the job summary has everything.
-
-**Inputs:** `mode` (`preview` or `up`), `command`, `concurrency`, `fail-fast`, `comment`, `pass-oidc`, `base`, `head`, `run`, `skip`, `all`, `pull-request`, `working-directory`, `github-token`.
-**Outputs:** `results` (JSON array of `{ id, status, reasons, counts, changedOutputs, newStack, error }`, status being `changes`, `no-changes`, `failed` or `skipped`), `changed`, `failed`, `any-changes`.
-
 ### `select`
 
 ```yaml
-jobs:
-  select:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pull-requests: write # replies to /pulumi-affected commands from people without write access
-    outputs:
-      stacks: ${{ steps.select.outputs.stacks }}
-      any: ${{ steps.select.outputs.any }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - id: select
-        uses: soft-advisor/pulumi-affected/select@<commit sha>
-
-  preview:
-    needs: select
-    if: needs.select.outputs.any == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        stack: ${{ fromJSON(needs.select.outputs.stacks) }}
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      # your own Pulumi and cloud sign-in
-      # Through env, never ${{ }} inside the script: the values come from repository files
-      - run: pulumi preview --cwd "$STACK_DIR" --stack "$STACK_NAME"
-        env:
-          STACK_DIR: ${{ matrix.stack.dir }}
-          STACK_NAME: ${{ matrix.stack.stack }}
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0 # history for the merge base
+    persist-credentials: false
+- id: select
+  uses: soft-advisor/pulumi-affected/select@<commit sha>
+  with:
+    output-file: selection.json # for later jobs, e.g. as an artifact
 ```
 
-To deploy only stacks whose last deploy is older than the change, pass `bases`: a JSON object from stack id to the commit each was last deployed from, or `null` for a stack never deployed.
+The comparison base comes from the event: a pull request's merge base with its target branch, a push's previous commit (a new branch selects everything), a merge group's base; otherwise the `base` input.
 
-**Inputs:** `base`, `head`, `bases`, `run`, `skip`, `all`, `pull-request`, `working-directory`, `github-token`.
-**Outputs:** `stacks` (JSON array of `{ id, project, dir, stack, configFile, wave, reasons }`), `ids`, `waves`, `any`, `result`.
+**Inputs:** `base`, `head`, `bases`, `run`, `skip`, `all`, `working-directory`, `output-file`.
+**Outputs:** `stacks` (JSON array of `{ id, project, dir, stack, configFile, wave, reasons }`, in wave order), `ids`, `waves`, `any`, `result` (everything, including skipped and unaffected stacks and warnings). The same JSON goes to `output-file`, and a summary to the job summary.
+
+`bases` lets each stack compare with its own revision instead of `base`, e.g. the commit it was last deployed from (Pulumi records it as `git.head` in `pulumi stack history --json`), or `null` for a stack never deployed.
+
+`select` only reads files: it never runs the repository's code, so it needs no credentials.
+
+### `classify`
+
+```yaml
+- id: classify
+  uses: soft-advisor/pulumi-affected/classify@<commit sha>
+  with:
+    previews: plans/*.preview.json # what `pulumi preview --json` printed, one file per stack
+```
+
+**Outputs:** `changed` and `unchanged` (JSON arrays of the preview files), `any`. A preview counts as changed when a resource would be created, updated, replaced or deleted. Reads and unchanged resources don't count, and neither does known noise listed under `classify.ignore`, such as a provider whose `assumeRole` differs because previews use a read-only role. Output that a wrapper script prints before Pulumi's JSON is skipped.
+
+A preview usually can't tell whether **stack outputs alone** will change, so a stack whose only change is its outputs counts as unchanged. If other stacks read those outputs, keep its plan anyway.
+
+## Example workflows
+
+These are starting points: the tool's part is `select` and `classify`; everything else is yours to change. Both keep previews and applies apart: previews run the pull request's code with read-only credentials, applies run only reviewed code.
+
+### Plan on the pull request, apply exactly those plans after merge
+
+```yaml
+# .github/workflows/plan.yml
+on: pull_request
+concurrency:
+  group: plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  id-token: write # read-only cloud role for previews; see Guardrails
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, persist-credentials: false }
+      # your read-only Pulumi and cloud sign-in, and dependency install
+      - id: select
+        uses: soft-advisor/pulumi-affected/select@<commit sha>
+        with: { output-file: selection.json }
+      - name: Preview the selected stacks, saving plans
+        run: |
+          mkdir -p plans
+          while read -r stack; do
+            id=$(jq -r .id <<<"$stack"); name=$(jq -r .stack <<<"$stack")
+            dir=$(jq -r '.dir | if . == "" then "." else . end' <<<"$stack")
+            file="plans/${id//\//__}"
+            pulumi --cwd "$dir" stack select --create "$name"
+            pulumi --cwd "$dir" --stack "$name" preview --json --save-plan "$PWD/$file.plan.json" > "$file.preview.json"
+          done < <(jq -c '.stacks[]' selection.json)
+      - id: classify
+        uses: soft-advisor/pulumi-affected/classify@<commit sha>
+        with: { previews: plans/*.preview.json }
+      - name: Keep only the plans with changes
+        env: { UNCHANGED: '${{ steps.classify.outputs.unchanged }}' }
+        run: |
+          jq -r '.[]' <<<"$UNCHANGED" | while read -r preview; do
+            rm -f "$preview" "${preview%.preview.json}.plan.json"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plans-${{ github.event.pull_request.head.sha }}
+          path: |
+            selection.json
+            plans/
+```
+
+```yaml
+# .github/workflows/apply.yml
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: apply # one at a time, never cancelled midway
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: read # to download the pull request's plans
+  pull-requests: read
+  id-token: write # deploy role
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    environment: production # optional: a required reviewer, or branch restrictions
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, persist-credentials: false }
+      - id: pr
+        name: Find the merged pull request and its plan run
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[0]')
+          head=$(jq -r .head.sha <<<"$pr")
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/plan.yml/runs?head_sha=$head&status=success" --jq '.workflow_runs[0].id')
+          echo "head=$head" >> "$GITHUB_OUTPUT"; echo "run=$run" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: plans-${{ steps.pr.outputs.head }}
+          run-id: ${{ steps.pr.outputs.run }}
+          github-token: ${{ github.token }}
+      - name: Refuse plans made from other code
+        run: |
+          git fetch --quiet origin "${{ steps.pr.outputs.head }}"
+          [ "$(git rev-parse HEAD^{tree})" = "$(git rev-parse '${{ steps.pr.outputs.head }}^{tree}')" ]
+      # your deploy-role cloud sign-in
+      - name: Apply exactly the plans, in dependency order
+        run: |
+          for id in $(jq -r '.waves[][]' selection.json); do
+            plan="plans/${id//\//__}.plan.json"
+            [ -f "$plan" ] || continue
+            stack=$(jq -c --arg id "$id" '.stacks[] | select(.id == $id)' selection.json)
+            dir=$(jq -r '.dir | if . == "" then "." else . end' <<<"$stack")
+            pulumi --cwd "$dir" --stack "$(jq -r .stack <<<"$stack")" up --yes --plan "$PWD/$plan"
+          done
+```
+
+The tree check is what makes "apply exactly what was planned" hold: a squash merge of a branch that was up to date with `main` has the same tree as the pull request's head. If it doesn't (the branch wasn't up to date, or the plans are missing), the apply stops instead of planning again.
+
+### Apply from a pull request comment (Atlantis-style)
+
+A comment workflow runs from the default branch, with that branch's permissions, so it should run no code. Let it check what you require (the commenter's write access, an approval, passing checks) and then start a `workflow_dispatch` of an apply workflow **on the pull request's branch**, so the apply runs as that branch, not as `main`. The apply workflow downloads that pull request's latest plans and applies them as above; merge afterwards. Your cloud trust policy for the deploy role decides which branches and events may assume it.
+
+To add stacks to a pull request's plans from a comment, the same comment workflow can dispatch the plan workflow on the pull request's branch with a `run` input, which the plan workflow passes to `select`.
+
+## Guardrails and limitations
+
+The tool selects; your repository's rules make plans safe to apply:
+
+- **Applies only run reviewed code.** Require an approval to merge into the default branch, and dismiss approvals when new commits are pushed, so the approved plan is the applied plan.
+- **Plans must not go stale.** Require branches to be up to date with the default branch before merging (or use a merge queue). Otherwise the plan was made against older code or state than what's merged, and the tree check above refuses it. Pulumi also refuses a plan whose resources no longer match it.
+- **Make the plan a required check**, so a pull request can't merge with a failing preview.
+- **One apply at a time**: a `concurrency` group that isn't cancelled midway. On self-managed backends, set `PULUMI_SELF_MANAGED_STATE_LOCKING`.
+- **Credentials by event.** Previews run the pull request's code, so they get read-only roles. Give the deploy role a trust policy that only accepts the default branch's push (or the branches you apply from), and never give a job that runs a pull request's code a way to obtain it. Hiding variables from a step isn't isolation: code running in a job can read anything the job can.
+- **Stacks that read a planned stack's outputs** are planned against its current outputs. If applying it changes them, the dependent's plan is rejected by Pulumi rather than applied; plan it again.
+- **Type-only changes** select nothing, since they don't change what's deployed; run `tsc --noEmit` in CI to catch type errors before the next plan does.
+- **ESC environments** change outside the repository; stacks importing them get a warning, and can be selected with `always`, a rule or `Pulumi-Affected-Run`.
+- **Stacks that only exist in the backend** (no `Pulumi.<stack>.yaml`) need listing under `stacks`.
+- **A safety net:** a scheduled run with `all: true` and `pulumi preview --expect-no-changes` catches drift and anything selection missed.
 
 ## CLI
+
+The npm package isn't published yet; meanwhile, run `node src/cli.ts` from a checkout.
 
 ```sh
 npx @soft-advisor/pulumi-affected select --base origin/main [--format markdown]
 npx @soft-advisor/pulumi-affected dependents accounts/business [--transitive]
-npx @soft-advisor/pulumi-affected run --mode preview --base origin/main [--format markdown]
 pulumi preview --json | npx @soft-advisor/pulumi-affected classify
 ```
 
-`select` analyses the working tree unless `--head` is given; `run` analyses `HEAD`. `classify` exits 0 when the preview changes something and 3 when it doesn't. See `--help` for every option.
+`select` analyses the working tree unless `--head` is given. `classify` exits 0 when the preview changes something and 3 when it doesn't. See `--help` for every option.
 
 ## Development
 
@@ -278,14 +277,14 @@ pnpm install
 pnpm lint        # Biome lint + format check
 pnpm typecheck
 pnpm test
-pnpm build       # also rebuilds select/dist, run/dist and schema.json, which are committed
+pnpm build       # also rebuilds select/dist, classify/dist and schema.json, which are committed
 ```
 
-Tests build real git repositories in a temporary folder. `test/run.test.ts` drives the real `pulumi` CLI against a local file backend, and is skipped when the CLI isn't installed. `e2e/fixtures` holds Pulumi projects with realistic layouts, and `e2e/scenarios.json` the changes and the stacks each should select. The CI `dogfood` job runs the action from each commit against those fixtures.
+Tests build real git repositories in a temporary folder. The `E2E` workflow runs every scenario in `e2e/scenarios.json` for real in this repository: it deploys `e2e/fixtures` to a file backend, opens a pull request with the scenario's change, and runs the plan and apply example above on it, checking what was selected, planned and applied.
 
 ## Releasing
 
-Bump `version` in `package.json` in a PR; merging it publishes to npm with provenance and tags the commit `v<version>` and `v<major>` ([`publish.yml`](.github/workflows/publish.yml)).
+Publishing is manual for now ([`publish.yml`](.github/workflows/publish.yml) only runs on `workflow_dispatch`). Once npm is set up, it runs on merges to `main`: bump `version` in `package.json` in a PR, and merging it publishes to npm with provenance and tags the commit `v<version>` and `v<major>`.
 
 npm trusted publishing (GitHub OIDC, no token) can only be set up for a package that already exists, so:
 
