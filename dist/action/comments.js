@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /*
  * Pull request comments the action owns, found again by a hidden marker on their first line:
  * `<!-- pulumi-affected:<kind>:<index> -->`. A report split over several comments has one
@@ -50,5 +51,81 @@ export async function syncComments(api, number, kind, bodies, onlyIfPresent = fa
         if (index >= bodies.length) {
             await api.request('DELETE', api.repo(`/issues/comments/${comment.id}`));
         }
+    }
+}
+const DIGEST = /^<!-- pulumi-affected:digest:([0-9a-f]{64}) -->$/m;
+/**
+ * Posts a report that's read when it changes. When the results differ from the last report, the
+ * old comments are hidden as outdated and the new ones posted, so GitHub notifies; when they're
+ * the same, the existing comments are only updated to say so, which notifies no one.
+ */
+export async function postReport(api, number, kind, bodies, status) {
+    // The results only: the footer names the commit, which differs on every push
+    const results = bodies.join('\n').replace(/^<sub>.*<\/sub>$/gm, '');
+    const digest = createHash('sha256').update(results).digest('hex');
+    const existing = await ownReports(api, number, kind);
+    const previous = existing.get(0)?.body?.match(DIGEST)?.[1];
+    const link = `[${status.sha.slice(0, 7)}](${status.url})`;
+    const same = previous === digest;
+    const line = same
+        ? `${status.verb} again against ${link}, no change.`
+        : `${status.verb} against ${link}.`;
+    const final = withStatus(bodies, line, digest);
+    if (same) {
+        await syncComments(api, number, kind, final);
+        return;
+    }
+    for (const comment of existing.values())
+        await retire(api, kind, comment);
+    for (const body of final) {
+        await api.request('POST', api.repo(`/issues/${number}/comments`), { body });
+    }
+}
+/** The report with its status line under the heading, and the digest of its results */
+function withStatus(bodies, line, digest) {
+    return bodies.map((body, index) => {
+        if (index > 0)
+            return body;
+        const lines = body.split('\n');
+        // The marker, then the heading
+        return [
+            lines[0],
+            `<!-- pulumi-affected:digest:${digest} -->`,
+            lines[1],
+            '',
+            line,
+            ...lines.slice(2),
+        ].join('\n');
+    });
+}
+async function ownReports(api, number, kind) {
+    const prefix = `<!-- pulumi-affected:${kind}:`;
+    const comments = await api.list(api.repo(`/issues/${number}/comments`));
+    const isOwn = await api.ownComments();
+    const reports = new Map();
+    for (const comment of comments) {
+        const body = comment.body ?? '';
+        if (!isOwn(comment.user) || !body.startsWith(prefix))
+            continue;
+        const index = Number(body.slice(prefix.length, body.indexOf(' -->')));
+        if (Number.isInteger(index) && !reports.has(index))
+            reports.set(index, comment);
+    }
+    return reports;
+}
+/**
+ * Marks an old report as outdated: its marker changes, so it's never updated again, and it's
+ * hidden as outdated. Hiding is best effort; the marker change is what matters.
+ */
+async function retire(api, kind, comment) {
+    const body = (comment.body ?? '').replace(`<!-- pulumi-affected:${kind}:`, `<!-- pulumi-affected:${kind}-outdated:`);
+    await api.request('PATCH', api.repo(`/issues/comments/${comment.id}`), { body });
+    if (!comment.node_id)
+        return;
+    try {
+        await api.graphql('mutation($id: ID!) { minimizeComment(input: { subjectId: $id, classifier: OUTDATED }) { clientMutationId } }', { id: comment.node_id });
+    }
+    catch {
+        // Still marked; just not hidden
     }
 }

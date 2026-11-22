@@ -84,7 +84,8 @@ export class GitHubApi {
      */
     async request(method, path, body) {
         for (let attempt = 1;; attempt++) {
-            const response = await fetch(`${this.baseUrl}${path}`, {
+            const url = /^https?:\/\//.test(path) ? path : `${this.baseUrl}${path}`;
+            const response = await fetch(url, {
                 method,
                 headers: {
                     authorization: `Bearer ${this.token}`,
@@ -108,6 +109,18 @@ export class GitHubApi {
             const wait = retryAfter > 0 ? retryAfter * 1000 : attempt * RETRY_DELAY;
             await new Promise((resolve) => setTimeout(resolve, Math.min(wait, MAX_RETRY_DELAY)));
         }
+    }
+    /** Runs a GraphQL query or mutation */
+    async graphql(query, variables) {
+        const url = process.env.GITHUB_GRAPHQL_URL ?? `${this.baseUrl}/graphql`;
+        const result = await this.request('POST', url, {
+            query,
+            variables,
+        });
+        if (result.errors?.length) {
+            throw new ApiError(200, `GitHub GraphQL failed: ${result.errors.map((e) => e.message).join('; ')}`);
+        }
+        return result.data;
     }
     /** Every page of a list endpoint */
     async list(path) {
