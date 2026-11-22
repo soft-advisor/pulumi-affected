@@ -713,7 +713,8 @@ export class Session {
             this.recordReads(stack.id, dependency.id, outputs);
             this.unknownReaders.delete(stack.id);
             if (outputs !== 'all') {
-              const dependents = (this.declaredOutputs[dependency.id] ??= {});
+              const dependents = this.declaredOutputs[dependency.id] ?? {};
+              this.declaredOutputs[dependency.id] = dependents;
               dependents[stack.id] = [...new Set([...(dependents[stack.id] ?? []), ...outputs])];
             }
           }
