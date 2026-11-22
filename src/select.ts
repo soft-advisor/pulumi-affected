@@ -88,10 +88,40 @@ export interface SelectResult {
    * JavaScript or TypeScript, stack names that can't be worked out) and have no `dependsOn`
    */
   unknownReaders: string[];
+  /** Outputs dependsOn says stacks read: dependency id → dependent id → outputs */
+  declaredOutputs: DeclaredOutputs;
   warnings: string[];
 }
 
 export type OutputsRead = Record<string, Record<string, string[] | 'all'>>;
+export type DeclaredOutputs = Record<string, Record<string, string[]>>;
+
+/**
+ * Patterns in the config's dependsOn, after and createStacks that match no stack: a typo or a
+ * renamed project, which would otherwise quietly do nothing
+ */
+function unmatchedPatterns(config: Config, stacks: Stack[]) {
+  const patterns: [string, string][] = [];
+  for (const [key, value] of Object.entries(config.dependsOn)) {
+    patterns.push(['dependsOn', key]);
+    for (const dependency of Array.isArray(value) ? value : Object.keys(value)) {
+      patterns.push([`dependsOn (under ${key})`, dependency]);
+    }
+  }
+  for (const [key, value] of Object.entries(config.after)) {
+    patterns.push(['after', key]);
+    for (const predecessor of value) patterns.push([`after (under ${key})`, predecessor]);
+  }
+  for (const pattern of [...config.createStacks.plan, ...config.createStacks.apply]) {
+    patterns.push(['createStacks', pattern]);
+  }
+  return patterns
+    .filter(([, pattern]) => !stacks.some((stack) => matchesStack(pattern, stack)))
+    .map(
+      ([where, pattern]) =>
+        `pulumi-affected.yaml: ${where} names "${pattern}", which matches no stack`,
+    );
+}
 
 export const RUN_TRAILER = 'Pulumi-Affected-Run';
 export const SKIP_TRAILER = 'Pulumi-Affected-Skip';
@@ -220,6 +250,7 @@ export function select(options: SelectOptions): SelectResult {
     ),
     outputsRead: session.outputsReadRecord(),
     unknownReaders: [...session.unknownReaders].sort(),
+    declaredOutputs: session.declaredOutputs,
     createStacks: requestsFor(defaultBase).create,
     warnings: [...new Set(warnings)],
   };
@@ -240,6 +271,8 @@ export class Session {
   readonly graphWarnings: string[] = [];
   /** Stacks that may read other stacks' outputs in ways analysis can't see */
   readonly unknownReaders = new Set<string>();
+  /** Outputs dependsOn says stacks read: dependency id → dependent id → outputs */
+  readonly declaredOutputs: DeclaredOutputs = {};
   /** Stack id → dependency id → outputs read, filled in by dependencyGraph */
   private readonly outputsRead = new Map<string, Map<string, Set<string> | 'all'>>();
 
@@ -679,10 +712,15 @@ export class Session {
             addEdge(graph, stack.id, dependency.id);
             this.recordReads(stack.id, dependency.id, outputs);
             this.unknownReaders.delete(stack.id);
+            if (outputs !== 'all') {
+              const dependents = (this.declaredOutputs[dependency.id] ??= {});
+              dependents[stack.id] = [...new Set([...(dependents[stack.id] ?? []), ...outputs])];
+            }
           }
         }
       }
     }
+    this.graphWarnings.push(...unmatchedPatterns(this.config, stacks));
     // Order only: these stacks apply after those, without reading their outputs
     for (const [pattern, predecessors] of Object.entries(this.config.after)) {
       for (const stack of stacks) {
@@ -985,6 +1023,7 @@ export function readDependencyGraph(options: { cwd: string; head?: string; confi
     graph,
     outputsRead: session.outputsReadRecord(),
     unknownReaders: [...session.unknownReaders].sort(),
+    declaredOutputs: session.declaredOutputs,
     warnings: session.graphWarnings,
   };
 }

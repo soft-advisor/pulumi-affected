@@ -7,11 +7,11 @@ import { classify } from "../classify.js";
 import { loadConfig } from "../config.js";
 import { matchesAnyStack, matchesStack } from "../patterns.js";
 import { errorText, isMissingStack, onCancel, parseLastJsonObject, } from "../pulumi/runner.js";
-import { secretsProviderOf, stateFingerprint } from "../pulumi/stack.js";
+import { readOutputs, secretsProviderOf, stateFingerprint } from "../pulumi/stack.js";
 import { readDependencyGraph, select, } from "../select.js";
 import { git, repoRootOf, WorktreeSnapshot } from "../snapshot.js";
 import { mapConcurrently } from "./concurrency.js";
-import { describeRead, staleReads } from "./outputs.js";
+import { describeRead, missingDeclaredOutputs, staleReads } from "./outputs.js";
 import { planHasSecrets, stackOutputChanges, unknownOutputChanges } from "./planfile.js";
 import { hashFile, planFileNames, writeManifest, } from "./manifest.js";
 export async function planStacks(options) {
@@ -77,6 +77,23 @@ export async function planStacks(options) {
         };
     }
     const warnings = [...selection.warnings];
+    // Outputs dependsOn names must be ones the stack exports, now or once this is applied
+    for (const outcome of outcomes) {
+        const id = outcome.kind === 'planned' ? outcome.stack.id : outcome.id;
+        if (outcome.kind === 'failed' || !selection.declaredOutputs[id])
+            continue;
+        const stack = selection.stacks.find((candidate) => candidate.id === id);
+        if (!stack)
+            continue;
+        try {
+            const current = Object.keys(await readOutputs(options.runner, stack));
+            const planned = outcome.kind === 'planned' ? outcome.stack.outputs : [];
+            warnings.push(...missingDeclaredOutputs(id, [...current, ...planned], selection.declaredOutputs));
+        }
+        catch {
+            // Reading outputs is only for this check
+        }
+    }
     const changesOutputs = planned.filter((stack) => !blocked.has(stack.id) && stack.outputs.length > 0);
     if (changesOutputs.length > 0 && selection.unknownReaders.length > 0) {
         warnings.push(unknownReadersWarning(changesOutputs, selection.unknownReaders));

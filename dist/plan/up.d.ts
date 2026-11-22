@@ -1,7 +1,7 @@
 import { type PulumiRunner } from '../pulumi/runner.ts';
 import { type SelectOptions } from '../select.ts';
 import type { PreviewSummary } from './manifest.ts';
-import type { StaleRead } from './outputs.ts';
+import { type StaleRead } from './outputs.ts';
 export type OutputReaders = 'up' | 'warn';
 export interface UpOptions {
     /** Any folder inside the repository, checked out at the merged commit */
@@ -39,6 +39,8 @@ export interface StackUpResult {
     counts?: Record<string, number>;
     /** Outputs the update changed */
     outputs?: string[];
+    /** Every output the stack has after the update, when they were read */
+    exported?: string[];
     /** Why it's deployed when the change didn't select it: outputs it reads changed */
     readsChanged?: StaleRead[];
 }

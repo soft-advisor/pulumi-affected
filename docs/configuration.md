@@ -32,3 +32,5 @@ classify:
     - type: pulumi:providers:aws
       properties: [assumeRole, assumeRoles] # previews run with a read-only role
 ```
+
+Patterns in `dependsOn`, `after` and `createStacks` that match no stack are reported as warnings, as are outputs named under `dependsOn` that the stack doesn't export (checked when previewing and deploying, against its outputs and the ones its plan adds): either would otherwise quietly do nothing.

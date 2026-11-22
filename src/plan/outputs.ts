@@ -1,4 +1,4 @@
-import type { OutputsRead } from '../select.ts';
+import type { DeclaredOutputs, OutputsRead } from '../select.ts';
 
 /*
  * Stacks that read outputs a plan changes. A stack's plan is made with the outputs its
@@ -59,4 +59,25 @@ export function describeRead(read: StaleRead) {
   return read.certain
     ? `reads ${outputs} from \`${read.dependency}\`, ${change}`
     : `may read ${outputs} from \`${read.dependency}\` (which outputs it reads can't be worked out), ${change}`;
+}
+
+/**
+ * Outputs dependsOn names that a stack doesn't export: a typo, or an output since renamed, which
+ * would never change and so never bring the dependent along
+ */
+export function missingDeclaredOutputs(
+  dependency: string,
+  exported: Iterable<string>,
+  declared: DeclaredOutputs,
+) {
+  const available = new Set(exported);
+  const warnings: string[] = [];
+  for (const [dependent, outputs] of Object.entries(declared[dependency] ?? {})) {
+    const missing = outputs.filter((output) => !available.has(output));
+    if (missing.length === 0) continue;
+    warnings.push(
+      `pulumi-affected.yaml: dependsOn says ${dependent} reads ${missing.map((output) => `"${output}"`).join(', ')} of ${dependency}, which it doesn't export${available.size > 0 ? ` (it exports ${[...available].sort().join(', ')})` : ''}`,
+    );
+  }
+  return warnings;
 }

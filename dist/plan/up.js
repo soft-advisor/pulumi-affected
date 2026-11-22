@@ -8,6 +8,7 @@ import { readOutputs, recentUpdates, stateFingerprint } from "../pulumi/stack.js
 import { readDependencyGraph, select } from "../select.js";
 import { ensureCommit, GitSnapshot, git, repoRootOf, resolveCommit } from "../snapshot.js";
 import { mapConcurrently } from "./concurrency.js";
+import { missingDeclaredOutputs } from "./outputs.js";
 import { initArgs, unknownReadersWarning, writeSalt } from "./plan.js";
 const RAN = new Set(['applied', 'unchanged']);
 export async function upStacks(options) {
@@ -15,7 +16,7 @@ export async function upStacks(options) {
     const commit = resolveCommit(repoRoot, 'HEAD');
     const config = loadConfig(new GitSnapshot(repoRoot, commit));
     const selection = select({ ...options.select, cwd: repoRoot, head: commit, config });
-    const { stacks: known, graph, outputsRead, unknownReaders, } = readDependencyGraph({
+    const { stacks: known, graph, outputsRead, unknownReaders, declaredOutputs, } = readDependencyGraph({
         cwd: repoRoot,
         head: commit,
         config,
@@ -105,6 +106,9 @@ export async function upStacks(options) {
             if (result.outcome === 'failed')
                 failed = true;
             results.set(id, result);
+            if (result.exported) {
+                warnings.push(...missingDeclaredOutputs(id, result.exported, declaredOutputs));
+            }
             // Stacks reading outputs this update changed were deployed with the old values
             if (result.outputs?.length) {
                 changedOutputs.push({ id });
@@ -195,6 +199,7 @@ async function upStack(stack, repoRoot, hasDependents, runner) {
             const after = await readOutputs(runner, stack);
             const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
             const outputs = [...keys].filter((key) => !isDeepStrictEqual(before[key], after[key])).sort();
+            result.exported = Object.keys(after).sort();
             if (outputs.length > 0)
                 result.outputs = outputs;
         }

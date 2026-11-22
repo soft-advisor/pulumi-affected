@@ -325,4 +325,31 @@ describe('preview, then up', { skip: !hasPulumi && 'pulumi is not installed' }, 
     assert.deepEqual(outcomes(result), { 'up/dev': 'applied' });
     assert.deepEqual(result.followUps, []);
   });
+
+  test("outputs dependsOn names that a stack doesn't export are reported, when previewing and deploying", async () => {
+    const { dir, base, runner } = setup({
+      'pulumi-affected.yaml': 'dependsOn:\n  down/dev:\n    up/dev: [wrod]\n',
+    });
+    commit(dir, { 'up/Pulumi.yaml': upProgram('nine') });
+    const directory = temporary('previews');
+    const manifest = await planStacks({
+      select: { cwd: dir, base },
+      directory,
+      runner,
+      concurrency: 2,
+      mode: 'preview',
+    });
+    assert.match(
+      manifest.warnings.join('\n'),
+      /dependsOn says down\/dev reads "wrod" of up\/dev, which it doesn't export \(it exports word\)/,
+    );
+    const result = await upStacks({
+      cwd: dir,
+      runner,
+      concurrency: 2,
+      select: { base },
+      outputReaders: 'up',
+    });
+    assert.match(result.warnings.join('\n'), /reads "wrod" of up\/dev, which it doesn't export/);
+  });
 });

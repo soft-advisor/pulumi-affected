@@ -24,7 +24,7 @@ import {
   type PulumiRunner,
   type StackTarget,
 } from '../pulumi/runner.ts';
-import { secretsProviderOf, stateFingerprint } from '../pulumi/stack.ts';
+import { readOutputs, secretsProviderOf, stateFingerprint } from '../pulumi/stack.ts';
 import {
   type CreateRequest,
   readDependencyGraph,
@@ -34,7 +34,7 @@ import {
 } from '../select.ts';
 import { git, repoRootOf, WorktreeSnapshot } from '../snapshot.ts';
 import { mapConcurrently } from './concurrency.ts';
-import { describeRead, type StaleRead, staleReads } from './outputs.ts';
+import { describeRead, missingDeclaredOutputs, type StaleRead, staleReads } from './outputs.ts';
 import { planHasSecrets, stackOutputChanges, unknownOutputChanges } from './planfile.ts';
 import {
   hashFile,
@@ -151,6 +151,22 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
   }
 
   const warnings = [...selection.warnings];
+  // Outputs dependsOn names must be ones the stack exports, now or once this is applied
+  for (const outcome of outcomes) {
+    const id = outcome.kind === 'planned' ? outcome.stack.id : outcome.id;
+    if (outcome.kind === 'failed' || !selection.declaredOutputs[id]) continue;
+    const stack = selection.stacks.find((candidate) => candidate.id === id);
+    if (!stack) continue;
+    try {
+      const current = Object.keys(await readOutputs(options.runner, stack));
+      const planned = outcome.kind === 'planned' ? outcome.stack.outputs : [];
+      warnings.push(
+        ...missingDeclaredOutputs(id, [...current, ...planned], selection.declaredOutputs),
+      );
+    } catch {
+      // Reading outputs is only for this check
+    }
+  }
   const changesOutputs = planned.filter(
     (stack) => !blocked.has(stack.id) && stack.outputs.length > 0,
   );

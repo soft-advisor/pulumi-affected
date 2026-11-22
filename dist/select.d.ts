@@ -60,9 +60,12 @@ export interface SelectResult {
      * JavaScript or TypeScript, stack names that can't be worked out) and have no `dependsOn`
      */
     unknownReaders: string[];
+    /** Outputs dependsOn says stacks read: dependency id → dependent id → outputs */
+    declaredOutputs: DeclaredOutputs;
     warnings: string[];
 }
 export type OutputsRead = Record<string, Record<string, string[] | 'all'>>;
+export type DeclaredOutputs = Record<string, Record<string, string[]>>;
 export declare const RUN_TRAILER = "Pulumi-Affected-Run";
 export declare const SKIP_TRAILER = "Pulumi-Affected-Skip";
 export declare function select(options: SelectOptions): SelectResult;
@@ -75,6 +78,8 @@ export declare class Session {
     readonly graphWarnings: string[];
     /** Stacks that may read other stacks' outputs in ways analysis can't see */
     readonly unknownReaders: Set<string>;
+    /** Outputs dependsOn says stacks read: dependency id → dependent id → outputs */
+    readonly declaredOutputs: DeclaredOutputs;
     /** Stack id → dependency id → outputs read, filled in by dependencyGraph */
     private readonly outputsRead;
     private recordReads;
@@ -138,5 +143,6 @@ export declare function readDependencyGraph(options: {
     graph: DependencyGraph;
     outputsRead: OutputsRead;
     unknownReaders: string[];
+    declaredOutputs: DeclaredOutputs;
     warnings: string[];
 };
