@@ -301,3 +301,14 @@ test('changesOnly ignores request lines and counts only changes', () => {
   assert.deepEqual(selectedIds(select({ cwd: dir, base })), ['org-accounts/business']);
   assert.deepEqual(selectedIds(select({ cwd: dir, base, changesOnly: true })), []);
 });
+
+test('dependsOn can name the outputs that stand for what a stack reads', () => {
+  const { dir } = createRepo({
+    ...project('dev', 'dev', ['dev']),
+    ...project('prod', 'prod', ['prod']),
+    'pulumi-affected.yaml': 'dependsOn:\n  prod/prod:\n    dev/dev: [nameServers]\n',
+  });
+  const result = select({ cwd: dir, base: 'HEAD', all: true });
+  assert.deepEqual(result.waves, [['dev/dev'], ['prod/prod']]);
+  assert.deepEqual(result.outputsRead['prod/prod'], { 'dev/dev': ['nameServers'] });
+});

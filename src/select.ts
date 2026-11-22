@@ -667,14 +667,19 @@ export class Session {
       }
     }
     for (const [pattern, dependencies] of Object.entries(this.config.dependsOn)) {
+      // A list of stacks, each read in full, or stacks mapped to the outputs that are read
+      const declared: [string, string[] | 'all'][] = Array.isArray(dependencies)
+        ? dependencies.map((dependency) => [dependency, 'all'])
+        : Object.entries(dependencies);
       for (const stack of stacks) {
         if (!matchesStack(pattern, stack)) continue;
-        for (const dependency of stacks) {
-          if (!matchesAnyStack(dependencies, dependency)) continue;
-          addEdge(graph, stack.id, dependency.id);
-          // What a stack reads from a dependency the analysis can't see is unknown
-          this.recordReads(stack.id, dependency.id, 'all');
-          this.unknownReaders.delete(stack.id);
+        for (const [dependencyPattern, outputs] of declared) {
+          for (const dependency of stacks) {
+            if (!matchesStack(dependencyPattern, dependency)) continue;
+            addEdge(graph, stack.id, dependency.id);
+            this.recordReads(stack.id, dependency.id, outputs);
+            this.unknownReaders.delete(stack.id);
+          }
         }
       }
     }

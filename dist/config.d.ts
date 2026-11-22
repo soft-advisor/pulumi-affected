@@ -7,7 +7,11 @@ export interface Config {
         exclude: string[];
     };
     stacks: string[];
-    dependsOn: Record<string, string[]>;
+    /**
+     * Dependencies analysis can't see: stack patterns, each of whose outputs may be read, or stack
+     * patterns mapped to the outputs that stand for what's read
+     */
+    dependsOn: Record<string, string[] | Record<string, string[]>>;
     after: Record<string, string[]>;
     rules: {
         when: string[];
