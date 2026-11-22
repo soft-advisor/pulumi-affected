@@ -2,3 +2,4 @@ config:
   fixture-access:accounts:
     - business
     - shop
+encryptionsalt: v1:Edu+pi6wp+Q=:v1:Q29gXc3YoNB8bZGl:3PVVwOTmBUf3okdAzTnMklsEWH8Hrg==
