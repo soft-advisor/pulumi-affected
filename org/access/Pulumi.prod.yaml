@@ -2,3 +2,4 @@ config:
   fixture-access:accounts:
     - business
     - shop
+encryptionsalt: v1:s8Zj7V/m5Kk=:v1:Cl0zRYHzw+yCGxmT:ZYQwilAv1FbjVlf8mW8c4qotl3VvcQ==
