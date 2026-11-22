@@ -34,6 +34,8 @@ export declare class GitHubApi {
      * transient failure shouldn't fail a deploy
      */
     request<T>(method: string, path: string, body?: unknown): Promise<T>;
+    /** Runs a GraphQL query or mutation */
+    graphql<T>(query: string, variables: Record<string, unknown>): Promise<T>;
     /** Every page of a list endpoint */
     list<T>(path: string): Promise<T[]>;
     private ownership;
