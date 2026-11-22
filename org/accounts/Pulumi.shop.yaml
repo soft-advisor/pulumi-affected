@@ -1,3 +1,2 @@
 config:
-  fixture-accounts:alias: shop
-encryptionsalt: v1:fm0C33T08LY=:v1:0DETYcRxBmzmkc94:jFFQnNDZ0i/J2JqCfdahJkyXAFcC/Q==
+  fixture-accounts:alias: store
