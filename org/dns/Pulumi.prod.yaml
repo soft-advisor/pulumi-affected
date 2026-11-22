@@ -1,2 +1,3 @@
 config:
   fixture-dns:domain: Example.com
+encryptionsalt: v1:+OtudeZ/Tm4=:v1:GvaTXbB9b4v4t91f:9rFWqlGiKPs1SXgUCZbnj21PY9Xqmw==
