@@ -10,6 +10,30 @@ import { findLockfile, hasPackage, LockfileError, packageClosure, readLockfile, 
 import { glob, matchesAnyGlob, matchesAnyStack, matchesStack, splitPatterns } from "./patterns.js";
 import { discoverProjects, readProject } from "./projects.js";
 import { dirnameOf, GitSnapshot, git, isInside, joinPath, repoRootOf, resolveCommit, WorktreeSnapshot, } from "./snapshot.js";
+/**
+ * Patterns in the config's dependsOn, after and createStacks that match no stack: a typo or a
+ * renamed project, which would otherwise quietly do nothing
+ */
+function unmatchedPatterns(config, stacks) {
+    const patterns = [];
+    for (const [key, value] of Object.entries(config.dependsOn)) {
+        patterns.push(['dependsOn', key]);
+        for (const dependency of Array.isArray(value) ? value : Object.keys(value)) {
+            patterns.push([`dependsOn (under ${key})`, dependency]);
+        }
+    }
+    for (const [key, value] of Object.entries(config.after)) {
+        patterns.push(['after', key]);
+        for (const predecessor of value)
+            patterns.push([`after (under ${key})`, predecessor]);
+    }
+    for (const pattern of [...config.createStacks.plan, ...config.createStacks.apply]) {
+        patterns.push(['createStacks', pattern]);
+    }
+    return patterns
+        .filter(([, pattern]) => !stacks.some((stack) => matchesStack(pattern, stack)))
+        .map(([where, pattern]) => `pulumi-affected.yaml: ${where} names "${pattern}", which matches no stack`);
+}
 export const RUN_TRAILER = 'Pulumi-Affected-Run';
 export const SKIP_TRAILER = 'Pulumi-Affected-Skip';
 /** How many reasons to list for one stack before summarizing the rest */
@@ -137,6 +161,7 @@ export function select(options) {
         dependencies: Object.fromEntries([...graph].map(([id, dependencies]) => [id, [...dependencies].sort()])),
         outputsRead: session.outputsReadRecord(),
         unknownReaders: [...session.unknownReaders].sort(),
+        declaredOutputs: session.declaredOutputs,
         createStacks: requestsFor(defaultBase).create,
         warnings: [...new Set(warnings)],
     };
@@ -156,6 +181,8 @@ export class Session {
     graphWarnings = [];
     /** Stacks that may read other stacks' outputs in ways analysis can't see */
     unknownReaders = new Set();
+    /** Outputs dependsOn says stacks read: dependency id → dependent id → outputs */
+    declaredOutputs = {};
     /** Stack id → dependency id → outputs read, filled in by dependencyGraph */
     outputsRead = new Map();
     recordReads(stack, dependency, outputs) {
@@ -548,10 +575,16 @@ export class Session {
                         addEdge(graph, stack.id, dependency.id);
                         this.recordReads(stack.id, dependency.id, outputs);
                         this.unknownReaders.delete(stack.id);
+                        if (outputs !== 'all') {
+                            const dependents = this.declaredOutputs[dependency.id] ?? {};
+                            this.declaredOutputs[dependency.id] = dependents;
+                            dependents[stack.id] = [...new Set([...(dependents[stack.id] ?? []), ...outputs])];
+                        }
                     }
                 }
             }
         }
+        this.graphWarnings.push(...unmatchedPatterns(this.config, stacks));
         // Order only: these stacks apply after those, without reading their outputs
         for (const [pattern, predecessors] of Object.entries(this.config.after)) {
             for (const stack of stacks) {
@@ -842,6 +875,7 @@ export function readDependencyGraph(options) {
         graph,
         outputsRead: session.outputsReadRecord(),
         unknownReaders: [...session.unknownReaders].sort(),
+        declaredOutputs: session.declaredOutputs,
         warnings: session.graphWarnings,
     };
 }

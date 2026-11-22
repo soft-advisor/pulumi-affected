@@ -312,3 +312,17 @@ test('dependsOn can name the outputs that stand for what a stack reads', () => {
   assert.deepEqual(result.waves, [['dev/dev'], ['prod/prod']]);
   assert.deepEqual(result.outputsRead['prod/prod'], { 'dev/dev': ['nameServers'] });
 });
+
+test('config patterns that match no stack are reported', () => {
+  const { dir } = createRepo({
+    ...project('dev', 'dev', ['dev']),
+    ...project('prod', 'prod', ['prod']),
+    'pulumi-affected.yaml':
+      'dependsOn:\n  prod/prod:\n    dve/dev: [nameServers]\nafter:\n  prdo/*: [dev/dev]\ncreateStacks:\n  apply: [nope/*]\n',
+  });
+  const warnings = select({ cwd: dir, base: 'HEAD', all: true }).warnings.join('\n');
+  assert.match(warnings, /dependsOn \(under prod\/prod\) names "dve\/dev", which matches no stack/);
+  assert.match(warnings, /after names "prdo\/\*", which matches no stack/);
+  assert.match(warnings, /createStacks names "nope\/\*", which matches no stack/);
+  assert.doesNotMatch(warnings, /"prod\/prod"|"dev\/dev"/);
+});

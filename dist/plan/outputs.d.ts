@@ -1,4 +1,4 @@
-import type { OutputsRead } from '../select.ts';
+import type { DeclaredOutputs, OutputsRead } from '../select.ts';
 export interface StaleRead {
     /** The stack reading the outputs */
     id: string;
@@ -18,3 +18,8 @@ export declare function staleReads(planned: readonly {
 }[], dependencies: Record<string, readonly string[]>, outputsRead: OutputsRead): StaleRead[];
 /** "`site/dev` outputs `pageLength`, `url`" style text for reports */
 export declare function describeRead(read: StaleRead): string;
+/**
+ * Outputs dependsOn names that a stack doesn't export: a typo, or an output since renamed, which
+ * would never change and so never bring the dependent along
+ */
+export declare function missingDeclaredOutputs(dependency: string, exported: Iterable<string>, declared: DeclaredOutputs): string[];

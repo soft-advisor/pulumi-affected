@@ -33,3 +33,18 @@ export function describeRead(read) {
         ? `reads ${outputs} from \`${read.dependency}\`, ${change}`
         : `may read ${outputs} from \`${read.dependency}\` (which outputs it reads can't be worked out), ${change}`;
 }
+/**
+ * Outputs dependsOn names that a stack doesn't export: a typo, or an output since renamed, which
+ * would never change and so never bring the dependent along
+ */
+export function missingDeclaredOutputs(dependency, exported, declared) {
+    const available = new Set(exported);
+    const warnings = [];
+    for (const [dependent, outputs] of Object.entries(declared[dependency] ?? {})) {
+        const missing = outputs.filter((output) => !available.has(output));
+        if (missing.length === 0)
+            continue;
+        warnings.push(`pulumi-affected.yaml: dependsOn says ${dependent} reads ${missing.map((output) => `"${output}"`).join(', ')} of ${dependency}, which it doesn't export${available.size > 0 ? ` (it exports ${[...available].sort().join(', ')})` : ''}`);
+    }
+    return warnings;
+}

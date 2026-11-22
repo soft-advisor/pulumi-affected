@@ -9,7 +9,7 @@ import { readDependencyGraph, type SelectOptions, select } from '../select.ts';
 import { ensureCommit, GitSnapshot, git, repoRootOf, resolveCommit } from '../snapshot.ts';
 import { mapConcurrently } from './concurrency.ts';
 import type { PreviewSummary } from './manifest.ts';
-import type { StaleRead } from './outputs.ts';
+import { missingDeclaredOutputs, type StaleRead } from './outputs.ts';
 import { initArgs, unknownReadersWarning, writeSalt } from './plan.ts';
 
 /*
@@ -65,6 +65,8 @@ export interface StackUpResult {
   counts?: Record<string, number>;
   /** Outputs the update changed */
   outputs?: string[];
+  /** Every output the stack has after the update, when they were read */
+  exported?: string[];
   /** Why it's deployed when the change didn't select it: outputs it reads changed */
   readsChanged?: StaleRead[];
 }
@@ -89,6 +91,7 @@ export async function upStacks(options: UpOptions): Promise<UpResult> {
     graph,
     outputsRead,
     unknownReaders,
+    declaredOutputs,
   } = readDependencyGraph({
     cwd: repoRoot,
     head: commit,
@@ -182,6 +185,9 @@ export async function upStacks(options: UpOptions): Promise<UpResult> {
       if (readsChanged) result.readsChanged = readsChanged;
       if (result.outcome === 'failed') failed = true;
       results.set(id, result);
+      if (result.exported) {
+        warnings.push(...missingDeclaredOutputs(id, result.exported, declaredOutputs));
+      }
 
       // Stacks reading outputs this update changed were deployed with the old values
       if (result.outputs?.length) {
@@ -281,6 +287,7 @@ async function upStack(
       const after = await readOutputs(runner, stack);
       const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
       const outputs = [...keys].filter((key) => !isDeepStrictEqual(before[key], after[key])).sort();
+      result.exported = Object.keys(after).sort();
       if (outputs.length > 0) result.outputs = outputs;
     }
     return result;
