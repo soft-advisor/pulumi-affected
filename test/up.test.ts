@@ -193,4 +193,72 @@ describe('preview, then up', { skip: !hasPulumi && 'pulumi is not installed' }, 
     });
     assert.deepEqual(outcomes(result), { 'other/prod': 'applied' });
   });
+
+  test("a cycle elsewhere doesn't lose a reader; a reader deployed later isn't a follow-up", async () => {
+    const { dir, base, runner } = setup({
+      'pulumi-affected.yaml':
+        'dependsOn:\n  down/dev: [up/dev]\n  other/dev: [other/prod]\n  other/prod: [other/dev]\n',
+      'other/Pulumi.prod.yaml': 'config: {}\n',
+    });
+    commit(dir, { 'up/Pulumi.yaml': upProgram('four') });
+    const taken = await upStacks({
+      cwd: dir,
+      runner,
+      concurrency: 2,
+      select: { base },
+      outputReaders: 'up',
+    });
+    assert.deepEqual(outcomes(taken), { 'up/dev': 'applied', 'down/dev': 'applied' });
+    assert.equal(output(dir, 'down'), 'four');
+
+    // Both selected, readers only listed: down still runs after up, so it isn't a follow-up
+    const next = run(dir, 'git', ['rev-parse', 'HEAD']).trim();
+    commit(dir, { 'up/Pulumi.yaml': upProgram('five'), 'down/Pulumi.yaml': downProgram('!') });
+    const listed = await upStacks({
+      cwd: dir,
+      runner,
+      concurrency: 2,
+      select: { base: next },
+      outputReaders: 'warn',
+    });
+    assert.deepEqual(outcomes(listed), { 'up/dev': 'applied', 'down/dev': 'applied' });
+    assert.deepEqual(listed.followUps, []);
+    assert.equal(output(dir, 'down'), 'five!');
+  });
+
+  test('stacks outside the allow-list refuse the whole deploy', async () => {
+    const { dir, base, runner } = setup();
+    commit(dir, { 'up/Pulumi.yaml': upProgram('six'), 'other/Pulumi.yaml': otherProgram('sixth') });
+    await assert.rejects(
+      upStacks({
+        cwd: dir,
+        runner,
+        concurrency: 2,
+        select: { base },
+        outputReaders: 'up',
+        allow: ['other/*'],
+      }),
+      /up\/dev is selected but not among the stacks allowed/,
+    );
+    assert.equal(output(dir, 'up'), 'one');
+  });
+
+  test('a stack the preview found unchanged is deployed if it changed since', async () => {
+    const { dir, base, runner } = setup();
+    commit(dir, { 'other/Pulumi.yaml': otherProgram('previewed') });
+    const previewed = run(dir, 'git', ['rev-parse', 'HEAD']).trim();
+    // Merged after the preview: other changes again
+    commit(dir, {
+      'other/Pulumi.yaml': 'name: other\nruntime: yaml\noutputs:\n  constant: same\n  added: yes\n',
+    });
+    const result = await upStacks({
+      cwd: dir,
+      runner,
+      concurrency: 2,
+      select: { base },
+      previews: { changed: new Set(), unchanged: new Set(['other/dev']), head: previewed },
+      outputReaders: 'up',
+    });
+    assert.deepEqual(outcomes(result), { 'other/dev': 'applied' });
+  });
 });

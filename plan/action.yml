@@ -101,7 +101,7 @@ outputs:
     description: Absolute path of the plan directory.
     value: ${{ steps.plan.outputs.directory }}
   artifact:
-    description: The artifact name, pulumi-plans-<git tree SHA>.
+    description: The artifact name, pulumi-plans-<git tree SHA> (mode plan) or pulumi-previews-<pull request number> (mode preview).
     value: ${{ steps.plan.outputs.artifact }}
   tree:
     description: The git tree SHA that was planned.

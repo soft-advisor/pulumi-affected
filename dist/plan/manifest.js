@@ -110,5 +110,6 @@ export function readPreviewSummary(directory) {
         unchanged.delete(id);
     for (const id of changed)
         unchanged.delete(id);
-    return { changed, unchanged };
+    const head = typeof manifest.head === 'string' && SHA.test(manifest.head) ? manifest.head : undefined;
+    return { changed, unchanged, ...(head ? { head } : {}) };
 }

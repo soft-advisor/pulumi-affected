@@ -1,12 +1,12 @@
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { loadConfig } from "../config.js";
-import { CycleError, computeWaves, dependentsOf } from "../graph.js";
+import { dependentsOf } from "../graph.js";
 import { matchesAnyStack } from "../patterns.js";
 import { errorText } from "../pulumi/runner.js";
 import { readOutputs, recentUpdates, stateFingerprint } from "../pulumi/stack.js";
 import { readDependencyGraph, select } from "../select.js";
-import { GitSnapshot, repoRootOf, resolveCommit } from "../snapshot.js";
+import { ensureCommit, GitSnapshot, repoRootOf, resolveCommit } from "../snapshot.js";
 import { mapConcurrently } from "./concurrency.js";
 import { initArgs, unknownReadersWarning, writeSalt } from "./plan.js";
 const RAN = new Set(['applied', 'unchanged']);
@@ -25,31 +25,55 @@ export async function upStacks(options) {
         const stack = byId.get(id);
         return stack !== undefined && (!options.allow || matchesAnyStack(options.allow, stack));
     };
+    const refused = selection.stacks.filter((stack) => !allowed(stack.id));
+    if (refused.length > 0) {
+        throw new Error(`${refused.map((stack) => stack.id).join(', ')} ${refused.length === 1 ? 'is' : 'are'} selected but not among the stacks allowed to deploy`);
+    }
+    // The preview's "no changes" only holds for the code it previewed: a stack that changed since
+    // (main moved on, or a deploy in between failed) is deployed anyway
+    const unchanged = new Set(options.previews?.unchanged ?? []);
+    if (options.previews) {
+        const since = changedSince(repoRoot, options.previews.head, commit, config);
+        if (since === undefined)
+            unchanged.clear();
+        else
+            for (const id of since)
+                unchanged.delete(id);
+    }
     // Selected stacks to deploy, and why; the preview can only take some out
     const toRun = new Map();
     const results = new Map();
     for (const stack of selection.stacks) {
-        if (options.previews?.unchanged.has(stack.id)) {
+        if (unchanged.has(stack.id))
             results.set(stack.id, { id: stack.id, outcome: 'unchanged' });
-        }
-        else {
+        else
             toRun.set(stack.id, undefined);
-        }
     }
     const warnings = [];
     const followUps = [];
     const changedOutputs = [];
     let failed = false;
-    for (const wave of orderedWaves(graph, known.map((stack) => stack.id))) {
-        const stacks = wave.filter((id) => toRun.has(id));
-        await mapConcurrently(stacks, options.concurrency, async (id) => {
+    const done = (id) => {
+        const outcome = results.get(id)?.outcome;
+        return outcome !== undefined && outcome !== 'unchanged';
+    };
+    const pending = () => [...toRun.keys()].filter((id) => !done(id));
+    // A stack runs once the stacks it depends on that are being deployed have run. Readers added
+    // along the way are scheduled the same way, so they always come after what they read; in a
+    // cycle, the stack waiting on the fewest others goes first.
+    for (let waiting = pending(); waiting.length > 0; waiting = pending()) {
+        const blockers = (id) => [...(graph.get(id) ?? [])].filter((dependency) => waiting.includes(dependency));
+        let ready = waiting.filter((id) => blockers(id).length === 0);
+        if (ready.length === 0) {
+            ready = [
+                [...waiting].sort((a, b) => blockers(a).length - blockers(b).length || a.localeCompare(b))[0],
+            ];
+        }
+        await mapConcurrently(ready.sort(), options.concurrency, async (id) => {
             const stack = byId.get(id);
             let result;
             if (!stack) {
                 result = { id, outcome: 'failed', error: "it isn't a stack this commit defines" };
-            }
-            else if (!allowed(id)) {
-                result = { id, outcome: 'failed', error: "it isn't one of the stacks allowed to deploy" };
             }
             else if (options.failFast && failed) {
                 result = {
@@ -87,13 +111,14 @@ export async function upStacks(options) {
                         outputs: read,
                         certain: reads !== 'all',
                     };
-                    if (options.outputReaders === 'up' && allowed(dependent)) {
-                        // It comes in a later wave, as it depends on this stack
+                    const comesLater = toRun.has(dependent) && !done(dependent);
+                    if (options.outputReaders === 'up' && allowed(dependent) && !done(dependent)) {
                         toRun.set(dependent, [...(toRun.get(dependent) ?? []), stale]);
                         if (results.get(dependent)?.outcome === 'unchanged')
                             results.delete(dependent);
                     }
-                    else {
+                    else if (!comesLater) {
+                        // Deployed already (in a cycle), or not at all: it needs deploying again
                         followUps.push(stale);
                     }
                 }
@@ -113,15 +138,18 @@ export async function upStacks(options) {
         ok: stacks.every((stack) => RAN.has(stack.outcome)),
     };
 }
-/** Waves over every stack, so readers of changed outputs come after what they read */
-function orderedWaves(graph, ids) {
+/**
+ * The stacks a change from the previewed commit to this one selects, or undefined when that
+ * commit can't be found (then nothing the preview says is trusted)
+ */
+function changedSince(repoRoot, previewed, commit, config) {
+    if (!previewed || !ensureCommit(repoRoot, previewed))
+        return undefined;
     try {
-        return computeWaves(graph, ids);
+        return new Set(select({ cwd: repoRoot, base: previewed, head: commit, config }).stacks.map((stack) => stack.id));
     }
-    catch (error) {
-        if (!(error instanceof CycleError))
-            throw error;
-        return [...ids].sort().map((id) => [id]);
+    catch {
+        return undefined;
     }
 }
 async function upStack(stack, repoRoot, hasDependents, runner) {

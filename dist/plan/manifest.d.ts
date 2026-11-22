@@ -93,6 +93,8 @@ export declare function readManifest(directory: string): Manifest;
 export interface PreviewSummary {
     changed: Set<string>;
     unchanged: Set<string>;
+    /** The commit previewed, if the manifest names a well-formed one */
+    head?: string;
 }
 /**
  * Reads a preview manifest (plan's `mode: preview`). It comes from the job that ran the pull

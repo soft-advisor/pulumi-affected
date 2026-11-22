@@ -196,7 +196,13 @@ async function up() {
     const cwd = input('working-directory') || process.cwd();
     const repoRoot = repoRootOf(cwd);
     const directory = input('plans');
-    const previews = directory ? readPreviewSummary(resolve(directory)) : undefined;
+    let previews;
+    try {
+        previews = directory ? readPreviewSummary(resolve(directory)) : undefined;
+    }
+    catch (caught) {
+        warning(`Can't read the preview list: ${caught instanceof Error ? caught.message : caught}`);
+    }
     if (!previews) {
         notice('No preview list from the pull request, so every stack the change selects is deployed');
     }
@@ -222,12 +228,14 @@ async function up() {
         warning(`Deploy ${read.id} next: it ${describeRead(read)}`);
     const report = renderUp(result, (index) => marker('apply', index));
     appendSummary(report.summary);
+    const needsPlan = [...new Set(result.followUps.map((read) => read.id))].sort();
     setOutput('result', JSON.stringify({
         stacks: result.stacks,
+        needsPlan,
         followUps: result.followUps,
         warnings: result.warnings,
     }));
-    setOutput('needs-plan', JSON.stringify([...new Set(result.followUps.map((read) => read.id))]));
+    setOutput('needs-plan', JSON.stringify(needsPlan));
     setOutput('failed', result.ok ? 'false' : 'true');
     await comment(report.bodies, cwd);
     if (!result.ok)
@@ -240,9 +248,22 @@ async function up() {
  */
 async function locatePreviews(sha) {
     setOutput('download', 'false');
+    const directory = input('directory');
+    if (directory && existsSync(join(resolve(directory), MANIFEST_FILE))) {
+        setOutput('directory', resolve(directory));
+        return;
+    }
     const token = input('github-token');
     if (!token)
         return;
+    try {
+        await findPreviews(token, sha);
+    }
+    catch (caught) {
+        warning(`Couldn't look for the pull request's preview list, so every selected stack is deployed: ${caught instanceof Error ? caught.message : caught}`);
+    }
+}
+async function findPreviews(token, sha) {
     const api = new GitHubApi(token);
     const heads = await trustedHeads(api, sha);
     const pulls = await pullRequestsOf(api, sha);

@@ -91,29 +91,19 @@ inputs:
     default: ${{ github.token }}
 
 outputs:
-  mode:
-    description: >-
-      plan: apply exactly the plans the plan action saved (strict). up: deploy the merged change
-      with pulumi up, skipping stacks the pull request's preview (plan's mode preview) found no
-      changes in. See docs/modes.md.
-    required: false
-    default: plan
-  output-readers:
-    description: >-
-      Mode up: up (also deploy stacks that read outputs a deploy changed, after it) or warn (only
-      list them). Default: the config's outputReaders, else up.
-    required: false
   directory:
     description: Absolute path of the plan directory.
     value: ${{ steps.apply.outputs.directory }}
   result:
-    description: JSON with each stack's outcome (applied, already-applied, refused, failed, skipped), needsPlan and warnings.
+    description: >-
+      JSON with each stack's outcome (mode plan: applied, already-applied, refused, failed,
+      skipped; mode up: applied, unchanged, failed, skipped), needsPlan, followUps and warnings.
     value: ${{ steps.apply.outputs.result }}
   needs-plan:
-    description: JSON array of unplanned stacks that read outputs the apply changed.
+    description: JSON array of stacks that read outputs the apply changed and weren't deployed with them.
     value: ${{ steps.apply.outputs.needs-plan }}
   failed:
-    description: "'true' when a plan wasn't applied; the action fails after commenting."
+    description: "'true' when a stack wasn't applied or deployed; the action fails after commenting."
     value: ${{ steps.apply.outputs.failed }}
 
 runs:

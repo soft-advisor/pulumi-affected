@@ -1,12 +1,12 @@
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { loadConfig } from '../config.ts';
-import { CycleError, computeWaves, type DependencyGraph, dependentsOf } from '../graph.ts';
+import { dependentsOf } from '../graph.ts';
 import { matchesAnyStack } from '../patterns.ts';
 import { errorText, type PulumiRunner } from '../pulumi/runner.ts';
 import { readOutputs, recentUpdates, stateFingerprint } from '../pulumi/stack.ts';
 import { readDependencyGraph, type SelectOptions, select } from '../select.ts';
-import { GitSnapshot, repoRootOf, resolveCommit } from '../snapshot.ts';
+import { ensureCommit, GitSnapshot, repoRootOf, resolveCommit } from '../snapshot.ts';
 import { mapConcurrently } from './concurrency.ts';
 import type { PreviewSummary } from './manifest.ts';
 import type { StaleRead } from './outputs.ts';
@@ -94,34 +94,58 @@ export async function upStacks(options: UpOptions): Promise<UpResult> {
     const stack = byId.get(id);
     return stack !== undefined && (!options.allow || matchesAnyStack(options.allow, stack));
   };
+  const refused = selection.stacks.filter((stack) => !allowed(stack.id));
+  if (refused.length > 0) {
+    throw new Error(
+      `${refused.map((stack) => stack.id).join(', ')} ${refused.length === 1 ? 'is' : 'are'} selected but not among the stacks allowed to deploy`,
+    );
+  }
+
+  // The preview's "no changes" only holds for the code it previewed: a stack that changed since
+  // (main moved on, or a deploy in between failed) is deployed anyway
+  const unchanged = new Set(options.previews?.unchanged ?? []);
+  if (options.previews) {
+    const since = changedSince(repoRoot, options.previews.head, commit, config);
+    if (since === undefined) unchanged.clear();
+    else for (const id of since) unchanged.delete(id);
+  }
 
   // Selected stacks to deploy, and why; the preview can only take some out
   const toRun = new Map<string, StaleRead[] | undefined>();
   const results = new Map<string, StackUpResult>();
   for (const stack of selection.stacks) {
-    if (options.previews?.unchanged.has(stack.id)) {
-      results.set(stack.id, { id: stack.id, outcome: 'unchanged' });
-    } else {
-      toRun.set(stack.id, undefined);
-    }
+    if (unchanged.has(stack.id)) results.set(stack.id, { id: stack.id, outcome: 'unchanged' });
+    else toRun.set(stack.id, undefined);
   }
 
   const warnings: string[] = [];
   const followUps: StaleRead[] = [];
   const changedOutputs: { id: string }[] = [];
   let failed = false;
-  for (const wave of orderedWaves(
-    graph,
-    known.map((stack) => stack.id),
-  )) {
-    const stacks = wave.filter((id) => toRun.has(id));
-    await mapConcurrently(stacks, options.concurrency, async (id) => {
+  const done = (id: string) => {
+    const outcome = results.get(id)?.outcome;
+    return outcome !== undefined && outcome !== 'unchanged';
+  };
+  const pending = () => [...toRun.keys()].filter((id) => !done(id));
+  // A stack runs once the stacks it depends on that are being deployed have run. Readers added
+  // along the way are scheduled the same way, so they always come after what they read; in a
+  // cycle, the stack waiting on the fewest others goes first.
+  for (let waiting = pending(); waiting.length > 0; waiting = pending()) {
+    const blockers = (id: string) =>
+      [...(graph.get(id) ?? [])].filter((dependency) => waiting.includes(dependency));
+    let ready = waiting.filter((id) => blockers(id).length === 0);
+    if (ready.length === 0) {
+      ready = [
+        [...waiting].sort(
+          (a, b) => blockers(a).length - blockers(b).length || a.localeCompare(b),
+        )[0],
+      ];
+    }
+    await mapConcurrently(ready.sort(), options.concurrency, async (id) => {
       const stack = byId.get(id);
       let result: StackUpResult;
       if (!stack) {
         result = { id, outcome: 'failed', error: "it isn't a stack this commit defines" };
-      } else if (!allowed(id)) {
-        result = { id, outcome: 'failed', error: "it isn't one of the stacks allowed to deploy" };
       } else if (options.failFast && failed) {
         result = {
           id,
@@ -156,11 +180,12 @@ export async function upStacks(options: UpOptions): Promise<UpResult> {
             outputs: read,
             certain: reads !== 'all',
           };
-          if (options.outputReaders === 'up' && allowed(dependent)) {
-            // It comes in a later wave, as it depends on this stack
+          const comesLater = toRun.has(dependent) && !done(dependent);
+          if (options.outputReaders === 'up' && allowed(dependent) && !done(dependent)) {
             toRun.set(dependent, [...(toRun.get(dependent) ?? []), stale]);
             if (results.get(dependent)?.outcome === 'unchanged') results.delete(dependent);
-          } else {
+          } else if (!comesLater) {
+            // Deployed already (in a cycle), or not at all: it needs deploying again
             followUps.push(stale);
           }
         }
@@ -182,13 +207,25 @@ export async function upStacks(options: UpOptions): Promise<UpResult> {
   };
 }
 
-/** Waves over every stack, so readers of changed outputs come after what they read */
-function orderedWaves(graph: DependencyGraph, ids: string[]) {
+/**
+ * The stacks a change from the previewed commit to this one selects, or undefined when that
+ * commit can't be found (then nothing the preview says is trusted)
+ */
+function changedSince(
+  repoRoot: string,
+  previewed: string | undefined,
+  commit: string,
+  config: ReturnType<typeof loadConfig>,
+) {
+  if (!previewed || !ensureCommit(repoRoot, previewed)) return undefined;
   try {
-    return computeWaves(graph, ids);
-  } catch (error) {
-    if (!(error instanceof CycleError)) throw error;
-    return [...ids].sort().map((id) => [id]);
+    return new Set(
+      select({ cwd: repoRoot, base: previewed, head: commit, config }).stacks.map(
+        (stack) => stack.id,
+      ),
+    );
+  } catch {
+    return undefined;
   }
 }
 

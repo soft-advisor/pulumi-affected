@@ -181,6 +181,8 @@ export function readManifest(directory: string): Manifest {
 export interface PreviewSummary {
   changed: Set<string>;
   unchanged: Set<string>;
+  /** The commit previewed, if the manifest names a well-formed one */
+  head?: string;
 }
 
 /**
@@ -211,5 +213,7 @@ export function readPreviewSummary(directory: string): PreviewSummary {
   const unchanged = ids(manifest.unchanged);
   for (const id of ids(manifest.failed)) unchanged.delete(id);
   for (const id of changed) unchanged.delete(id);
-  return { changed, unchanged };
+  const head =
+    typeof manifest.head === 'string' && SHA.test(manifest.head) ? manifest.head : undefined;
+  return { changed, unchanged, ...(head ? { head } : {}) };
 }

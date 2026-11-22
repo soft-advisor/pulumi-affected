@@ -2,7 +2,7 @@ import { existsSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { type ApplyOptions, applyPlans } from '../plan/apply.ts';
 import { eventContext } from './context.ts';
-import { MANIFEST_FILE, readPreviewSummary } from '../plan/manifest.ts';
+import { MANIFEST_FILE, type PreviewSummary, readPreviewSummary } from '../plan/manifest.ts';
 import { upStacks } from '../plan/up.ts';
 import { describeRead } from '../plan/outputs.ts';
 import { renderApply, renderUp } from '../plan/report.ts';
@@ -249,7 +249,12 @@ async function up() {
   const cwd = input('working-directory') || process.cwd();
   const repoRoot = repoRootOf(cwd);
   const directory = input('plans');
-  const previews = directory ? readPreviewSummary(resolve(directory)) : undefined;
+  let previews: PreviewSummary | undefined;
+  try {
+    previews = directory ? readPreviewSummary(resolve(directory)) : undefined;
+  } catch (caught) {
+    warning(`Can't read the preview list: ${caught instanceof Error ? caught.message : caught}`);
+  }
   if (!previews) {
     notice('No preview list from the pull request, so every stack the change selects is deployed');
   }
@@ -271,15 +276,17 @@ async function up() {
   for (const read of result.followUps) warning(`Deploy ${read.id} next: it ${describeRead(read)}`);
   const report = renderUp(result, (index) => marker('apply', index));
   appendSummary(report.summary);
+  const needsPlan = [...new Set(result.followUps.map((read) => read.id))].sort();
   setOutput(
     'result',
     JSON.stringify({
       stacks: result.stacks,
+      needsPlan,
       followUps: result.followUps,
       warnings: result.warnings,
     }),
   );
-  setOutput('needs-plan', JSON.stringify([...new Set(result.followUps.map((read) => read.id))]));
+  setOutput('needs-plan', JSON.stringify(needsPlan));
   setOutput('failed', result.ok ? 'false' : 'true');
   await comment(report.bodies, cwd);
   if (!result.ok) error('Not every stack was deployed');
@@ -292,8 +299,23 @@ async function up() {
  */
 async function locatePreviews(sha: string) {
   setOutput('download', 'false');
+  const directory = input('directory');
+  if (directory && existsSync(join(resolve(directory), MANIFEST_FILE))) {
+    setOutput('directory', resolve(directory));
+    return;
+  }
   const token = input('github-token');
   if (!token) return;
+  try {
+    await findPreviews(token, sha);
+  } catch (caught) {
+    warning(
+      `Couldn't look for the pull request's preview list, so every selected stack is deployed: ${caught instanceof Error ? caught.message : caught}`,
+    );
+  }
+}
+
+async function findPreviews(token: string, sha: string) {
   const api = new GitHubApi(token);
   const heads = await trustedHeads(api, sha);
   const pulls = await pullRequestsOf(api, sha);
