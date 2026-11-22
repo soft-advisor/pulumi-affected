@@ -39,6 +39,11 @@ export const configSchema = {
             type: 'object',
             additionalProperties: { $ref: '#/definitions/stackPatterns' },
         },
+        after: {
+            description: "Order only: the key's stacks apply after these, when both are planned, without reading their outputs (dependsOn assumes every output is read). Keys and values are stack patterns.",
+            type: 'object',
+            additionalProperties: { $ref: '#/definitions/stackPatterns' },
+        },
         rules: {
             description: 'Select stacks when files change in any way, even whitespace',
             type: 'array',

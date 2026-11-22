@@ -56,6 +56,13 @@ export declare const configSchema: {
                 readonly $ref: "#/definitions/stackPatterns";
             };
         };
+        readonly after: {
+            readonly description: "Order only: the key's stacks apply after these, when both are planned, without reading their outputs (dependsOn assumes every output is read). Keys and values are stack patterns.";
+            readonly type: "object";
+            readonly additionalProperties: {
+                readonly $ref: "#/definitions/stackPatterns";
+            };
+        };
         readonly rules: {
             readonly description: "Select stacks when files change in any way, even whitespace";
             readonly type: "array";

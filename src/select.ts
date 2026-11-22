@@ -676,6 +676,17 @@ export class Session {
         }
       }
     }
+    // Order only: these stacks apply after those, without reading their outputs
+    for (const [pattern, predecessors] of Object.entries(this.config.after)) {
+      for (const stack of stacks) {
+        if (!matchesStack(pattern, stack)) continue;
+        for (const predecessor of stacks) {
+          if (!matchesAnyStack(predecessors, predecessor)) continue;
+          addEdge(graph, stack.id, predecessor.id);
+          this.recordReads(stack.id, predecessor.id, []);
+        }
+      }
+    }
     return graph;
   }
 }

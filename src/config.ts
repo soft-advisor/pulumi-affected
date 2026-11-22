@@ -10,6 +10,7 @@ export interface Config {
   projects: { include: string[]; exclude: string[] };
   stacks: string[];
   dependsOn: Record<string, string[]>;
+  after: Record<string, string[]>;
   rules: { when: string[]; run: string[] }[];
   always: string[];
   inputs: Record<string, string[]>;
@@ -35,6 +36,7 @@ export function defaultConfig(): Config {
     projects: { include: ['**'], exclude: [] },
     stacks: [],
     dependsOn: {},
+    after: {},
     rules: [],
     always: [],
     inputs: {},
@@ -73,6 +75,7 @@ export function parseConfig(text: string, path = CONFIG_FILE): Config {
     },
     stacks: parsed.stacks ?? [],
     dependsOn: parsed.dependsOn ?? {},
+    after: parsed.after ?? {},
     rules: parsed.rules ?? [],
     always: parsed.always ?? [],
     inputs: parsed.inputs ?? {},

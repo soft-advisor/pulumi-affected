@@ -10,6 +10,8 @@ projects:
 stacks: [site/preview] # stacks without a Pulumi.<stack>.yaml
 dependsOn:
   site/prod: [site/dev] # prod looks up dev's DNS zone in the cloud
+after: # order only: applied after these when both are planned, reading none of their outputs
+  accounts/*: [org/prod, accounts/management]
 rules:
   - when: ['scripts/pulumi.sh']
     run: [all]

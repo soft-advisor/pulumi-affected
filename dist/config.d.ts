@@ -8,6 +8,7 @@ export interface Config {
     };
     stacks: string[];
     dependsOn: Record<string, string[]>;
+    after: Record<string, string[]>;
     rules: {
         when: string[];
         run: string[];
