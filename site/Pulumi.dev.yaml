@@ -1,2 +1,3 @@
 config:
   fixture-site:env: dev
+encryptionsalt: v1:muB+A2M0/74=:v1:hzZs8sfuyWRaeBnm:pqleSjOzjp/mv2dEAPY4QugJILzFvg==
