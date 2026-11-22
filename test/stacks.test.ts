@@ -294,3 +294,10 @@ test('after orders stacks without assuming they read any outputs', () => {
     'org/prod': [],
   });
 });
+
+test('changesOnly ignores request lines and counts only changes', () => {
+  const { dir, base } = createRepo(ACCOUNTS);
+  commit(dir, {}, 'Merge\n\nPulumi-Affected-Run: org-accounts/business');
+  assert.deepEqual(selectedIds(select({ cwd: dir, base })), ['org-accounts/business']);
+  assert.deepEqual(selectedIds(select({ cwd: dir, base, changesOnly: true })), []);
+});

@@ -16,6 +16,8 @@ interface HistoryEntry {
     kind?: string;
     result?: string;
     message?: string;
+    /** Resources per operation, e.g. { create: 2, same: 5 } */
+    resourceChanges?: Record<string, number>;
 }
 /** The stack's newest history entries, newest first */
 export declare function recentUpdates(runner: PulumiRunner, stack: StackTarget, count?: number): Promise<HistoryEntry[]>;

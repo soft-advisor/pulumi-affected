@@ -53,6 +53,8 @@ export interface SelectOptions {
   all?: boolean;
   /** Text that may carry Pulumi-Affected-Run/Skip lines, e.g. a pull request description */
   messages?: string[];
+  /** Only changes count: Pulumi-Affected-* lines in commits and messages are ignored */
+  changesOnly?: boolean;
   config?: Config;
 }
 
@@ -946,6 +948,7 @@ function readRequests(repoRoot: string, base: string, options: SelectOptions) {
     }
   };
 
+  if (options.changesOnly) return { run, skip, create, malformed };
   const headRev = options.head ?? 'HEAD';
   // Oldest first, so later lines (newer commits, then the pull request) take precedence
   const log = git(repoRoot, ['log', '--reverse', '--format=%h%x00%B%x01', `${base}..${headRev}`]);

@@ -95,6 +95,10 @@ export declare const configSchema: {
             readonly description: "Files whose content change selects every stack. Default: .nvmrc and .node-version.";
             readonly $ref: "#/definitions/globs";
         };
+        readonly outputReaders: {
+            readonly description: "With plan's mode preview and apply's mode up: deploy the stacks that read outputs a deploy changed, after it and with the new values (up, the default), or only list them, to deploy later (warn)";
+            readonly enum: readonly ["up", "warn"];
+        };
         readonly createStacks: {
             readonly description: "When stacks that don't exist yet are created. plan: the plan job creates them, empty, and plans them; apply: they must have no resources in the change that adds them, and the apply job creates them. The plan action's create-stacks input is the default; a Pulumi-Affected-Create-Stacks line in a pull request overrides both.";
             readonly type: "object";

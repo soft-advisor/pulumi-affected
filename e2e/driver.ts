@@ -35,6 +35,8 @@ interface Scenario {
   applied: string[];
   /** A stack to update after planning, so applying its plan is refused */
   changeState?: string;
+  /** preview: plan's mode preview and apply's mode up, instead of saved plans */
+  mode?: 'preview';
   /** The plan action's create-stacks input */
   createStacks?: 'plan' | 'apply';
   /** Stacks whose plan is refused */
@@ -214,6 +216,8 @@ function prepare(index: number, dir: string) {
   output('head-sha', head);
   output('banner', scenario.banner ?? '');
   output('create-stacks', scenario.createStacks ?? 'plan');
+  output('plan-mode', scenario.mode ?? 'plan');
+  output('apply-mode', scenario.mode === 'preview' ? 'up' : 'plan');
 }
 
 function writeChanges(dir: string, changes: Record<string, string | null>) {
@@ -334,7 +338,7 @@ function changeState(index: number, dir: string) {
 
 interface ApplyResult {
   stacks: { id: string; outcome: string }[];
-  needsPlan: string[];
+  needsPlan?: string[];
 }
 
 function assertApply(index: number) {
@@ -352,9 +356,11 @@ function assertApply(index: number) {
   same(withOutcome('applied', result), scenario.applied, 'applied');
   same(withOutcome('refused', result), refused, 'refused');
   same(withOutcome('skipped', result), [], 'skipped');
-  if (expectedOutcome === 'success')
-    same(result.needsPlan, scenario.needsPlan ?? [], 'to plan again');
   if (expectedOutcome === 'success') {
+    same(result.needsPlan ?? [], scenario.needsPlan ?? [], 'to plan again');
+  }
+  // Deploying with up again just runs up again; only saved plans are recognised as applied
+  if (expectedOutcome === 'success' && scenario.mode !== 'preview') {
     // Applying the same plans again finds them all applied already
     const again = JSON.parse(process.env.REAPPLY_RESULT || '{"stacks":[]}') as ApplyResult;
     same(withOutcome('already-applied', again), scenario.applied, 'already applied on a rerun');

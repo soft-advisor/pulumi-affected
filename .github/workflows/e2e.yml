@@ -113,6 +113,7 @@ jobs:
           # The wrapper prints BANNER first, as scripts that assume a role often do
           command: sh ${{ github.workspace }}/tool/e2e/wrapper.sh --cwd {dir} --stack {stack}
           create-stacks: ${{ steps.prepare.outputs.create-stacks }}
+          mode: ${{ steps.prepare.outputs.plan-mode }}
           pull-request: ${{ steps.prepare.outputs.pull-request }}
           retention-days: 1
       - name: Check the plans
@@ -141,8 +142,9 @@ jobs:
           base: ${{ steps.prepare.outputs.base-sha }}
           # The plans were uploaded by this run, which runs on the tool's own commit
           plan-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          mode: ${{ steps.prepare.outputs.apply-mode }}
       - id: reapply
-        if: steps.apply.outcome == 'success'
+        if: steps.apply.outcome == 'success' && steps.prepare.outputs.apply-mode == 'plan'
         uses: ./tool/apply
         with:
           directory: ${{ steps.apply.outputs.directory }}

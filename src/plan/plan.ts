@@ -66,8 +66,15 @@ export interface PlanOptions {
   createStacks?: CreateStacks;
   /** Stop planning at the first stack that fails, instead of planning every other one */
   failFast?: boolean;
+  /**
+   * `plan` (the default): save the plans, for `apply` to apply exactly. `preview`: only preview,
+   * to show what the change will do; after merge, `up` deploys the stacks with changes.
+   */
+  mode?: PlanMode;
   onFinish?: (outcome: StackOutcome) => void;
 }
+
+export type PlanMode = 'plan' | 'preview';
 
 export type StackOutcome =
   | { kind: 'planned'; stack: PlannedStack }
@@ -113,14 +120,16 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
   }
 
   // A planned stack reading outputs another plan changes was planned with their old values: its
-  // plan can only be right once the other is applied, so it belongs in a later change
+  // plan can only be right once the other is applied, so it belongs in a later change. A
+  // preview only informs: `up` deploys it after the other, with the new values.
+  const preview = options.mode === 'preview';
   const planned = outcomes.flatMap((outcome) =>
     outcome.kind === 'planned' ? [outcome.stack] : [],
   );
   const stale = staleReads(planned, selection.dependencies, selection.outputsRead);
   const blocked = new Map<string, StaleRead[]>();
   for (const read of stale) {
-    if (planned.some((stack) => stack.id === read.id)) {
+    if (!preview && planned.some((stack) => stack.id === read.id)) {
       blocked.set(read.id, [...(blocked.get(read.id) ?? []), read]);
     }
   }
@@ -149,8 +158,17 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
     warnings.push(unknownReadersWarning(changesOutputs, selection.unknownReaders));
   }
 
+  // Previews leave no plans behind: `up` doesn't use them
+  if (preview) {
+    for (const stack of planned) {
+      rmSync(join(directory, stack.plan), { force: true });
+      rmSync(join(directory, stack.preview), { force: true });
+    }
+  }
+
   const manifest: Manifest = {
     version: 2,
+    ...(preview ? { mode: 'preview' as const } : {}),
     tree: git(repoRoot, ['rev-parse', 'HEAD^{tree}']).trim(),
     head: git(repoRoot, ['rev-parse', 'HEAD']).trim(),
     base: selection.base,
@@ -282,12 +300,19 @@ async function planStack(stack: SelectedStack, context: StackContext): Promise<S
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
   }
-  if (createOnApply && !secretsCarried && planHasSecrets(readFileSync(planPath, 'utf8'))) {
+  // A preview only informs; `up` creates the stack with whatever it has
+  const strict = context.mode !== 'preview';
+  if (
+    strict &&
+    createOnApply &&
+    !secretsCarried &&
+    planHasSecrets(readFileSync(planPath, 'utf8'))
+  ) {
     return fail(
       `It doesn't exist yet, and it's created when applying (create-stacks: apply), but its plan holds secrets, which can only be carried to the real stack with passphrase secrets and PULUMI_CONFIG_PASSPHRASE set. Create it when planning with Pulumi-Affected-Create-Stacks: plan ${stack.id}`,
     );
   }
-  if (createOnApply && classification.changes.length > 0) {
+  if (strict && createOnApply && classification.changes.length > 0) {
     const resources = classification.changes.map((change) => `${change.type} ${change.name}`);
     return fail(
       `It doesn't exist yet, and it's created when applying (create-stacks: apply), so the change that adds it must give it no resources; this one would create ${resources.length}: ${resources.slice(0, 10).join(', ')}${resources.length > 10 ? ', …' : ''}. Add the stack first, empty, and its resources in a later pull request; or create it when planning with Pulumi-Affected-Create-Stacks: plan ${stack.id}`,

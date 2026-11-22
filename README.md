@@ -50,6 +50,8 @@ jobs:
       - uses: soft-advisor/pulumi-affected/apply@v0
 ```
 
+This is the strict mode: the merge applies exactly the plans reviewed. For a preview on the pull request and a `pulumi up` after merge instead, set `mode: preview` and `mode: up`; see [modes](docs/modes.md).
+
 Pin the actions to a commit SHA in production. Read [Guardrails](docs/guardrails.md) before relying on this: your repository's rules (approvals, up-to-date branches) are what make plans safe to apply.
 
 ## Forcing a stack
@@ -67,15 +69,16 @@ Stack patterns are `<project>/<stack>`, where `<project>` is the project's name 
 
 ## Documentation
 
-|                                                  |                                                                                                  |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
-| [How detection works](docs/detection.md)         | What selects a stack: code, packages, config, files read, stack references; forcing and skipping |
-| [Configuration](docs/configuration.md)           | `pulumi-affected.yaml`                                                                           |
-| [GitHub Actions](docs/actions.md)                | `select`, `classify`, `plan` and `apply`: inputs, outputs and what each checks                   |
-| [Example workflows](docs/workflows.md)           | Plan and apply, keeping undeployed code from being missed, recovering, drift checks              |
-| [New stacks](docs/new-stacks.md)                 | Creating stacks when planning or when applying                                                   |
-| [Guardrails and limitations](docs/guardrails.md) | What your repository must enforce, and what isn't covered                                        |
-| [Development and releasing](docs/development.md) | Working on this repository                                                                       |
+|                                                    |                                                                                                  |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| [How detection works](docs/detection.md)           | What selects a stack: code, packages, config, files read, stack references; forcing and skipping |
+| [Configuration](docs/configuration.md)             | `pulumi-affected.yaml`                                                                           |
+| [GitHub Actions](docs/actions.md)                  | `select`, `classify`, `plan` and `apply`: inputs, outputs and what each checks                   |
+| [Example workflows](docs/workflows.md)             | Plan and apply, keeping undeployed code from being missed, recovering, drift checks              |
+| [Plan and apply, or preview and up](docs/modes.md) | Applying exactly the reviewed plans, or previewing and deploying with `pulumi up`                |
+| [New stacks](docs/new-stacks.md)                   | Creating stacks when planning or when applying                                                   |
+| [Guardrails and limitations](docs/guardrails.md)   | What your repository must enforce, and what isn't covered                                        |
+| [Development and releasing](docs/development.md)   | Working on this repository                                                                       |
 
 ## CLI
 

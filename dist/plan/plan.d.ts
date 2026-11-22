@@ -13,8 +13,14 @@ export interface PlanOptions {
     createStacks?: CreateStacks;
     /** Stop planning at the first stack that fails, instead of planning every other one */
     failFast?: boolean;
+    /**
+     * `plan` (the default): save the plans, for `apply` to apply exactly. `preview`: only preview,
+     * to show what the change will do; after merge, `up` deploys the stacks with changes.
+     */
+    mode?: PlanMode;
     onFinish?: (outcome: StackOutcome) => void;
 }
+export type PlanMode = 'plan' | 'preview';
 export type StackOutcome = {
     kind: 'planned';
     stack: PlannedStack;

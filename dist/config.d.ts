@@ -23,6 +23,11 @@ export interface Config {
         ignore: IgnoreRule[];
     };
     createStacks: CreateStacksConfig;
+    /**
+     * With plan's `mode: preview` and apply's `mode: up`: deploy the stacks that read outputs a
+     * deploy changed, after it (`up`), or only list them (`warn`)
+     */
+    outputReaders?: 'up' | 'warn';
 }
 export type CreateStacks = 'plan' | 'apply';
 /** When stacks that don't exist yet are created: a default, and stack patterns that differ */

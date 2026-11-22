@@ -801,6 +801,8 @@ function readRequests(repoRoot, base, options) {
                 list.push({ pattern, source });
         }
     };
+    if (options.changesOnly)
+        return { run, skip, create, malformed };
     const headRev = options.head ?? 'HEAD';
     // Oldest first, so later lines (newer commits, then the pull request) take precedence
     const log = git(repoRoot, ['log', '--reverse', '--format=%h%x00%B%x01', `${base}..${headRev}`]);

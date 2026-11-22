@@ -8,7 +8,7 @@ import { commandRunner, DEFAULT_COMMAND } from "../pulumi/runner.js";
 import { repoRootOf } from "../snapshot.js";
 import { marker, syncComments } from "./comments.js";
 import { appendSummary, booleanInput, error, GitHubApi, input, notice, printUntrusted, setOutput, warning, } from "./github.js";
-import { positiveInteger, pullRequestNumber, selectOptionsFromInputs } from "./inputs.js";
+import { choice, outputReaders, positiveInteger, pullRequestNumber, selectOptionsFromInputs, } from "./inputs.js";
 /*
  * The `plan` action's Node step: selects, previews each selected stack with --save-plan and
  * writes the plans, their manifest and a report. The composite action around it uploads the
@@ -21,6 +21,8 @@ async function main() {
     const directory = resolve(input('directory') || 'pulumi-plans');
     const repoRoot = repoRootOf(options.cwd);
     const runner = commandRunner(input('command') || DEFAULT_COMMAND, repoRoot);
+    const mode = choice('mode', ['plan', 'preview'], 'plan');
+    const readers = outputReaders(repoRoot);
     const manifest = await planStacks({
         select,
         directory,
@@ -28,6 +30,7 @@ async function main() {
         concurrency: positiveInteger('concurrency', 4),
         failFast: booleanInput('fail-fast'),
         createStacks: createStacksInput(),
+        mode,
         onFinish: (outcome) => {
             if (outcome.kind === 'failed')
                 printUntrusted(`${outcome.id}: failed\n${outcome.error}`);
@@ -37,14 +40,18 @@ async function main() {
     });
     for (const message of manifest.warnings)
         warning(message);
+    const deployedAfter = mode === 'preview' && readers === 'up';
     for (const read of manifest.followUps) {
-        warning(`Plan ${read.id} again after this is applied: it ${describeRead(read)}`);
+        warning(`${deployedAfter ? `${read.id} is also deployed after merging` : `Plan ${read.id} again after this is applied`}: it ${describeRead(read)}`);
     }
-    const report = renderPlan(manifest, (index) => marker('plan', index));
+    const report = renderPlan(manifest, (index) => marker('plan', index), readers);
     writeFileSync(join(directory, COMMENT_FILE), report.bodies.join('\n\n'));
     appendSummary(report.summary);
     setOutput('directory', directory);
-    setOutput('artifact', `pulumi-plans-${manifest.tree}`);
+    // Previews are found by the pull request they're for; plans by the exact code they're for
+    setOutput('artifact', mode === 'preview'
+        ? `pulumi-previews-${pullRequestNumber(event) ?? manifest.head}`
+        : `pulumi-plans-${manifest.tree}`);
     setOutput('tree', manifest.tree);
     setOutput('any', manifest.stacks.length > 0 ? 'true' : 'false');
     setOutput('ids', JSON.stringify(manifest.stacks.map((stack) => stack.id)));

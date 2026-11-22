@@ -18,6 +18,11 @@ export interface Config {
   packages: { ignore: string[] };
   classify: { ignore: IgnoreRule[] };
   createStacks: CreateStacksConfig;
+  /**
+   * With plan's `mode: preview` and apply's `mode: up`: deploy the stacks that read outputs a
+   * deploy changed, after it (`up`), or only list them (`warn`)
+   */
+  outputReaders?: 'up' | 'warn';
 }
 
 export type CreateStacks = 'plan' | 'apply';
@@ -82,6 +87,7 @@ export function parseConfig(text: string, path = CONFIG_FILE): Config {
     globalInputs: parsed.globalInputs ?? defaults.globalInputs,
     packages: { ignore: parsed.packages?.ignore ?? [] },
     classify: { ignore: parsed.classify?.ignore ?? [] },
+    outputReaders: parsed.outputReaders,
     createStacks: {
       default: parsed.createStacks?.default,
       plan: parsed.createStacks?.plan ?? [],
