@@ -1,0 +1,4 @@
+config:
+  fixture-access:accounts:
+    - business
+    - shop
