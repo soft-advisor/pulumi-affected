@@ -280,3 +280,17 @@ test('Pulumi-Affected-Create-Stacks lines: newer commits and then the pull reque
   });
   assert.equal(withPullRequest.createStacks.at(-1)?.source, 'the pull request');
 });
+
+test('after orders stacks without assuming they read any outputs', () => {
+  const { dir } = createRepo({
+    ...project('org', 'org', ['prod']),
+    ...project('accounts', 'accounts', ['management', 'shop']),
+    'pulumi-affected.yaml': 'after:\n  accounts/*: [org/prod, accounts/management]\n',
+  });
+  const result = select({ cwd: dir, base: 'HEAD', all: true });
+  assert.deepEqual(result.waves, [['org/prod'], ['accounts/management'], ['accounts/shop']]);
+  assert.deepEqual(result.outputsRead['accounts/shop'], {
+    'accounts/management': [],
+    'org/prod': [],
+  });
+});
