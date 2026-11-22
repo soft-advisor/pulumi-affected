@@ -52,7 +52,7 @@ function mergesInto(repoRoot, commit, base) {
     }
 }
 /** Fetches a commit with the job's token, as the checkout may not have kept credentials */
-function fetchCommit(repoRoot, sha, token) {
+export function fetchCommit(repoRoot, sha, token) {
     try {
         git(repoRoot, ['cat-file', '-e', `${sha}^{commit}`]);
         return true;

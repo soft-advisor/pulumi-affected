@@ -2,6 +2,7 @@ import { existsSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { type ApplyOptions, applyPlans } from '../plan/apply.ts';
 import { eventContext } from './context.ts';
+import { fetchCommit } from './merge.ts';
 import { MANIFEST_FILE, type PreviewSummary, readPreviewSummary } from '../plan/manifest.ts';
 import { upStacks } from '../plan/up.ts';
 import { describeRead } from '../plan/outputs.ts';
@@ -263,6 +264,10 @@ async function up() {
     select: await selection(cwd),
     previews,
     outputReaders: outputReaders(repoRoot),
+    fetchCommit: (sha) => {
+      const token = input('github-token');
+      return token ? fetchCommit(repoRoot, sha, token) : false;
+    },
     failFast: booleanInput('fail-fast'),
     runner: commandRunner(input('command') || DEFAULT_COMMAND, repoRoot),
     concurrency: positiveInteger('concurrency', 4),

@@ -6,7 +6,7 @@ import { matchesAnyStack } from '../patterns.ts';
 import { errorText, type PulumiRunner } from '../pulumi/runner.ts';
 import { readOutputs, recentUpdates, stateFingerprint } from '../pulumi/stack.ts';
 import { readDependencyGraph, type SelectOptions, select } from '../select.ts';
-import { ensureCommit, GitSnapshot, repoRootOf, resolveCommit } from '../snapshot.ts';
+import { ensureCommit, GitSnapshot, git, repoRootOf, resolveCommit } from '../snapshot.ts';
 import { mapConcurrently } from './concurrency.ts';
 import type { PreviewSummary } from './manifest.ts';
 import type { StaleRead } from './outputs.ts';
@@ -39,6 +39,11 @@ export interface UpOptions {
   outputReaders: OutputReaders;
   /** Stack patterns that may be deployed */
   allow?: string[];
+  /**
+   * Fetches a commit that isn't in the checkout (the previewed one is usually GitHub's merge
+   * commit for the pull request, on no branch), returning whether it's there now
+   */
+  fetchCommit?: (sha: string) => boolean;
   failFast?: boolean;
   onFinish?: (result: StackUpResult) => void;
 }
@@ -102,12 +107,25 @@ export async function upStacks(options: UpOptions): Promise<UpResult> {
   }
 
   // The preview's "no changes" only holds for the code it previewed: a stack that changed since
-  // (main moved on, or a deploy in between failed) is deployed anyway
+  // (main moved on, or a deploy in between failed) is deployed anyway. The same tree is the same
+  // code, which is the usual case and needs nothing fetched.
+  const warnings: string[] = [];
   const unchanged = new Set(options.previews?.unchanged ?? []);
-  if (options.previews) {
-    const since = changedSince(repoRoot, options.previews.head, commit, config);
-    if (since === undefined) unchanged.clear();
-    else for (const id of since) unchanged.delete(id);
+  const previews = options.previews;
+  const tree = git(repoRoot, ['rev-parse', `${commit}^{tree}`]).trim();
+  if (previews && unchanged.size > 0 && previews.tree !== tree) {
+    const available =
+      previews.head !== undefined &&
+      (ensureCommit(repoRoot, previews.head) || options.fetchCommit?.(previews.head) === true);
+    const since = available ? changedSince(repoRoot, previews.head, commit, config) : undefined;
+    if (since === undefined) {
+      warnings.push(
+        `The previewed commit${previews.head ? ` ${previews.head.slice(0, 7)}` : ''} can't be compared with this one, so its "no changes" isn't trusted: every selected stack is deployed (${[...unchanged].join(', ')} included)`,
+      );
+      unchanged.clear();
+    } else {
+      for (const id of since) unchanged.delete(id);
+    }
   }
 
   // Selected stacks to deploy, and why; the preview can only take some out
@@ -118,7 +136,6 @@ export async function upStacks(options: UpOptions): Promise<UpResult> {
     else toRun.set(stack.id, undefined);
   }
 
-  const warnings: string[] = [];
   const followUps: StaleRead[] = [];
   const changedOutputs: { id: string }[] = [];
   let failed = false;
@@ -217,7 +234,7 @@ function changedSince(
   commit: string,
   config: ReturnType<typeof loadConfig>,
 ) {
-  if (!previewed || !ensureCommit(repoRoot, previewed)) return undefined;
+  if (!previewed) return undefined;
   try {
     // Only what changed in code and config: the merge commit repeats the request lines
     return new Set(
