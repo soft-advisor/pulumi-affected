@@ -42,6 +42,11 @@ export interface PlannedStack {
 }
 export interface Manifest {
     version: typeof MANIFEST_VERSION;
+    /**
+     * `preview` when only previewed (plan's `mode: preview`): the plan files aren't kept, and the
+     * manifest only tells `up` which stacks had changes
+     */
+    mode?: 'preview';
     /** The git tree that was planned: only exactly this code may apply the plans */
     tree: string;
     head: string;
@@ -84,4 +89,15 @@ export declare class ManifestError extends Error {
 }
 /** Reads and checks a manifest, and the hash of every plan file it names */
 export declare function readManifest(directory: string): Manifest;
+/** What a preview found, as `up` uses it: which stacks had changes, and which had none */
+export interface PreviewSummary {
+    changed: Set<string>;
+    unchanged: Set<string>;
+}
+/**
+ * Reads a preview manifest (plan's `mode: preview`). It comes from the job that ran the pull
+ * request's code, so it's only used to skip stacks it says had no changes; anything it leaves
+ * out is deployed.
+ */
+export declare function readPreviewSummary(directory: string): PreviewSummary;
 export {};

@@ -48,6 +48,19 @@ inputs:
     description: How many stacks to preview at once.
     required: false
     default: '4'
+  mode:
+    description: >-
+      plan: save the plans, which the apply action applies exactly (strict). preview: only
+      preview, to show what the change will do; after merge, the apply action in mode up deploys
+      it with pulumi up. See docs/modes.md.
+    required: false
+    default: plan
+  output-readers:
+    description: >-
+      Mode preview: up (stacks that read outputs this change alters are deployed after it, with
+      the new values) or warn (they're listed, to deploy later). Default: the config's
+      outputReaders, else up. Only wording here; the apply action decides.
+    required: false
   create-stacks:
     description: >-
       When a selected stack that doesn't exist yet is created. plan: now, empty, in the real
@@ -63,7 +76,9 @@ inputs:
     required: false
     default: 'false'
   upload:
-    description: Upload the plan directory as the artifact `pulumi-plans-<git tree SHA>`, which apply looks for.
+    description: >-
+      Upload the plan directory as an artifact for the apply action: pulumi-plans-<git tree SHA>
+      in mode plan, pulumi-previews-<pull request number> in mode preview.
     required: false
     default: 'true'
   retention-days:
@@ -120,6 +135,8 @@ runs:
         INPUT_CONCURRENCY: ${{ inputs.concurrency }}
         INPUT_FAIL_FAST: ${{ inputs.fail-fast }}
         INPUT_CREATE_STACKS: ${{ inputs.create-stacks }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_OUTPUT_READERS: ${{ inputs.output-readers }}
         INPUT_COMMENT: ${{ inputs.comment }}
         INPUT_PULL_REQUEST: ${{ inputs.pull-request }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}

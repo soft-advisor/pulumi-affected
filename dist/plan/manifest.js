@@ -55,6 +55,7 @@ export function readManifest(directory) {
     check(SHA.test(manifest.tree) && SHA.test(manifest.head), 'tree or head is not a SHA');
     check(Array.isArray(manifest.stacks) && Array.isArray(manifest.failed), 'stacks or failed missing');
     check(typeof manifest.pulumiVersion === 'string', 'pulumiVersion missing');
+    check(manifest.mode === undefined, 'these are previews, not plans: deploy them with the apply action in mode up');
     check(Array.isArray(manifest.followUps), 'followUps missing');
     const ids = new Set();
     for (const stack of manifest.stacks) {
@@ -79,4 +80,35 @@ export function readManifest(directory) {
         check(hashFile(planPath) === stack.planHash, `${stack.plan} doesn't match its hash`);
     }
     return manifest;
+}
+/**
+ * Reads a preview manifest (plan's `mode: preview`). It comes from the job that ran the pull
+ * request's code, so it's only used to skip stacks it says had no changes; anything it leaves
+ * out is deployed.
+ */
+export function readPreviewSummary(directory) {
+    const path = join(directory, MANIFEST_FILE);
+    if (!existsSync(path))
+        throw new ManifestError(`No ${MANIFEST_FILE} in ${directory}`);
+    let manifest;
+    try {
+        manifest = JSON.parse(readFileSync(path, 'utf8'));
+    }
+    catch {
+        throw new ManifestError(`${MANIFEST_FILE} isn't JSON`);
+    }
+    const ids = (list) => new Set((Array.isArray(list) ? list : [])
+        .map((entry) => entry?.id)
+        .filter((id) => typeof id === 'string'));
+    if (manifest?.mode !== 'preview') {
+        throw new ManifestError(`${MANIFEST_FILE} isn't from a preview (plan's mode: preview)`);
+    }
+    const changed = ids(manifest.stacks);
+    // Failing to preview isn't "no changes"
+    const unchanged = ids(manifest.unchanged);
+    for (const id of ids(manifest.failed))
+        unchanged.delete(id);
+    for (const id of changed)
+        unchanged.delete(id);
+    return { changed, unchanged };
 }

@@ -52,6 +52,7 @@ export function parseConfig(text, path = CONFIG_FILE) {
         globalInputs: parsed.globalInputs ?? defaults.globalInputs,
         packages: { ignore: parsed.packages?.ignore ?? [] },
         classify: { ignore: parsed.classify?.ignore ?? [] },
+        outputReaders: parsed.outputReaders,
         createStacks: {
             default: parsed.createStacks?.default,
             plan: parsed.createStacks?.plan ?? [],

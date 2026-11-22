@@ -9,8 +9,12 @@ import { describeRead } from "./outputs.js";
  */
 /** Changes listed per stack before the rest are only counted */
 const MAX_CHANGES = 50;
-export function renderPlan(manifest, marker) {
-    const heading = `### pulumi-affected plan: ${planHeadline(manifest)}`;
+export function renderPlan(manifest, marker, outputReaders = 'up') {
+    const preview = manifest.mode === 'preview';
+    const heading = `### pulumi-affected ${preview ? 'preview' : 'plan'}: ${planHeadline(manifest)}`;
+    const followUpsTitle = preview && outputReaders === 'up'
+        ? 'Also deployed after merging, after the stacks they read, with the new values:'
+        : 'Plan again after this is applied:';
     const rows = [
         ...manifest.stacks.map((stack) => `| ${code(stack.id)} | ${planSummary(stack)} | ${stack.reasons.map(reasonText).join('<br>')} |`),
         ...manifest.failed.map((stack) => `| ${code(stack.id)} | **failed** | ${stack.reasons.map(reasonText).join('<br>')} |`),
@@ -19,11 +23,13 @@ export function renderPlan(manifest, marker) {
     const intro = [
         ...blocked.map((stack) => `> [!CAUTION]\n> ${code(stack.id)} can't be planned in this change: it ${(stack.blockedBy ?? []).map(readText).join('; ')}. Its plan would be made with the old values. Change ${[...new Set((stack.blockedBy ?? []).map((read) => code(read.dependency)))].join(', ')} first and ${code(stack.id)} in a later pull request, or leave it out of this one with ${code(`Pulumi-Affected-Skip: ${stack.id}`)} and plan it after this is applied.`),
         manifest.followUps.length > 0
-            ? `> [!WARNING]\n> **Plan again after this is applied:**\n${manifest.followUps.map((read) => `> - ${code(read.id)} ${readText(read)}${manifest.skipped.some((skip) => skip.id === read.id) ? ', and has changes this pull request skips' : ''}`).join('\n')}`
+            ? `> [!WARNING]\n> **${followUpsTitle}**\n${manifest.followUps.map((read) => `> - ${code(read.id)} ${readText(read)}${manifest.skipped.some((skip) => skip.id === read.id) ? ', and has changes this pull request skips' : ''}`).join('\n')}`
             : '',
         rows.length > 0
-            ? ['| Stack | Plan | Why |', '| --- | --- | --- |', ...rows].join('\n')
-            : 'Nothing to apply.',
+            ? [`| Stack | ${preview ? 'Preview' : 'Plan'} | Why |`, '| --- | --- | --- |', ...rows].join('\n')
+            : preview
+                ? 'Nothing to deploy.'
+                : 'Nothing to apply.',
         lists(manifest),
     ]
         .filter(Boolean)
@@ -33,7 +39,7 @@ export function renderPlan(manifest, marker) {
             .filter((stack) => !stack.blockedBy)
             .map((stack) => `<details><summary>${code(stack.id)} failed</summary>\n\n${fence(stack.error)}\n\n</details>`),
         ...manifest.stacks.filter((stack) => stack.changes.length > 0).map(changesSection),
-        `<sub>Planned ${manifest.head.slice(0, 7)} (tree ${manifest.tree.slice(0, 7)}) against ${manifest.base.slice(0, 7)} with Pulumi ${safeText(manifest.pulumiVersion)}</sub>`,
+        `<sub>${preview ? 'Previewed' : 'Planned'} ${manifest.head.slice(0, 7)} (tree ${manifest.tree.slice(0, 7)}) against ${manifest.base.slice(0, 7)} with Pulumi ${safeText(manifest.pulumiVersion)}</sub>`,
     ];
     const bodies = splitComments(heading, intro, sections, marker);
     return { summary: [heading, intro, ...sections].join('\n\n'), bodies };
@@ -88,7 +94,9 @@ function planSummary(stack) {
     return parts.join('; ');
 }
 function planHeadline(manifest) {
-    const parts = [`${manifest.stacks.length} to apply`];
+    const parts = [
+        `${manifest.stacks.length} ${manifest.mode === 'preview' ? 'with changes' : 'to apply'}`,
+    ];
     if (manifest.unchanged.length > 0)
         parts.push(`${manifest.unchanged.length} unchanged`);
     if (manifest.failed.length > 0)
@@ -131,4 +139,57 @@ function changesSection(stack) {
         '',
         '</details>',
     ].join('\n');
+}
+export function renderUp(result, marker) {
+    const deployed = result.stacks.filter((stack) => stack.outcome === 'applied');
+    const parts = [`${deployed.length} deployed`];
+    const unchanged = result.stacks.filter((stack) => stack.outcome === 'unchanged');
+    if (unchanged.length > 0)
+        parts.push(`${unchanged.length} without changes`);
+    const failed = result.stacks.filter((stack) => stack.outcome === 'failed');
+    if (failed.length > 0)
+        parts.push(`${failed.length} failed`);
+    const skipped = result.stacks.filter((stack) => stack.outcome === 'skipped');
+    if (skipped.length > 0)
+        parts.push(`${skipped.length} skipped`);
+    const heading = `### pulumi-affected up: ${result.stacks.length === 0 ? 'nothing to deploy' : parts.join(', ')}`;
+    const rows = result.stacks
+        .filter((stack) => stack.outcome !== 'unchanged')
+        .map((stack) => {
+        const outcome = stack.outcome === 'applied'
+            ? formatCounts({
+                changed: true,
+                counts: withoutSame(stack.counts),
+                changes: [],
+                outputs: stack.outputs ?? [],
+                ignored: [],
+            })
+            : `**${stack.outcome}**`;
+        const why = stack.readsChanged?.length
+            ? `it ${stack.readsChanged.map(readText).join('; ')}`
+            : 'selected';
+        return `| ${code(stack.id)} | ${safeText(outcome)} | ${why} |`;
+    });
+    const intro = [
+        rows.length > 0 ? ['| Stack | Result | Why |', '| --- | --- | --- |', ...rows].join('\n') : '',
+        unchanged.length > 0
+            ? `Not deployed, their preview showed no changes: ${unchanged.map((stack) => code(stack.id)).join(', ')}`
+            : '',
+        result.followUps.length > 0
+            ? `> [!WARNING]\n> **Deploy these next:**\n${result.followUps.map((read) => `> - ${code(read.id)} ${readText(read)}`).join('\n')}`
+            : '',
+        ...result.warnings.map((warning) => `> ${safeText(warning)}`),
+    ]
+        .filter(Boolean)
+        .join('\n\n');
+    const sections = result.stacks
+        .filter((stack) => stack.error)
+        .map((stack) => `<details><summary>${code(stack.id)} ${safeText(stack.outcome)}</summary>\n\n${fence(stack.error ?? '')}\n\n</details>`);
+    const bodies = splitComments(heading, intro || 'Nothing to deploy.', sections, marker);
+    return { summary: [heading, intro, ...sections].join('\n\n'), bodies };
+}
+/** Counts without the resources an update left alone */
+function withoutSame(counts) {
+    const { same: _, ...changed } = counts ?? {};
+    return changed;
 }

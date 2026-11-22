@@ -1,7 +1,8 @@
+import { loadConfig } from "../config.js";
 import { splitPatterns } from "../patterns.js";
 import { eventContext } from "./context.js";
 import { booleanInput, input, readEvent, warning } from "./github.js";
-import { repoRootOf } from "../snapshot.js";
+import { repoRootOf, WorktreeSnapshot } from "../snapshot.js";
 /** Selection options from the action's inputs and the triggering event, shared by select and plan */
 export function selectOptionsFromInputs() {
     const cwd = input('working-directory') || process.cwd();
@@ -52,4 +53,18 @@ export function positiveInteger(name, fallback) {
     if (!Number.isInteger(number) || number < 1)
         throw new Error(`${name} "${value}" isn't a positive whole number`);
     return number;
+}
+/** An input that must be one of `values` */
+export function choice(name, values, fallback) {
+    const value = input(name) || fallback;
+    if (!values.includes(value)) {
+        throw new Error(`${name} must be ${values.join(' or ')}, not "${value}"`);
+    }
+    return value;
+}
+/** The output-readers input, else the config's outputReaders, else up */
+export function outputReaders(repoRoot) {
+    if (input('output-readers'))
+        return choice('output-readers', ['up', 'warn'], 'up');
+    return loadConfig(new WorktreeSnapshot(repoRoot)).outputReaders ?? 'up';
 }

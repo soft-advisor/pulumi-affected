@@ -21,6 +21,7 @@ inputs:
 globalInputs: ['.nvmrc', '.node-version'] # the default
 packages:
   ignore: ['@types/*']
+outputReaders: up # preview and up: deploy stacks reading changed outputs after them (or warn); see modes.md
 createStacks: # when stacks that don't exist yet are created; see new-stacks.md
   default: plan
   apply: [site/*]

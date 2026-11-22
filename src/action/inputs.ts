@@ -1,8 +1,10 @@
+import { loadConfig } from '../config.ts';
+import type { OutputReaders } from '../plan/up.ts';
 import type { SelectOptions } from '../select.ts';
 import { splitPatterns } from '../patterns.ts';
 import { type Context, eventContext } from './context.ts';
 import { booleanInput, type GitHubEvent, input, readEvent, warning } from './github.ts';
-import { repoRootOf } from '../snapshot.ts';
+import { repoRootOf, WorktreeSnapshot } from '../snapshot.ts';
 
 /** Selection options from the action's inputs and the triggering event, shared by select and plan */
 export function selectOptionsFromInputs(): { options: SelectOptions; event: GitHubEvent } {
@@ -57,4 +59,19 @@ export function positiveInteger(name: string, fallback: number) {
   if (!Number.isInteger(number) || number < 1)
     throw new Error(`${name} "${value}" isn't a positive whole number`);
   return number;
+}
+
+/** An input that must be one of `values` */
+export function choice<T extends string>(name: string, values: readonly T[], fallback: T): T {
+  const value = input(name) || fallback;
+  if (!values.includes(value as T)) {
+    throw new Error(`${name} must be ${values.join(' or ')}, not "${value}"`);
+  }
+  return value as T;
+}
+
+/** The output-readers input, else the config's outputReaders, else up */
+export function outputReaders(repoRoot: string): OutputReaders {
+  if (input('output-readers')) return choice('output-readers', ['up', 'warn'] as const, 'up');
+  return loadConfig(new WorktreeSnapshot(repoRoot)).outputReaders ?? 'up';
 }

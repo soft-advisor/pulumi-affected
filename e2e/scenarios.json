@@ -278,5 +278,24 @@
     "expected": [],
     "changed": [],
     "applied": []
+  },
+  {
+    "name": "preview, then up: one stack's config, and the stack reading its outputs",
+    "changes": {
+      "org/accounts/Pulumi.shop.yaml": "config:\n  fixture-accounts:alias: store\n"
+    },
+    "expected": ["fixture-accounts/shop"],
+    "changed": ["fixture-accounts/shop"],
+    "applied": ["fixture-accounts/shop", "fixture-access/prod"],
+    "mode": "preview"
+  },
+  {
+    "name": "preview, then up: a stack without changes isn't deployed",
+    "changes": {},
+    "expected": ["fixture-dns/prod"],
+    "message": "Check dns\n\nPulumi-Affected-Run: fixture-dns/prod\n",
+    "changed": [],
+    "applied": [],
+    "mode": "preview"
   }
 ]

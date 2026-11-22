@@ -56,6 +56,11 @@ export interface PlannedStack {
 
 export interface Manifest {
   version: typeof MANIFEST_VERSION;
+  /**
+   * `preview` when only previewed (plan's `mode: preview`): the plan files aren't kept, and the
+   * manifest only tells `up` which stacks had changes
+   */
+  mode?: 'preview';
   /** The git tree that was planned: only exactly this code may apply the plans */
   tree: string;
   head: string;
@@ -127,6 +132,10 @@ export function readManifest(directory: string): Manifest {
     'stacks or failed missing',
   );
   check(typeof manifest.pulumiVersion === 'string', 'pulumiVersion missing');
+  check(
+    manifest.mode === undefined,
+    'these are previews, not plans: deploy them with the apply action in mode up',
+  );
   check(Array.isArray(manifest.followUps), 'followUps missing');
   const ids = new Set<string>();
   for (const stack of manifest.stacks) {
@@ -166,4 +175,41 @@ export function readManifest(directory: string): Manifest {
     check(hashFile(planPath) === stack.planHash, `${stack.plan} doesn't match its hash`);
   }
   return manifest;
+}
+
+/** What a preview found, as `up` uses it: which stacks had changes, and which had none */
+export interface PreviewSummary {
+  changed: Set<string>;
+  unchanged: Set<string>;
+}
+
+/**
+ * Reads a preview manifest (plan's `mode: preview`). It comes from the job that ran the pull
+ * request's code, so it's only used to skip stacks it says had no changes; anything it leaves
+ * out is deployed.
+ */
+export function readPreviewSummary(directory: string): PreviewSummary {
+  const path = join(directory, MANIFEST_FILE);
+  if (!existsSync(path)) throw new ManifestError(`No ${MANIFEST_FILE} in ${directory}`);
+  let manifest: Partial<Manifest>;
+  try {
+    manifest = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    throw new ManifestError(`${MANIFEST_FILE} isn't JSON`);
+  }
+  const ids = (list: unknown) =>
+    new Set(
+      (Array.isArray(list) ? list : [])
+        .map((entry) => (entry as { id?: unknown } | null)?.id)
+        .filter((id): id is string => typeof id === 'string'),
+    );
+  if (manifest?.mode !== 'preview') {
+    throw new ManifestError(`${MANIFEST_FILE} isn't from a preview (plan's mode: preview)`);
+  }
+  const changed = ids(manifest.stacks);
+  // Failing to preview isn't "no changes"
+  const unchanged = ids(manifest.unchanged);
+  for (const id of ids(manifest.failed)) unchanged.delete(id);
+  for (const id of changed) unchanged.delete(id);
+  return { changed, unchanged };
 }
