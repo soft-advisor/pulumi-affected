@@ -1,2 +1,3 @@
 config:
   fixture-site:env: prod
+encryptionsalt: v1:j4YvxNCiDf4=:v1:lZejBqgQg/YFeKlm:8nf5XSht9p9CqWOdcaClPiZBPI7j+Q==
