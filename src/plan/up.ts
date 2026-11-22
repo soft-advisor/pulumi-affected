@@ -219,10 +219,15 @@ function changedSince(
 ) {
   if (!previewed || !ensureCommit(repoRoot, previewed)) return undefined;
   try {
+    // Only what changed in code and config: the merge commit repeats the request lines
     return new Set(
-      select({ cwd: repoRoot, base: previewed, head: commit, config }).stacks.map(
-        (stack) => stack.id,
-      ),
+      select({
+        cwd: repoRoot,
+        base: previewed,
+        head: commit,
+        config,
+        changesOnly: true,
+      }).stacks.map((stack) => stack.id),
     );
   } catch {
     return undefined;

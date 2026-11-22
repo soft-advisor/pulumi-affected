@@ -23,6 +23,8 @@ export interface SelectOptions {
     all?: boolean;
     /** Text that may carry Pulumi-Affected-Run/Skip lines, e.g. a pull request description */
     messages?: string[];
+    /** Only changes count: Pulumi-Affected-* lines in commits and messages are ignored */
+    changesOnly?: boolean;
     config?: Config;
 }
 export interface SelectedStack extends Stack {
