@@ -15,3 +15,5 @@ export type MergeCheck =
     base: string;
 };
 export declare function ensureCurrentMerge(repoRoot: string, event: GitHubEvent, api: GitHubApi, token: string, sleep?: (ms: number) => Promise<unknown>): Promise<MergeCheck>;
+/** Fetches a commit with the job's token, as the checkout may not have kept credentials */
+export declare function fetchCommit(repoRoot: string, sha: string, token: string): boolean;

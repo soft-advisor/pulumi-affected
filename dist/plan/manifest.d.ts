@@ -95,6 +95,8 @@ export interface PreviewSummary {
     unchanged: Set<string>;
     /** The commit previewed, if the manifest names a well-formed one */
     head?: string;
+    /** The tree previewed: the same tree is the same code */
+    tree?: string;
 }
 /**
  * Reads a preview manifest (plan's `mode: preview`). It comes from the job that ran the pull

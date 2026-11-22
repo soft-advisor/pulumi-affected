@@ -16,6 +16,11 @@ export interface UpOptions {
     outputReaders: OutputReaders;
     /** Stack patterns that may be deployed */
     allow?: string[];
+    /**
+     * Fetches a commit that isn't in the checkout (the previewed one is usually GitHub's merge
+     * commit for the pull request, on no branch), returning whether it's there now
+     */
+    fetchCommit?: (sha: string) => boolean;
     failFast?: boolean;
     onFinish?: (result: StackUpResult) => void;
 }

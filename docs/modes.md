@@ -42,6 +42,6 @@ The list comes from the job that ran the pull request's code, so it's only used 
 
 Their preview on the pull request, if they were previewed, used the outputs as they were before, so it can't show what the new values change.
 
-**Trusting the list.** The preview's "no changes" only holds for the code it previewed. A stack that changed between the previewed commit and the merged one (because `main` moved on, or a deploy in between failed) is deployed anyway; if the previewed commit can't be found, nothing in the list is trusted.
+**Trusting the list.** The preview's "no changes" only holds for the code it previewed. When the merged code is the previewed code (the same git tree, as when an up-to-date branch is squash-merged), the list is trusted as it is. Otherwise, stacks that changed between the previewed commit and the merged one (because `main` moved on, or a deploy in between failed) are deployed anyway. The previewed commit is usually GitHub's merge commit for the pull request, which is on no branch, so it's fetched with the job's token. If it still can't be compared, nothing in the list is trusted, and the deploy says so.
 
 **Reruns** run `up` again, which changes nothing for stacks already deployed. A rerun doesn't know which outputs the first run changed, so a stack reading them that failed the first time isn't deployed again by it; deploy it with `Pulumi-Affected-Run` or its force file.

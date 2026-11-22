@@ -261,4 +261,51 @@ describe('preview, then up', { skip: !hasPulumi && 'pulumi is not installed' }, 
     });
     assert.deepEqual(outcomes(result), { 'other/dev': 'applied' });
   });
+
+  test('the preview is trusted when the merged code is the previewed code, even if its commit is unreachable', async () => {
+    const { dir, base, runner } = setup();
+    commit(dir, {
+      'up/Pulumi.yaml': upProgram('seven'),
+      'other/Pulumi.yaml': otherProgram('seventh'),
+    });
+    const tree = run(dir, 'git', ['rev-parse', 'HEAD^{tree}']).trim();
+    // GitHub's merge commit for the pull request: on no branch, so not in the checkout
+    const unreachable = 'f'.repeat(40);
+    const trusted = await upStacks({
+      cwd: dir,
+      runner,
+      concurrency: 2,
+      select: { base },
+      previews: {
+        changed: new Set(['up/dev']),
+        unchanged: new Set(['other/dev']),
+        head: unreachable,
+        tree,
+      },
+      outputReaders: 'warn',
+    });
+    assert.equal(outcomes(trusted)['other/dev'], 'unchanged');
+    assert.deepEqual(trusted.warnings, []);
+
+    // Different code and no way to compare: everything selected is deployed, and it says why
+    const distrusted = await upStacks({
+      cwd: dir,
+      runner,
+      concurrency: 2,
+      select: { base },
+      previews: {
+        changed: new Set(['up/dev']),
+        unchanged: new Set(['other/dev']),
+        head: unreachable,
+        tree: 'e'.repeat(40),
+      },
+      outputReaders: 'warn',
+      fetchCommit: () => false,
+    });
+    assert.equal(outcomes(distrusted)['other/dev'], 'applied');
+    assert.match(
+      distrusted.warnings.join('\n'),
+      /can't be compared with this one.*other\/dev included/,
+    );
+  });
 });

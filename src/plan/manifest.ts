@@ -183,6 +183,8 @@ export interface PreviewSummary {
   unchanged: Set<string>;
   /** The commit previewed, if the manifest names a well-formed one */
   head?: string;
+  /** The tree previewed: the same tree is the same code */
+  tree?: string;
 }
 
 /**
@@ -215,5 +217,7 @@ export function readPreviewSummary(directory: string): PreviewSummary {
   for (const id of changed) unchanged.delete(id);
   const head =
     typeof manifest.head === 'string' && SHA.test(manifest.head) ? manifest.head : undefined;
-  return { changed, unchanged, ...(head ? { head } : {}) };
+  const tree =
+    typeof manifest.tree === 'string' && SHA.test(manifest.tree) ? manifest.tree : undefined;
+  return { changed, unchanged, ...(head ? { head } : {}), ...(tree ? { tree } : {}) };
 }
