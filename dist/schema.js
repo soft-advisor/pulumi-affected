@@ -35,9 +35,20 @@ export const configSchema = {
             items: { type: 'string', pattern: '^[A-Za-z0-9_./ @+-]+/[A-Za-z0-9_.-]+$' },
         },
         dependsOn: {
-            description: "Dependencies analysis can't see, for example a stack that looks up another stack's resources in the cloud. Keys and values are stack patterns.",
+            description: "Dependencies analysis can't see, for example a stack that looks up another stack's resources in the cloud. Keys are stack patterns. Values are either stack patterns, whose outputs may all be read, or stack patterns mapped to the outputs that stand for what's read (only a change to those deploys or replans the dependent).",
             type: 'object',
-            additionalProperties: { $ref: '#/definitions/stackPatterns' },
+            additionalProperties: {
+                oneOf: [
+                    { $ref: '#/definitions/stackPatterns' },
+                    {
+                        type: 'object',
+                        additionalProperties: {
+                            type: 'array',
+                            items: { type: 'string', minLength: 1 },
+                        },
+                    },
+                ],
+            },
         },
         after: {
             description: "Order only: the key's stacks apply after these, when both are planned, without reading their outputs (dependsOn assumes every output is read). Keys and values are stack patterns.",

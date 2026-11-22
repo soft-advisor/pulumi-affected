@@ -308,4 +308,21 @@ describe('preview, then up', { skip: !hasPulumi && 'pulumi is not installed' }, 
       /can't be compared with this one.*other\/dev included/,
     );
   });
+
+  test('a dependsOn that names outputs deploys the dependent only when those change', async () => {
+    const { dir, base, runner } = setup({
+      'pulumi-affected.yaml': 'dependsOn:\n  down/dev:\n    up/dev: [zone]\n',
+    });
+    // up's word changes, but down only depends on up's zone
+    commit(dir, { 'up/Pulumi.yaml': upProgram('eight') });
+    const result = await upStacks({
+      cwd: dir,
+      runner,
+      concurrency: 2,
+      select: { base },
+      outputReaders: 'up',
+    });
+    assert.deepEqual(outcomes(result), { 'up/dev': 'applied' });
+    assert.deepEqual(result.followUps, []);
+  });
 });

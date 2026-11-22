@@ -39,9 +39,20 @@ export const configSchema = {
     },
     dependsOn: {
       description:
-        "Dependencies analysis can't see, for example a stack that looks up another stack's resources in the cloud. Keys and values are stack patterns.",
+        "Dependencies analysis can't see, for example a stack that looks up another stack's resources in the cloud. Keys are stack patterns. Values are either stack patterns, whose outputs may all be read, or stack patterns mapped to the outputs that stand for what's read (only a change to those deploys or replans the dependent).",
       type: 'object',
-      additionalProperties: { $ref: '#/definitions/stackPatterns' },
+      additionalProperties: {
+        oneOf: [
+          { $ref: '#/definitions/stackPatterns' },
+          {
+            type: 'object',
+            additionalProperties: {
+              type: 'array',
+              items: { type: 'string', minLength: 1 },
+            },
+          },
+        ],
+      },
     },
     after: {
       description:

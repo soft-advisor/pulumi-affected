@@ -50,10 +50,21 @@ export declare const configSchema: {
             };
         };
         readonly dependsOn: {
-            readonly description: "Dependencies analysis can't see, for example a stack that looks up another stack's resources in the cloud. Keys and values are stack patterns.";
+            readonly description: "Dependencies analysis can't see, for example a stack that looks up another stack's resources in the cloud. Keys are stack patterns. Values are either stack patterns, whose outputs may all be read, or stack patterns mapped to the outputs that stand for what's read (only a change to those deploys or replans the dependent).";
             readonly type: "object";
             readonly additionalProperties: {
-                readonly $ref: "#/definitions/stackPatterns";
+                readonly oneOf: readonly [{
+                    readonly $ref: "#/definitions/stackPatterns";
+                }, {
+                    readonly type: "object";
+                    readonly additionalProperties: {
+                        readonly type: "array";
+                        readonly items: {
+                            readonly type: "string";
+                            readonly minLength: 1;
+                        };
+                    };
+                }];
             };
         };
         readonly after: {

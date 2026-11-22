@@ -8,8 +8,10 @@ projects:
   include: ['**'] # folders with a Pulumi.yaml to consider
   exclude: ['examples/**']
 stacks: [site/preview] # stacks without a Pulumi.<stack>.yaml
-dependsOn:
-  site/prod: [site/dev] # prod looks up dev's DNS zone in the cloud
+dependsOn: # dependencies analysis can't see, e.g. cloud lookups
+  site/prod: [site/dev] # prod may read any of dev's outputs
+  site/preview:
+    site/dev: [nameServers] # only a change to dev's nameServers affects it
 after: # order only: applied after these when both are planned, reading none of their outputs
   accounts/*: [org/prod, accounts/management]
 rules:
