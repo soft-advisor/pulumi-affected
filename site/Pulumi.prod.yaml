@@ -1,2 +1,3 @@
 config:
   fixture-site:env: prod
+encryptionsalt: v1:wGA/AIi4rfY=:v1:3y+ZbCsLMSlKJWKU:V8JFn9g3/omTP5WLm7z8fHmXbChT2g==
