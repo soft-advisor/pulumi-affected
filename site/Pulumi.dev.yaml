@@ -1,2 +1,3 @@
 config:
   fixture-site:env: dev
+encryptionsalt: v1:Ig82WDE9fAA=:v1:nKjsfI/vimncCrpc:koXrpUKr3XrA8oa7GMsgF4pN3tzQlA==
