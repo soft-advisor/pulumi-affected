@@ -3,5 +3,5 @@ export function accountName(alias: string) {
 }
 
 export function zoneName(domain: string) {
-  return domain.toLowerCase();
+  return `${domain.toLowerCase()}.`;
 }
