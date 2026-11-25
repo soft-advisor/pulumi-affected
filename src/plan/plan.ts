@@ -87,6 +87,7 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
   mkdirSync(directory, { recursive: true });
   const config = options.select.config ?? loadConfig(new WorktreeSnapshot(repoRoot));
   const selection = select({ ...options.select, config });
+  if (options.mode !== 'preview') refuseForceUp(selection.forceUp);
 
   // Wave by wave, so a stack created to be planned exists before the stacks that reference it
   const outcomes: StackOutcome[] = [];
@@ -206,6 +207,7 @@ export async function planStacks(options: PlanOptions): Promise<Manifest> {
         : [],
     ),
     skipped: selection.skipped,
+    ...(selection.forceUp.length > 0 ? { forceUp: selection.forceUp } : {}),
     followUps: stale.filter((read) => !blocked.has(read.id)),
     dependencies: selection.dependencies,
     warnings,
@@ -533,4 +535,15 @@ export async function pulumiVersion(runner: PulumiRunner) {
 /** That stacks whose references can't be analysed may need planning once outputs change */
 export function unknownReadersWarning(changed: { id: string }[], readers: string[]) {
   return `${changed.map((stack) => stack.id).join(', ')} change outputs, and ${readers.join(', ')} may read them in ways analysis can't see; plan those again after this is applied if they do, or declare what they read under dependsOn`;
+}
+
+/**
+ * Plans apply exactly what they saved, and a stack whose plan shows no changes has none saved, so
+ * a forced deploy can't work in this mode. Failing beats silently not deploying.
+ */
+export function refuseForceUp(forceUp: string[]) {
+  if (forceUp.length === 0) return;
+  throw new Error(
+    `Pulumi-Affected-Force-Up (${forceUp.join(', ')}) only works with plan's mode preview and apply's mode up: in mode plan, apply applies exactly the saved plans, and a stack without changes has none`,
+  );
 }

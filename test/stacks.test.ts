@@ -107,6 +107,35 @@ test('commit trailers and messages request or skip stacks', () => {
   assert.deepEqual(selectedIds(skipped), ['org-accounts/hyperchick', 'org-accounts/management']);
 });
 
+test('Pulumi-Affected-Force-Up selects stacks, wins over a skip, and lists them in forceUp', () => {
+  const forced = selectChange(
+    ACCOUNTS,
+    {},
+    { messages: ['Unprotect\n\nPulumi-Affected-Force-Up: org-accounts/hyperchick\n'] },
+  );
+  assert.deepEqual(selectedIds(forced), ['org-accounts/hyperchick']);
+  assert.deepEqual(forced.forceUp, ['org-accounts/hyperchick']);
+  assert.deepEqual(reasonsOf(forced, 'org-accounts/hyperchick'), [
+    'deploy forced by the pull request',
+  ]);
+
+  const overSkip = selectChange(
+    ACCOUNTS,
+    {},
+    { message: 'x\n\nPulumi-Affected-Skip: hyperchick\nPulumi-Affected-Force-Up: hyperchick\n' },
+  );
+  assert.deepEqual(selectedIds(overSkip), ['org-accounts/hyperchick']);
+  assert.deepEqual(overSkip.skipped, []);
+
+  // A Run line selects without forcing a deploy
+  const run = selectChange(ACCOUNTS, {}, { message: 'x\n\nPulumi-Affected-Run: business\n' });
+  assert.deepEqual(run.forceUp, []);
+
+  const option = selectChange(ACCOUNTS, {}, { forceUp: ['org-accounts/manage*', 'nope/*'] });
+  assert.deepEqual(option.forceUp, ['org-accounts/management']);
+  assert.deepEqual(option.warnings, ['--force-up: "nope/*" matches no stack']);
+});
+
 test('requesting a pattern that matches nothing warns', () => {
   const result = selectChange(ACCOUNTS, {}, { run: ['nope/*'] });
   assert.deepEqual(result.warnings, ['--run: "nope/*" matches no stack']);

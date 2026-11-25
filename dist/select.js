@@ -36,6 +36,7 @@ function unmatchedPatterns(config, stacks) {
 }
 export const RUN_TRAILER = 'Pulumi-Affected-Run';
 export const SKIP_TRAILER = 'Pulumi-Affected-Skip';
+export const FORCE_UP_TRAILER = 'Pulumi-Affected-Force-Up';
 /** How many reasons to list for one stack before summarizing the rest */
 const MAX_REASONS = 8;
 /** Files that never affect a program */
@@ -70,6 +71,7 @@ export function select(options) {
         return requests;
     };
     const forced = new Set();
+    const forcedUp = new Set();
     const skipped = new Map();
     const unmatched = new Map();
     for (const project of projects) {
@@ -102,6 +104,16 @@ export function select(options) {
                 unmatched.set(pattern, '');
                 addReason(stack, `requested by ${source}`);
                 forced.add(stack.id);
+            }
+            for (const { pattern, source } of requests.forceUp) {
+                if (!unmatched.has(pattern))
+                    unmatched.set(pattern, source);
+                if (!matchesStack(pattern, stack))
+                    continue;
+                unmatched.set(pattern, '');
+                addReason(stack, `deploy forced by ${source}`);
+                forced.add(stack.id);
+                forcedUp.add(stack.id);
             }
             const skip = requests.skip.find(({ pattern }) => matchesStack(pattern, stack));
             if (skip)
@@ -158,6 +170,7 @@ export function select(options) {
             .filter((stack) => !reasons.has(stack.id) && !skippedStacks.some((skip) => skip.id === stack.id))
             .map((stack) => stack.id),
         skipped: skippedStacks,
+        forceUp: [...forcedUp].sort(),
         dependencies: Object.fromEntries([...graph].map(([id, dependencies]) => [id, [...dependencies].sort()])),
         outputsRead: session.outputsReadRecord(),
         unknownReaders: [...session.unknownReaders].sort(),
@@ -810,12 +823,13 @@ export function describeFactChanges(before, after) {
     return reasons;
 }
 /**
- * Pulumi-Affected-Run/Skip/Create-Stacks lines in commit messages between base and head, and in
- * `messages`
+ * Pulumi-Affected-Run/Skip/Force-Up/Create-Stacks lines in commit messages between base and
+ * head, and in `messages`
  */
 function readRequests(repoRoot, base, options) {
     const run = [];
     const skip = [];
+    const forceUp = [];
     const create = [];
     const malformed = [];
     const scan = (text, source) => {
@@ -831,16 +845,21 @@ function readRequests(repoRoot, base, options) {
                 }
                 continue;
             }
-            const match = /^\s*(Pulumi-Affected-(?:Run|Skip))\s*:\s*(.+)$/i.exec(line);
+            const match = /^\s*(Pulumi-Affected-(?:Run|Skip|Force-Up))\s*:\s*(.+)$/i.exec(line);
             if (!match)
                 continue;
-            const list = match[1].toLowerCase() === RUN_TRAILER.toLowerCase() ? run : skip;
+            const lists = {
+                [RUN_TRAILER.toLowerCase()]: run,
+                [SKIP_TRAILER.toLowerCase()]: skip,
+                [FORCE_UP_TRAILER.toLowerCase()]: forceUp,
+            };
+            const list = lists[match[1].toLowerCase()];
             for (const pattern of splitPatterns(match[2]))
                 list.push({ pattern, source });
         }
     };
     if (options.changesOnly)
-        return { run, skip, create, malformed };
+        return { run, skip, forceUp, create, malformed };
     const headRev = options.head ?? 'HEAD';
     // Oldest first, so later lines (newer commits, then the pull request) take precedence
     const log = git(repoRoot, ['log', '--reverse', '--format=%h%x00%B%x01', `${base}..${headRev}`]);
@@ -857,7 +876,9 @@ function readRequests(repoRoot, base, options) {
         run.push({ pattern, source: '--run' });
     for (const pattern of options.skip ?? [])
         skip.push({ pattern, source: '--skip' });
-    return { run, skip, create, malformed };
+    for (const pattern of options.forceUp ?? [])
+        forceUp.push({ pattern, source: '--force-up' });
+    return { run, skip, forceUp, create, malformed };
 }
 /** The stacks in the repo and how they depend on each other, as of `head` */
 export function readDependencyGraph(options) {

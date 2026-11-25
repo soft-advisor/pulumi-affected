@@ -131,6 +131,9 @@ export async function upStacks(options: UpOptions): Promise<UpResult> {
     }
   }
 
+  // Asked to deploy regardless of what the preview showed
+  for (const id of selection.forceUp) unchanged.delete(id);
+
   // Selected stacks to deploy, and why; the preview can only take some out
   const toRun = new Map<string, StaleRead[] | undefined>();
   const results = new Map<string, StackUpResult>();

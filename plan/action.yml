@@ -26,6 +26,12 @@ inputs:
   skip:
     description: Stack patterns to leave out unless also requested, separated by commas or newlines.
     required: false
+  force-up:
+    description: >-
+      Stack patterns to select and deploy even when their preview shows no changes (like
+      Pulumi-Affected-Force-Up lines), separated by commas or newlines. Mode preview only: mode
+      plan fails.
+    required: false
   all:
     description: Plan every stack.
     required: false

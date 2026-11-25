@@ -59,3 +59,8 @@ export declare function pulumiVersion(runner: PulumiRunner): Promise<string>;
 export declare function unknownReadersWarning(changed: {
     id: string;
 }[], readers: string[]): string;
+/**
+ * Plans apply exactly what they saved, and a stack whose plan shows no changes has none saved, so
+ * a forced deploy can't work in this mode. Failing beats silently not deploying.
+ */
+export declare function refuseForceUp(forceUp: string[]): void;

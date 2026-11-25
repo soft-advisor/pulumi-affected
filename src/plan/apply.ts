@@ -18,7 +18,13 @@ import { readDependencyGraph, type SelectOptions, select } from '../select.ts';
 import { GitSnapshot, git, repoRootOf, resolveCommit } from '../snapshot.ts';
 import { mapConcurrently } from './concurrency.ts';
 import { hashText, type Manifest, type PlannedStack, readManifest } from './manifest.ts';
-import { initArgs, pulumiVersion, unknownReadersWarning, writeSalt } from './plan.ts';
+import {
+  initArgs,
+  pulumiVersion,
+  refuseForceUp,
+  unknownReadersWarning,
+  writeSalt,
+} from './plan.ts';
 import { describeRead, type StaleRead, staleReads } from './outputs.ts';
 import {
   createsOnlyTheStack,
@@ -121,13 +127,11 @@ export async function applyPlans(options: ApplyOptions): Promise<ApplyResult> {
   } = readDependencyGraph({ cwd: repoRoot, head: commit, config });
   checkCheckout(repoRoot, directory, known);
   const byId = new Map(known.map((stack) => [stack.id, stack]));
-  const selected = options.select
-    ? new Set(
-        select({ ...options.select, cwd: repoRoot, head: commit, config }).stacks.map(
-          (stack) => stack.id,
-        ),
-      )
+  const selection = options.select
+    ? select({ ...options.select, cwd: repoRoot, head: commit, config })
     : undefined;
+  if (selection) refuseForceUp(selection.forceUp);
+  const selected = selection ? new Set(selection.stacks.map((stack) => stack.id)) : undefined;
   for (const stack of manifest.stacks) {
     const match = byId.get(stack.id);
     if (!match || match.dir !== stack.dir || match.stack !== stack.stack) {

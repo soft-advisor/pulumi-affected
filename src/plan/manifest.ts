@@ -73,6 +73,8 @@ export interface Manifest {
   /** Stacks that couldn't be planned; `blockedBy` when they read outputs another plan changes */
   failed: { id: string; error: string; reasons: string[]; blockedBy?: StaleRead[] }[];
   skipped: { id: string; source: string; reasons: string[] }[];
+  /** Stacks a Pulumi-Affected-Force-Up line asks to deploy even without changes (mode preview) */
+  forceUp?: string[];
   /** Stacks that read outputs these plans change, to plan again once they're applied */
   followUps: StaleRead[];
   /** Stack id → ids of the stacks it depends on, for the report */

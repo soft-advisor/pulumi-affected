@@ -65,6 +65,8 @@ Pin the actions to a commit SHA in production. Read [Guardrails](docs/guardrails
 
 `Pulumi-Affected-Skip: <patterns>` leaves stacks out, unless something also requests them. Skipped stacks are listed in the output with what skipped them, so a skip is never silent.
 
+Forcing selects a stack, but in [mode `up`](docs/modes.md) a selected stack whose preview shows no changes still isn't deployed. To deploy it anyway, use `Pulumi-Affected-Force-Up: <patterns>` (or the `force-up` input, `--force-up`): it selects the stacks and `apply` runs `pulumi up` on them even without changes. That's for changes Pulumi doesn't preview, such as `protect`, which only takes effect once `up` records it. Mode `plan` refuses it, since a stack without changes has no plan to apply.
+
 Stack patterns are `<project>/<stack>`, where `<project>` is the project's name or its folder, or a bare `<stack>` for that stack in every project. Both parts may be globs.
 
 ## Documentation
