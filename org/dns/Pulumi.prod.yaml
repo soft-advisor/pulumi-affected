@@ -1,2 +1,3 @@
 config:
   fixture-dns:domain: Example.com
+encryptionsalt: v1:ChKeyMKcuno=:v1:ZGSv72AlZVu7Jfu6:GG1mERM0tWf7do7kvs49ii1vsbr1ow==
