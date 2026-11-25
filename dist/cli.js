@@ -11,7 +11,8 @@ import { readDependencyGraph, select } from "./select.js";
 const NO_CHANGES_EXIT_CODE = 3;
 const USAGE = `Usage:
   pulumi-affected select --base <rev> [--head <rev>] [--bases <file>] [--run <pattern>]...
-                         [--skip <pattern>]... [--all] [--message <file>]...
+                         [--skip <pattern>]... [--force-up <pattern>]... [--all]
+                         [--message <file>]...
                          [--format json|markdown] [--config <file>]
   pulumi-affected dependents <stack> [--transitive] [--head <rev>] [--config <file>]
   pulumi-affected classify [<file>]
@@ -23,7 +24,9 @@ select    Prints the stacks a change affects, why, and the waves to run them in.
                       from (null: never deployed); those stacks compare against it
           --run       also select stacks matching a pattern ("all" selects every stack)
           --skip      leave out stacks matching a pattern, unless --run names them
-          --message   file whose Pulumi-Affected-Run/Skip lines count, e.g. a PR description
+          --force-up  select stacks matching a pattern, to deploy with pulumi up even when
+                      their preview shows no changes (listed in the output's forceUp)
+          --message   file whose Pulumi-Affected-* lines count, e.g. a PR description
 dependents  Prints the stacks that depend on <stack>.
 classify  Reads \`pulumi preview --json\` output (a file, or stdin) and prints whether it changes
           anything; exits 0 with changes, 3 without.
@@ -40,6 +43,7 @@ async function main(argv) {
             bases: { type: 'string' },
             run: { type: 'string', multiple: true },
             skip: { type: 'string', multiple: true },
+            'force-up': { type: 'string', multiple: true },
             all: { type: 'boolean' },
             message: { type: 'string', multiple: true },
             format: { type: 'string', default: 'json' },
@@ -66,6 +70,7 @@ async function main(argv) {
             bases: values.bases ? JSON.parse(readFileSync(values.bases, 'utf8')) : undefined,
             run: values.run,
             skip: values.skip,
+            forceUp: values['force-up'],
             all: values.all,
             messages: values.message?.map((path) => readFileSync(path, 'utf8')),
             config,

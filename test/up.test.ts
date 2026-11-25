@@ -181,6 +181,38 @@ describe('preview, then up', { skip: !hasPulumi && 'pulumi is not installed' }, 
     assert.equal(output(dir, 'down'), 'one');
   });
 
+  test('Pulumi-Affected-Force-Up deploys a stack its preview found unchanged', async () => {
+    const { dir, base, runner } = setup();
+    // other is selected, but its preview shows nothing: like a change only to protect
+    commit(dir, { 'other/Pulumi.yaml': otherProgram('second') });
+    const messages = ['Unprotect\n\nPulumi-Affected-Force-Up: other/dev\n'];
+
+    const directory = temporary('previews');
+    const manifest = await planStacks({
+      select: { cwd: dir, base, messages },
+      directory,
+      runner,
+      concurrency: 2,
+      mode: 'preview',
+    });
+    assert.deepEqual(
+      manifest.unchanged.map((stack) => stack.id),
+      ['other/dev'],
+    );
+    assert.deepEqual(manifest.forceUp, ['other/dev']);
+
+    const result = await upStacks({
+      cwd: dir,
+      runner,
+      concurrency: 2,
+      select: { base, messages },
+      previews: readPreviewSummary(directory),
+      outputReaders: 'up',
+    });
+    assert.deepEqual(outcomes(result), { 'other/dev': 'applied' });
+    assert.ok(result.ok);
+  });
+
   test('a new stack is created by up', async () => {
     const { dir, base, runner } = setup();
     commit(dir, { 'other/Pulumi.prod.yaml': 'config: {}\n' });
@@ -352,4 +384,22 @@ describe('preview, then up', { skip: !hasPulumi && 'pulumi is not installed' }, 
     });
     assert.match(result.warnings.join('\n'), /reads "wrod" of up\/dev, which it doesn't export/);
   });
+});
+
+test('plan mode refuses Pulumi-Affected-Force-Up rather than silently not deploying', async () => {
+  const { dir, base } = createRepo({
+    'other/Pulumi.yaml': otherProgram('first'),
+    'other/Pulumi.dev.yaml': 'config: {}\n',
+  });
+  const runner = commandRunner(DEFAULT_COMMAND, dir);
+  await assert.rejects(
+    planStacks({
+      select: { cwd: dir, base, forceUp: ['other/dev'] },
+      directory: temporary('plans'),
+      runner,
+      concurrency: 1,
+      mode: 'plan',
+    }),
+    /Pulumi-Affected-Force-Up \(other\/dev\) only works with plan's mode preview/,
+  );
 });

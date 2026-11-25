@@ -50,6 +50,11 @@ inputs:
   skip:
     description: As for plan, when plan used it.
     required: false
+  force-up:
+    description: >-
+      Stack patterns to deploy even when the pull request's preview found no changes in them
+      (like Pulumi-Affected-Force-Up lines). Mode up only: mode plan fails.
+    required: false
   all:
     description: As for plan, when plan used it.
     required: false

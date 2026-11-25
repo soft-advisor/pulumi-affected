@@ -33,6 +33,7 @@ export function selectOptionsFromInputs(): { options: SelectOptions; event: GitH
       bases: input('bases') ? JSON.parse(input('bases')) : undefined,
       run: splitPatterns(input('run')),
       skip: splitPatterns(input('skip')),
+      forceUp: splitPatterns(input('force-up')),
       all: booleanInput('all') || context.all,
       messages: context.messages,
     },

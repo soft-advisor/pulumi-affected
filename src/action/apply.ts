@@ -152,7 +152,8 @@ async function locate() {
 
 /**
  * How the change is selected, as the plan selected it: its base (the input, else the event's),
- * Pulumi-Affected-Run/Skip lines in its pull request, and the same run/skip/all/bases inputs
+ * Pulumi-Affected-Run/Skip/Force-Up lines in its pull request, and the same
+ * run/skip/force-up/all/bases inputs
  */
 async function selection(cwd: string): Promise<NonNullable<ApplyOptions['select']>> {
   const repoRoot = repoRootOf(cwd);
@@ -178,6 +179,7 @@ async function selection(cwd: string): Promise<NonNullable<ApplyOptions['select'
     bases: input('bases') ? JSON.parse(input('bases')) : undefined,
     run: splitPatterns(input('run')),
     skip: splitPatterns(input('skip')),
+    forceUp: splitPatterns(input('force-up')),
     all: booleanInput('all') || context?.all,
     messages,
   };

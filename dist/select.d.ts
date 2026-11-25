@@ -19,6 +19,11 @@ export interface SelectOptions {
     run?: string[];
     /** Stack patterns to leave out unless also named in `run` */
     skip?: string[];
+    /**
+     * Stack patterns to select and deploy with `pulumi up` even when their preview shows no
+     * changes, e.g. to record a change Pulumi doesn't preview (protect); mode up only
+     */
+    forceUp?: string[];
     /** Select every stack */
     all?: boolean;
     /** Text that may carry Pulumi-Affected-Run/Skip lines, e.g. a pull request description */
@@ -46,6 +51,11 @@ export interface SelectResult {
         source: string;
         reasons: string[];
     }[];
+    /**
+     * Selected stack ids a Pulumi-Affected-Force-Up line or --force-up asked to deploy even if
+     * their preview shows no changes
+     */
+    forceUp: string[];
     /** Every stack id to the ids of the stacks it depends on */
     dependencies: Record<string, string[]>;
     /** Pulumi-Affected-Create-Stacks lines in the change, in the order they were found */
@@ -68,6 +78,7 @@ export type OutputsRead = Record<string, Record<string, string[] | 'all'>>;
 export type DeclaredOutputs = Record<string, Record<string, string[]>>;
 export declare const RUN_TRAILER = "Pulumi-Affected-Run";
 export declare const SKIP_TRAILER = "Pulumi-Affected-Skip";
+export declare const FORCE_UP_TRAILER = "Pulumi-Affected-Force-Up";
 export declare function select(options: SelectOptions): SelectResult;
 /**
  * Holds snapshots and analyses for one selection, so each project is analysed once per

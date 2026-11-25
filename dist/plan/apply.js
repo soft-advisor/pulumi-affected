@@ -12,7 +12,7 @@ import { readDependencyGraph, select } from "../select.js";
 import { GitSnapshot, git, repoRootOf, resolveCommit } from "../snapshot.js";
 import { mapConcurrently } from "./concurrency.js";
 import { hashText, readManifest } from "./manifest.js";
-import { initArgs, pulumiVersion, unknownReadersWarning, writeSalt } from "./plan.js";
+import { initArgs, pulumiVersion, refuseForceUp, unknownReadersWarning, writeSalt, } from "./plan.js";
 import { describeRead, staleReads } from "./outputs.js";
 import { createsOnlyTheStack, relaxPlan, stackOutputChanges, unknownOutputChanges, } from "./planfile.js";
 export class ApplyError extends Error {
@@ -39,9 +39,12 @@ export async function applyPlans(options) {
     const { stacks: known, graph, outputsRead, unknownReaders, } = readDependencyGraph({ cwd: repoRoot, head: commit, config });
     checkCheckout(repoRoot, directory, known);
     const byId = new Map(known.map((stack) => [stack.id, stack]));
-    const selected = options.select
-        ? new Set(select({ ...options.select, cwd: repoRoot, head: commit, config }).stacks.map((stack) => stack.id))
+    const selection = options.select
+        ? select({ ...options.select, cwd: repoRoot, head: commit, config })
         : undefined;
+    if (selection)
+        refuseForceUp(selection.forceUp);
+    const selected = selection ? new Set(selection.stacks.map((stack) => stack.id)) : undefined;
     for (const stack of manifest.stacks) {
         const match = byId.get(stack.id);
         if (!match || match.dir !== stack.dir || match.stack !== stack.stack) {

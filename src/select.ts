@@ -49,6 +49,11 @@ export interface SelectOptions {
   run?: string[];
   /** Stack patterns to leave out unless also named in `run` */
   skip?: string[];
+  /**
+   * Stack patterns to select and deploy with `pulumi up` even when their preview shows no
+   * changes, e.g. to record a change Pulumi doesn't preview (protect); mode up only
+   */
+  forceUp?: string[];
   /** Select every stack */
   all?: boolean;
   /** Text that may carry Pulumi-Affected-Run/Skip lines, e.g. a pull request description */
@@ -74,6 +79,11 @@ export interface SelectResult {
   unaffected: string[];
   /** Stacks a change affected but a Pulumi-Affected-Skip line or --skip left out */
   skipped: { id: string; source: string; reasons: string[] }[];
+  /**
+   * Selected stack ids a Pulumi-Affected-Force-Up line or --force-up asked to deploy even if
+   * their preview shows no changes
+   */
+  forceUp: string[];
   /** Every stack id to the ids of the stacks it depends on */
   dependencies: Record<string, string[]>;
   /** Pulumi-Affected-Create-Stacks lines in the change, in the order they were found */
@@ -125,6 +135,7 @@ function unmatchedPatterns(config: Config, stacks: Stack[]) {
 
 export const RUN_TRAILER = 'Pulumi-Affected-Run';
 export const SKIP_TRAILER = 'Pulumi-Affected-Skip';
+export const FORCE_UP_TRAILER = 'Pulumi-Affected-Force-Up';
 
 /** How many reasons to list for one stack before summarizing the rest */
 const MAX_REASONS = 8;
@@ -163,6 +174,7 @@ export function select(options: SelectOptions): SelectResult {
     return requests;
   };
   const forced = new Set<string>();
+  const forcedUp = new Set<string>();
   const skipped = new Map<string, string>();
   const unmatched = new Map<string, string>();
 
@@ -191,6 +203,14 @@ export function select(options: SelectOptions): SelectResult {
         unmatched.set(pattern, '');
         addReason(stack, `requested by ${source}`);
         forced.add(stack.id);
+      }
+      for (const { pattern, source } of requests.forceUp) {
+        if (!unmatched.has(pattern)) unmatched.set(pattern, source);
+        if (!matchesStack(pattern, stack)) continue;
+        unmatched.set(pattern, '');
+        addReason(stack, `deploy forced by ${source}`);
+        forced.add(stack.id);
+        forcedUp.add(stack.id);
       }
       const skip = requests.skip.find(({ pattern }) => matchesStack(pattern, stack));
       if (skip) skipped.set(stack.id, skip.source);
@@ -245,6 +265,7 @@ export function select(options: SelectOptions): SelectResult {
       )
       .map((stack) => stack.id),
     skipped: skippedStacks,
+    forceUp: [...forcedUp].sort(),
     dependencies: Object.fromEntries(
       [...graph].map(([id, dependencies]) => [id, [...dependencies].sort()]),
     ),
@@ -962,12 +983,13 @@ export interface CreateRequest {
 }
 
 /**
- * Pulumi-Affected-Run/Skip/Create-Stacks lines in commit messages between base and head, and in
- * `messages`
+ * Pulumi-Affected-Run/Skip/Force-Up/Create-Stacks lines in commit messages between base and
+ * head, and in `messages`
  */
 function readRequests(repoRoot: string, base: string, options: SelectOptions) {
   const run: Request[] = [];
   const skip: Request[] = [];
+  const forceUp: Request[] = [];
   const create: CreateRequest[] = [];
   const malformed: string[] = [];
   const scan = (text: string, source: string) => {
@@ -985,14 +1007,19 @@ function readRequests(repoRoot: string, base: string, options: SelectOptions) {
         }
         continue;
       }
-      const match = /^\s*(Pulumi-Affected-(?:Run|Skip))\s*:\s*(.+)$/i.exec(line);
+      const match = /^\s*(Pulumi-Affected-(?:Run|Skip|Force-Up))\s*:\s*(.+)$/i.exec(line);
       if (!match) continue;
-      const list = match[1].toLowerCase() === RUN_TRAILER.toLowerCase() ? run : skip;
+      const lists: Record<string, Request[]> = {
+        [RUN_TRAILER.toLowerCase()]: run,
+        [SKIP_TRAILER.toLowerCase()]: skip,
+        [FORCE_UP_TRAILER.toLowerCase()]: forceUp,
+      };
+      const list = lists[match[1].toLowerCase()];
       for (const pattern of splitPatterns(match[2])) list.push({ pattern, source });
     }
   };
 
-  if (options.changesOnly) return { run, skip, create, malformed };
+  if (options.changesOnly) return { run, skip, forceUp, create, malformed };
   const headRev = options.head ?? 'HEAD';
   // Oldest first, so later lines (newer commits, then the pull request) take precedence
   const log = git(repoRoot, ['log', '--reverse', '--format=%h%x00%B%x01', `${base}..${headRev}`]);
@@ -1005,7 +1032,8 @@ function readRequests(repoRoot: string, base: string, options: SelectOptions) {
   if (options.all) run.push({ pattern: 'all', source: '--all' });
   for (const pattern of options.run ?? []) run.push({ pattern, source: '--run' });
   for (const pattern of options.skip ?? []) skip.push({ pattern, source: '--skip' });
-  return { run, skip, create, malformed };
+  for (const pattern of options.forceUp ?? []) forceUp.push({ pattern, source: '--force-up' });
+  return { run, skip, forceUp, create, malformed };
 }
 
 /** The stacks in the repo and how they depend on each other, as of `head` */

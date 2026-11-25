@@ -28,7 +28,9 @@ export function renderPlan(manifest, marker, outputReaders = 'up') {
         rows.length > 0
             ? [`| Stack | ${preview ? 'Preview' : 'Plan'} | Why |`, '| --- | --- | --- |', ...rows].join('\n')
             : preview
-                ? 'Nothing to deploy.'
+                ? (manifest.forceUp ?? []).length > 0
+                    ? 'No changes, but forced stacks are deployed after merging (see below).'
+                    : 'Nothing to deploy.'
                 : 'Nothing to apply.',
         lists(manifest),
     ]
@@ -114,8 +116,13 @@ function countsOf(stack) {
 }
 function lists(manifest) {
     const lines = [];
-    if (manifest.unchanged.length > 0) {
-        lines.push(`Previewed without changes: ${manifest.unchanged.map((stack) => code(stack.id)).join(', ')}`);
+    const forceUp = new Set(manifest.forceUp ?? []);
+    const unchanged = manifest.unchanged.filter((stack) => !forceUp.has(stack.id));
+    if (unchanged.length > 0) {
+        lines.push(`Previewed without changes: ${unchanged.map((stack) => code(stack.id)).join(', ')}`);
+    }
+    if (forceUp.size > 0) {
+        lines.push(`Deployed after merging even without changes (Pulumi-Affected-Force-Up): ${[...forceUp].map(code).join(', ')}`);
     }
     for (const stack of manifest.skipped) {
         lines.push(`Skipped by ${safeText(stack.source)}: ${code(stack.id)}`);
